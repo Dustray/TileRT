@@ -9,7 +9,6 @@ from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.gated_attention import GatedAttention
 from tilert.models.qwen3_6.modules.delta_net import DeltaNet
 from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
-from tilert.models.qwen3_6.modules.mlp import QwenMlpBlock
 
 __all__ = ["QwenDsa"]
 
@@ -21,11 +20,10 @@ class QwenDsa(SerializableTileRTModule):
     - 30 DeltaNet layers (3 per block × 10 blocks)
     - 10 Gated Attention layers (1 per block × 10 blocks)
 
-    This module handles both layer types with appropriate routing.
-    
-    Forward pass priority:
-        1. golden_forward: PyTorch reference implementation (default)
-        2. tilert_forward: Optimized CUDA kernel (when flag_enable_tilert=True)
+    This module instantiates those layers in order and provides the high-level
+    ``forward`` dispatcher.  The optimized TileRT path will be implemented once
+    the dedicated kernels are available; until then the golden path serves as a
+    reference and sanity check.
     """
 
     def __init__(
@@ -35,14 +33,6 @@ class QwenDsa(SerializableTileRTModule):
         num_devices: int,
         cached_ffn_ops: list | None = None,
     ):
-        """Initialize QwenDsa module.
-
-        Args:
-            model_args: Model configuration.
-            device_id: Current GPU device ID.
-            num_devices: Total number of devices.
-            cached_ffn_ops: Optional pre-cached FFN ops for weight reuse.
-        """
         super().__init__(
             model_args=model_args,
             device_id=device_id,
@@ -54,68 +44,138 @@ class QwenDsa(SerializableTileRTModule):
         self.device_id = device_id
         self.num_devices = num_devices
 
-        dev = f"cuda:{device_id}"
-
-        # Layer configuration
-        self.n_delta_layers = model_args.n_delta_layers  # 30
-        self.n_gated_layers = model_args.n_gated_layers   # 10
-        self.n_blocks = model_args.n_blocks                # 10
+        if cached_ffn_ops is not None:
+            assert len(cached_ffn_ops) == model_args.n_layers, (
+                f"Expected {model_args.n_layers} cached FFN ops, "
+                f"got {len(cached_ffn_ops)}"
+            )
 
         # Layer type mapping: 0 = DeltaNet, 1 = Gated Attention
         # Pattern: [DeltaNet, DeltaNet, DeltaNet, GatedAttention] × 10
-        self.layer_types = []
-        for block_idx in range(self.n_blocks):
-            # 3 DeltaNet layers per block
-            for _ in range(3):
-                self.layer_types.append(0)  # DeltaNet
-            # 1 Gated Attention layer per block
-            self.layer_types.append(1)  # Gated Attention
+        self.layer_types: list[int] = []
+        for _ in range(model_args.n_blocks):
+            self.layer_types.extend([0, 0, 0, 1])
 
-        # TODO: Initialize DeltaNet and Gated Attention layers
-        # This requires the corresponding CUDA kernels to be built first
+        for layer_idx, layer_type in enumerate(self.layer_types):
+            ffn_op = cached_ffn_ops[layer_idx] if cached_ffn_ops else None
+            if layer_type == 0:
+                block = DeltaNet(
+                    model_args=model_args,
+                    device_id=device_id,
+                    num_devices=num_devices,
+                )
+            else:
+                block = GatedAttention(
+                    model_args=model_args,
+                    device_id=device_id,
+                    num_devices=num_devices,
+                )
+            self.register_op(block, prefix=f"layer_{layer_idx}_", suffix=f"_dev_{device_id}")
 
-    def golden_forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Golden forward pass (PyTorch reference implementation).
+    def _block_forward(
+        self,
+        block: SerializableTileRTModule,
+        x: torch.Tensor,
+        start_pos: int,
+        layer_cache: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Route one layer through the correct forward signature."""
+        if isinstance(block, DeltaNet):
+            out, layer_cache["delta_state"] = block.forward(
+                x, start_pos, layer_cache.get("delta_state")
+            )
+            return out, layer_cache
+        if isinstance(block, GatedAttention):
+            k_cache = layer_cache["k_cache"]
+            v_cache = layer_cache["v_cache"]
+            out, k_cache, v_cache = block.forward(x, start_pos, layer_cache["freqs_cis"], k_cache, v_cache)
+            layer_cache["k_cache"] = k_cache
+            layer_cache["v_cache"] = v_cache
+            return out, layer_cache
+        raise TypeError(f"Unsupported block type: {type(block)}")
 
-        This is the default forward method, providing a correct but
-        unoptimized reference implementation for testing and validation.
+    def golden_forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        caches: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Reference forward through all 40 heterogeneous layers."""
+        if caches is None:
+            caches = self._init_layer_caches(freqs_cis)
+
+        h = x
+        for block in self.exec_seq:
+            layer_idx = int(block.prefix_seq[0].split("_")[1]) if hasattr(block, "prefix_seq") else 0
+            layer_cache = caches.setdefault(layer_idx, {
+                "k_cache": caches.get("k_cache"),
+                "v_cache": caches.get("v_cache"),
+                "freqs_cis": freqs_cis,
+                "delta_state": None,
+            })
+            h, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
+        return h, caches
+
+    def tilert_forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        caches: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Optimized forward placeholder.
+
+        Falls back to ``golden_forward`` until the show-hands / CUDA-graph
+        wrappers for Qwen3.6 are implemented.
         """
-        raise NotImplementedError(
-            "QwenDsa golden_forward: PyTorch reference implementation not yet implemented. "
-            "This requires implementing the reference forward pass for Qwen3.6 architecture."
-        )
+        return self.golden_forward(x, start_pos, freqs_cis, caches)
 
-    def tilert_forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Tilert forward pass (optimized CUDA kernel).
-
-        This is the optimized forward method using TileRT CUDA kernels.
-        Requires building the libtilert_qwen36.so library first.
-        """
-        raise NotImplementedError(
-            "QwenDsa tilert_forward: CUDA kernels not yet built. "
-            "Build libtilert_qwen36.so to enable this path."
-        )
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Forward pass with automatic path selection.
-
-        Automatically selects between golden_forward and tilert_forward
-        based on the flag_enable_tilert flag.
-        """
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        caches: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.flag_enable_tilert:
-            return self.tilert_forward(*args, **kwargs)
-        return self.golden_forward(*args, **kwargs)
+            return self.tilert_forward(x, start_pos, freqs_cis, caches)
+        return self.golden_forward(x, start_pos, freqs_cis, caches)
+
+    def _init_layer_caches(self, freqs_cis: torch.Tensor) -> dict[str, Any]:
+        """Allocate KV caches for Gated Attention layers.
+
+        DeltaNet layers carry their own recurrent state in ``layer_cache``.
+        """
+        dev = f"cuda:{self.device_id}"
+        cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
+        return {
+            "k_cache": torch.zeros(
+                self.model_args.max_batch_size,
+                cache_seq_len,
+                self.model_args.n_kv_heads,
+                self.model_args.qk_head_dim,
+                dtype=torch.bfloat16,
+                device=dev,
+            ),
+            "v_cache": torch.zeros(
+                self.model_args.max_batch_size,
+                cache_seq_len,
+                self.model_args.n_kv_heads,
+                self.model_args.qk_head_dim,
+                dtype=torch.bfloat16,
+                device=dev,
+            ),
+            "freqs_cis": freqs_cis,
+        }
 
     def get_tilert_weights_alias(self) -> list[str]:
-        """Get weight aliases for serialization."""
-        # TODO: Implement based on actual layer structure
-        return []
+        """Aggregate aliases from all registered ops."""
+        return super().get_tilert_weights_alias()
 
     def from_pretrained(self, model_path: str) -> None:
         """Load pretrained weights."""
-        raise NotImplementedError(
-            "QwenDsa weight loading not yet implemented."
-        )
+        raise NotImplementedError("QwenDsa weight loading not yet implemented.")
 
     def cleanup(self) -> None:
         """Cleanup resources."""

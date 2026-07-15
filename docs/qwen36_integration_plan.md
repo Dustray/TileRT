@@ -1,5 +1,50 @@
 # Qwen3.6-35B-A3B 接入 TileRT 技术方案
 
+## 0. 背景术语说明
+
+### 0.1 常用缩写
+
+| 缩写 | 全称 | 含义 |
+|---|---|---|
+| **MLA** | Multi-head Latent Attention | DeepSeek-V3.2/GLM-5 使用的注意力结构。把 Q/K/V 通过低秩 LoRA 压缩到 latent space，显著减少 KV cache。 |
+| **MLP** | Multi-Layer Perceptron | 稠密前馈网络（Dense FFN）。在 DeepSeek-V3.2/GLM-5 中，前若干层是 dense MLP，后面才是 MoE。 |
+| **MoE** | Mixture of Experts | 专家混合模型。每次只激活 top-k 个 expert，Qwen3.6 是每层都是 MoE，256 专家里激活 8+1。 |
+| **GQA** | Grouped Query Attention | Qwen3.6 使用的注意力。Query 头数多（16），KV 头数少（2），通过分组减少 KV cache。 |
+| **MTP** | Multi-Token Prediction | DeepSeek-V3.2 的额外模块，一次预测多个 token。Qwen3.6 没有 MTP。 |
+
+### 0.2 DeepSeek-V3.2 / GLM-5 / Qwen3.6-35B-A3B 结构对比
+
+| 特性 | DeepSeek-V3.2 | GLM-5 | Qwen3.6-35B-A3B |
+|---|---|---|---|
+| 总层数 | 61 | 78 | 40 |
+| 层类型 | 前 3 层 dense MLP + 后 58 层 MoE | 前 3 层 dense MLP + 后 75 层 MoE | **每层都是 MoE**，无 dense MLP |
+| 注意力 | **MLA** | **MLA**（从 DSv3.2 修改） | **GQA + DeltaNet**（异构） |
+| 隐藏维度 | 7168 | 6144 | 2048 |
+| MoE inter_dim | 2048 | 2048 | **512** |
+| 专家数 | 256 | 256 | 256 |
+| 激活专家 | 8 + 1 shared | 8 | 8 + 1 shared |
+| MTP | **有**（layer 61） | 无 | 无 |
+| 层模式 | 同构（除前 3 层 MLP） | 同构 | **异构**：10 × [3 DeltaNet + 1 Gated Attn] |
+| TileRT 移植难度 | 基准 | 小（改 dim/scale dtype） | 大（需新 op + 异构调度） |
+
+#### DeepSeek-V3.2
+- 核心特点：通过 MLA 把 KV cache 压缩到低维 latent，配合 MTP 做多 token 预测。
+- TileRT 适配：需要完整的 `mla_v2` 模块以及大量 MLA 专用 op。
+
+#### GLM-5
+- 核心特点：可以看作 DeepSeek-V3.2 架构的"放大/变种"，维度改为 6144，无 MTP。
+- TileRT 适配：多数 op 直接从 DSv3.2 复制后改 dim 和 scale dtype。
+
+#### Qwen3.6-35B-A3B
+- 核心特点：
+  - 不用 MLA，用更传统的 **GQA** + 新型线性注意力 **DeltaNet**。
+  - 层间异构：**DeltaNet 层**负责记忆/状态压缩，**Gated Attention 层**负责长程注意。
+  - 规模更小（2048 dim vs 7168/6144），但**每层都是 MoE**。
+- TileRT 适配：
+  - 不需要 MLA 相关 op。
+  - 可复用 MoE 通信类 op（改 inter_dim=512）。
+  - 需要新增 `gqa_attention.py`、`delta_net.py` 等 wrapper 及对应 CUDA kernel。
+
 ## 1. 架构差异分析
 
 | 特性 | DeepSeek-V3.2 | Qwen3.6-35B-A3B | 适配策略 |
@@ -111,10 +156,10 @@ tilert/models/qwen3_6/
 | `tilert/models/qwen3_6/model_args.py` | ✅ 完成 | 架构参数正确 |
 | `tilert/models/qwen3_6/generator.py` | ⚠️ 框架 | 需实现核心解码层 |
 | `tilert/models/qwen3_6/modules/__init__.py` | ✅ 完成 | 所有子模块导出 |
-| `tilert/models/qwen3_6/modules/dsa.py` | ⚠️ 框架 | 需初始化子模块 |
-| `tilert/models/qwen3_6/modules/delta_net.py` | ⚠️ 框架 | 占位实现 |
-| `tilert/models/qwen3_6/modules/gated_attention.py` | ⚠️ 框架 | 占位实现 |
-| `tilert/models/qwen3_6/modules/moe.py` | ⚠️ 框架 | 占位实现 |
+| `tilert/models/qwen3_6/modules/dsa.py` | ✅ 实现 | 40 层异构栈 + golden/tilert forward |
+| `tilert/models/qwen3_6/modules/delta_net.py` | ✅ 实现 | reference wrapper + MoE；tilert forward 占位 |
+| `tilert/models/qwen3_6/modules/gated_attention.py` | ✅ 实现 | GQA reference + op wrapper；tilert forward 占位 |
+| `tilert/models/qwen3_6/modules/moe.py` | ✅ 实现 | MoE block 组合 RMSNormExpertProj / ExpertSelectUpGateSiLU / ExpertDownAllReduce |
 | `tilert/models/qwen3_6/modules/mlp.py` | ⚠️ 框架 | 占位实现 |
 | `tilert/models/qwen3_6/modules/mtp.py` | ⚠️ 框架 | 占位实现 |
 | `tilert/__init__.py` | ✅ 完成 | 后端注册 |
@@ -168,35 +213,34 @@ self.decode_layer = None  # placeholder
 
 **影响**: 无法进行实际推理，需要创建 `QwenShowHandsDSALayer`
 
-#### 问题 2: dsa.py 子模块未初始化
+#### 问题 2: dsa.py 子模块未初始化 ✅ 已解决
 
-**DeepSeek 实现** (同构层):
+**当前实现** (异构层):
 ```python
-for layer_idx in range(model_args.n_layers):
-    if layer_idx < model_args.n_dense_layers:
-        block = MlpBlock(...)
+self.layer_types: list[int] = []
+for _ in range(model_args.n_blocks):
+    self.layer_types.extend([0, 0, 0, 1])
+
+for layer_idx, layer_type in enumerate(self.layer_types):
+    if layer_type == 0:
+        block = DeltaNet(...)
     else:
-        block = MoeBlock(...)
-    self.register_op(block, ...)
+        block = GatedAttention(...)
+    self.register_op(block, prefix=f"layer_{layer_idx}_", suffix=f"_dev_{device_id}")
 ```
 
-**Qwen3.6 当前** (异构层):
-```python
-# TODO: Initialize DeltaNet and Gated Attention layers
-self.layer_types = [0,0,0,1, 0,0,0,1, ...]  # 40层映射
-```
-
-**分析**: 符合当前开发阶段，实现 golden_forward 时需补充
+**分析**: 40 层异构栈已初始化，支持 golden/tilert 双路径 forward。
 
 ### 6.4 后续工作优先级
 
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
 | P0 | 创建 QwenShowHandsDSALayer | 端到端解码层 |
-| P1 | 实现 golden_forward | 各模块 PyTorch 参考实现 |
-| P2 | 初始化 QwenDsa 子模块 | 40层循环初始化 |
+| P0 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py`（在 CUDA kernel 之前） |
+| P1 | 补全 golden_forward | DeltaNet / Gated Attention 真实参考计算 |
+| P2 | 硬编码参数清理 | `expert_down_allreduce.py`、`rmsnorm_up_gate_silu.py` tile/scale 形状适配 2048-dim |
 | P3 | 实现 MTP 支持 | 投机解码 |
-| P4 | 构建 CUDA kernels | libtilert_qwen36.so |
+| P4 | 构建 CUDA kernels | `libtilert_qwen36.so`（`gqa_attention_op`、`delta_net_op`） |
 
 ## 7. 工作量估算
 
@@ -216,3 +260,86 @@ self.layer_types = [0,0,0,1, 0,0,0,1, ...]  # 40层映射
 1. 确认是否需要 MTP (多 token 预测) 支持
 2. 获取模型 config.json 确认具体参数
 3. 开始实现基础代码结构
+
+## 8. Python 层 op 适配进展 (2026-07-15)
+
+### 8.1 `tilert/models/qwen3_6/ops/` 目录清理
+
+- 从 `deepseek_v3_2/ops/` 复制全部 op wrapper 后，按 Qwen3.6 架构裁剪。
+- 删除 13 个 MLA/Indexer 专用文件：
+  - `flash_sparse_mla.py`
+  - `layernorm_rope_rotate.py`
+  - `projo_wkvb.py`
+  - `projq_wqb.py`
+  - `projx_wis.py`
+  - `projx_wqaki.py`
+  - `projx_wqkva.py`
+  - `rmsnorm_kv.py`
+  - `rmsnorm_projq_wqb.py`
+  - `rmsnorm_projq_wqi.py`
+  - `rmsnorm_projx_wqakis.py`
+  - `rmsnorm_projx_wqkva.py`
+  - `sparse_index.py`
+- 修复 `__init__.py` 导出，剩余可复用 op：
+  - `broadcast_selected_token_ids`, `receive_selected_token_ids`
+  - `down_allreduce`
+  - `eh_proj_allreduce`
+  - `expert_down_allreduce`
+  - `expert_sel_up_gate_silu`
+  - `padded_allreduce_add`
+  - `qkv_rope`
+  - `rmsnorm_expert_proj`, `rmsnorm_head_proj`, `rmsnorm_quant`, `rmsnorm_up_gate_silu`
+  - `rotate`
+  - `topk`
+  - `unproj_o_allreduce`
+
+### 8.2 已完成的维度/算法调整
+
+| 文件 | 调整内容 |
+|------|----------|
+| `rmsnorm_up_gate_silu.py` | 移除 BF16MMA 支持；scale buffer dtype 改为 float32；适配 `inter_dim=512` |
+| `unproj_o_allreduce.py` | 仅保留 FP16MMA；`v_head_dim` → `qk_head_dim` |
+| `qkv_rope.py` | `qk_rope_head_dim` → `rope_dim` |
+| `rotate.py` | `qk_rope_head_dim` → `rope_dim`；`index_n_heads` → `n_heads`；`index_head_dim` → `qk_head_dim` |
+| `__init__.py` | 移除已删除文件的 import 与 `__all__` 导出 |
+
+### 8.3 `weight_converter.py` 适配
+
+- 导入 `ModelArgsQwen36`。
+- 增加 `self.is_qwen36` 标识，根据 Qwen3.6 结构计算层数：
+  - `num_dense_layers = n_delta_layers` (30)
+  - `num_moe_layers = n_gated_layers` (10)
+  - `num_mtp_layers = 0`
+- `transform_mla` 重命名为 `transform_attention`；Qwen3.6 暂无 MLA 分片，返回空字典。
+- `convert_a_layer`：Qwen3.6 每层都是 MoE，统一走 `transform_moe`。
+- `transform_moe`：对 Qwen3.6 gate weight reshape 为 `(n_routed_experts, dim)`。
+- `transform_mlp`：Qwen3.6 不使用，但若被调用则切换为 Qwen3.6 的 `RMSNormUpGateSiLU` / `DownAllReduce`。
+- `transform_mtp`：Qwen3.6 直接返回空字典。
+- `__process_head_weights`：Qwen3.6 使用 `qwen3_6/ops/rmsnorm_head_proj.py`。
+- CLI 新增 `--model_type qwen3_6` 分支。
+
+### 8.4 当前限制
+
+- `GatedAttention.tilert_forward` 与 `DeltaNet.tilert_forward` 目前均 fallback 到 `golden_forward`，待专用 CUDA kernel 完成后替换。
+- `RMSNormUpGateSiLU.tilert_scales` 形状硬编码为 `(9, 4, 64)`，需根据 `dim=2048`、`inter_dim=512` 推导。
+- `ExpertDownAllReduceWeightsConverter.convert_to_general` 使用 128-SM 布局；对 Qwen3.6 的 `dim=2048`，`dim_per_sm=16`，tile 划分可能需要重新调整。
+- 因环境缺少 `torch` 运行库，尚未做运行时 import / 数值验证。
+
+### 8.5 验证状态
+
+- 所有 `qwen3_6/ops/*.py` 通过 AST 语法检查。
+- 所有 `qwen3_6/modules/*.py` 通过 AST 语法检查。
+- `weight_converter.py` 通过 AST 语法检查。
+
+### 8.6 待办事项
+
+| 优先级 | 任务 | 说明 |
+|--------|------|------|
+| P0 | 实现 `modules/moe.py` | ✅ 已完成 |
+| P0 | 实现 `modules/gated_attention.py` | ✅ 已完成 |
+| P0 | 实现 `modules/delta_net.py` | ✅ 已完成 |
+| P0 | 实现 `modules/dsa.py` | ✅ 已完成 |
+| P1 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py`（CUDA kernel 之前） |
+| P2 | 硬编码参数清理 | 检查 `expert_down_allreduce.py`、`rmsnorm_up_gate_silu.py` tile/scale 形状是否适配 2048-dim |
+| P2 | `transform_attention` 补全 | Qwen3.6 无 MLA，但需按 GQA/DeltaNet 实际分片补充转换逻辑 |
+| P3 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |

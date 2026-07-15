@@ -18,6 +18,7 @@ from tilert.models.deepseek_v3_2.ops.expert_sel_up_gate_silu import ExpertSelect
 from tilert.models.deepseek_v3_2.ops.rmsnorm_head_proj import RMSNormHeadProj
 from tilert.models.deepseek_v3_2.ops.rmsnorm_up_gate_silu import RMSNormUpGateSiLU
 from tilert.models.glm_5.model_args import ModelArgsGLM5
+from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 
 __all__ = [
     "WeightConverter",
@@ -36,24 +37,34 @@ class WeightConverter:
 
     def __init__(
         self,
-        model_args: ModelArgs | ModelArgsGLM5,
+        model_args: ModelArgs | ModelArgsGLM5 | ModelArgsQwen36,
         num_devices: int,
         model_dir: str,
         save_dir: str,
         test_mode: bool = False,
     ) -> None:
         self.model_args = cast(ModelArgs, model_args)
+        self.is_qwen36 = isinstance(model_args, ModelArgsQwen36)
         self.num_devices = num_devices
         self.model_dir = model_dir
         self.save_dir = save_dir
         self.test_mode = test_mode
 
-        self.num_dense_layers = model_args.n_dense_layers
-        self.num_moe_layers = model_args.n_layers - self.num_dense_layers
-        self.num_mtp_layers = 1
+        if self.is_qwen36:
+            self.num_dense_layers = model_args.n_delta_layers
+            self.num_moe_layers = model_args.n_gated_layers
+            self.num_mtp_layers = 0
+        else:
+            self.num_dense_layers = model_args.n_dense_layers
+            self.num_moe_layers = model_args.n_layers - self.num_dense_layers
+            self.num_mtp_layers = 1
         self.total_layers = self.num_dense_layers + self.num_moe_layers + self.num_mtp_layers
         if self.test_mode:
-            self.target_layers = [0, self.model_args.n_dense_layers, self.model_args.n_layers]
+            self.target_layers = [
+                0,
+                self.num_dense_layers,
+                self.num_dense_layers + self.num_moe_layers - 1,
+            ]
         else:
             self.target_layers = list(range(self.total_layers))
 
@@ -240,12 +251,16 @@ class WeightConverter:
         logger.info(f"Index file: {index_filename}")
         return shards
 
-    def transform_mla(
+    def transform_attention(
         self,
         weights_hf: dict[str, torch.Tensor],
         layer_id: int,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        """Shard MLA weights across devices."""
+        """Shard attention/MLA weights across devices."""
+        if self.is_qwen36:
+            # Qwen3.6 has no MLA LoRA weights; attention weights are handled per-layer.
+            return {f"dev_{dev_id}": {} for dev_id in range(self.num_devices)}
+
         mla_weights: dict[str, dict[str, torch.Tensor]] = {
             f"dev_{dev_id}": {} for dev_id in range(self.num_devices)
         }
@@ -282,6 +297,12 @@ class WeightConverter:
         mlp_gate_weight = f"model.layers.{layer_id}.mlp.gate.weight"
         post_attn_norm_weight = weights_hf[post_attn_norm_weight].float()
         mlp_gate_weight = weights_hf[mlp_gate_weight]
+
+        # Qwen3.6 gate weight has shape (n_routed_experts, dim).
+        if self.is_qwen36:
+            mlp_gate_weight = mlp_gate_weight.reshape(
+                self.model_args.n_routed_experts, self.model_args.dim
+            )
 
         moe_weights: dict[str, dict[str, torch.Tensor]] = {}
         exp_sel_up_gate_silu = ExpertSelectUpGateSiLU(self.model_args, self.num_devices)
@@ -327,13 +348,33 @@ class WeightConverter:
         layer_id: int,
     ) -> dict[str, dict[str, torch.Tensor]]:
         """Transform MLP weights."""
-        rmsnorm_up_gate_silu = RMSNormUpGateSiLU(
-            self.model_args, device_id=0, num_devices=self.num_devices
-        )
+        if self.is_qwen36:
+            from tilert.models.qwen3_6.ops.rmsnorm_up_gate_silu import (
+                RMSNormUpGateSiLU as RMSNormUpGateSiLUQwen36,
+            )
+
+            rmsnorm_up_gate_silu = RMSNormUpGateSiLUQwen36(
+                self.model_args, device_id=0, num_devices=self.num_devices
+            )
+        else:
+            rmsnorm_up_gate_silu = RMSNormUpGateSiLU(
+                self.model_args, device_id=0, num_devices=self.num_devices
+            )
         post_attn_norm_weight, gate_weights, gate_scales, up_weights, up_scales = (
             rmsnorm_up_gate_silu.device_sharding(weights_hf, f"model.layers.{layer_id}.mlp")
         )
-        down_allreduce = DownAllReduce(self.model_args, device_id=0, num_devices=self.num_devices)
+        if self.is_qwen36:
+            from tilert.models.qwen3_6.ops.down_allreduce import (
+                DownAllReduce as DownAllReduceQwen36,
+            )
+
+            down_allreduce = DownAllReduceQwen36(
+                self.model_args, device_id=0, num_devices=self.num_devices
+            )
+        else:
+            down_allreduce = DownAllReduce(
+                self.model_args, device_id=0, num_devices=self.num_devices
+            )
         down_weights, down_scales = down_allreduce.device_sharding(
             weights_hf, f"model.layers.{layer_id}.mlp"
         )
@@ -382,7 +423,10 @@ class WeightConverter:
         weights_hf: dict[str, torch.Tensor],
         layer_id: int,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        """Transform MTP weights."""
+        """Transform MTP weights. Qwen3.6 has no MTP layer."""
+        if self.is_qwen36:
+            return {f"dev_{dev_id}": {} for dev_id in range(self.num_devices)}
+
         enorm_weight_key = f"model.layers.{layer_id}.enorm.weight"
         hnorm_weight_key = f"model.layers.{layer_id}.hnorm.weight"
         enorm_weight = weights_hf[enorm_weight_key]
@@ -419,9 +463,12 @@ class WeightConverter:
             weights = load_file(path, device=self.default_device)
             weights_dict.update(weights)
 
-        mla_weights = self.transform_mla(weights_dict, layer_idx)
+        attention_weights = self.transform_attention(weights_dict, layer_idx)
 
-        if layer_idx < self.num_dense_layers:
+        if self.is_qwen36:
+            # Qwen3.6 uses MoE in every layer; no dense MLP transform.
+            mlp_weights = self.transform_moe(weights_dict, layer_idx)
+        elif layer_idx < self.num_dense_layers:
             mlp_weights = self.transform_mlp(weights_dict, layer_idx)
         else:
             mlp_weights = self.transform_moe(weights_dict, layer_idx)
@@ -429,10 +476,10 @@ class WeightConverter:
         mtp_weights: dict[str, dict[str, torch.Tensor]] = {
             f"dev_{dev_id}": {} for dev_id in range(self.num_devices)
         }
-        if layer_idx >= self.num_dense_layers + self.num_moe_layers:
+        if not self.is_qwen36 and layer_idx >= self.num_dense_layers + self.num_moe_layers:
             mtp_weights = self.transform_mtp(weights_dict, layer_idx)
 
-        return mla_weights, mlp_weights, mtp_weights
+        return attention_weights, mlp_weights, mtp_weights
 
     def __process_head_weights(self) -> None:
         """Process head weights."""
@@ -450,9 +497,18 @@ class WeightConverter:
         }
 
         layer_idx = self.num_dense_layers + self.num_moe_layers
-        rmsnorm_head_proj = RMSNormHeadProj(
-            self.model_args, device_id=0, num_devices=self.num_devices
-        )
+        if self.is_qwen36:
+            from tilert.models.qwen3_6.ops.rmsnorm_head_proj import (
+                RMSNormHeadProj as RMSNormHeadProjQwen36,
+            )
+
+            rmsnorm_head_proj = RMSNormHeadProjQwen36(
+                self.model_args, device_id=0, num_devices=self.num_devices
+            )
+        else:
+            rmsnorm_head_proj = RMSNormHeadProj(
+                self.model_args, device_id=0, num_devices=self.num_devices
+            )
         gamma, head_proj = rmsnorm_head_proj.device_sharding(weights_hf)
 
         for dev_id in range(self.num_devices):
@@ -662,11 +718,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     model_type = args.model_type
-    model_args: ModelArgsDsav32 | ModelArgsGLM5
+    model_args: ModelArgsDsav32 | ModelArgsGLM5 | ModelArgsQwen36
     if model_type == "deepseek-v32":
         model_args = ModelArgsDsav32()
     elif model_type == "glm-5":
         model_args = ModelArgsGLM5()
+    elif model_type == "qwen3_6":
+        model_args = ModelArgsQwen36()
     else:
         raise ValueError(f"Invalid model type: {model_type}")
 
