@@ -43,6 +43,7 @@ logger = init_logging()
 _BACKENDS = {
     "deepseek_v3_2": "libtilert_dsv32.so",
     "glm5": "libtilert_glm5.so",
+    "qwen3_6": "libtilert_qwen36.so",  # TODO: Build this library
 }
 
 _loaded_backend: str | None = None

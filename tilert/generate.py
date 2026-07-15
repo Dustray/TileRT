@@ -9,6 +9,7 @@ import tilert
 if TYPE_CHECKING:
     from tilert.models.deepseek_v3_2.generator import DSAv32Generator
     from tilert.models.glm_5.generator import GLM5Generator
+    from tilert.models.qwen3_6.generator import Qwen36Generator
 from tilert.benchmark import BenchMode
 from tilert.benchmark import coding_prompt as coding_bench
 from tilert.benchmark import long_prompt as long_bench
@@ -27,7 +28,7 @@ def get_generator(
     top_k: int = 256,
     enable_thinking: bool = False,
     sampling_seed: int = 42,
-) -> "DSAv32Generator | GLM5Generator":
+) -> "DSAv32Generator | GLM5Generator | Qwen36Generator":
     """Load the matching backend .so and build the generator for ``model_type``.
 
     DeepSeek-V3.2 and GLM-5 ship as separate libraries; only one backend loads
@@ -69,6 +70,23 @@ def get_generator(
             sampling_seed=sampling_seed,
         )
 
+    if model_type == "qwen3_6":
+        from tilert.models.qwen3_6.generator import Qwen36Generator
+        from tilert.models.qwen3_6.model_args import ModelArgsQwen36
+
+        return Qwen36Generator(
+            model_args=ModelArgsQwen36(),
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            model_weights_dir=model_weights_dir,
+            with_mtp=with_mtp,
+            top_p=top_p,
+            top_k=top_k,
+            use_topp=top_p < 1.0,
+            sampling_seed=sampling_seed,
+            enable_thinking=enable_thinking,
+        )
+
     raise ValueError(f"unsupported model_type: {model_type!r}")
 
 
@@ -84,7 +102,7 @@ def parse_args():  # type: ignore
         "--model",
         type=str,
         default="deepseek_v3_2",
-        choices=["deepseek_v3_2", "glm5"],
+        choices=["deepseek_v3_2", "glm5", "qwen3_6"],
         help="Model type to use (default: deepseek_v3_2).",
     )
     parser.add_argument("--max-new-tokens", type=int, default=4000, help="Max tokens to generate")
