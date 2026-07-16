@@ -149,7 +149,9 @@ class GQAAttention(TileRTModule):
         self.algorithm = algorithm
         self.n_heads = model_args.n_heads
         self.n_kv_heads = model_args.n_kv_heads
+        self.dim = model_args.dim
         self.head_dim = model_args.qk_head_dim
+        self.v_head_dim = model_args.v_head_dim
         self.rope_dim = model_args.rope_dim
         self.num_local_heads = self.n_heads // num_devices
         self.num_local_kv_heads = max(1, self.n_kv_heads // num_devices)
@@ -199,11 +201,8 @@ class GQAAttention(TileRTModule):
         q_norm_w = weights_map[f"{prefix}.q_norm.weight"]
         k_norm_w = weights_map[f"{prefix}.k_norm.weight"]
 
-        q_out, _ = q_w.shape
-        k_out, _ = k_w.shape
-        v_out, _ = v_w.shape
         q_per_dev = self.num_local_heads * self.head_dim
-        kv_per_dev = self.num_local_kv_heads * self.head_dim
+        kv_per_dev = self.num_local_kv_heads * self.v_head_dim
         qkv_parts = [
             q_w[i * q_per_dev : (i + 1) * q_per_dev]
             for i in range(self.num_devices)
@@ -216,8 +215,8 @@ class GQAAttention(TileRTModule):
             v_w[i * kv_per_dev : (i + 1) * kv_per_dev]
             for i in range(self.num_devices)
         ]
-        # o_proj input dim equals the Q head count * head_dim.
-        o_per_dev = self.num_local_heads * self.head_dim
+        # o_proj input dim equals the Q head count * value_head_dim.
+        o_per_dev = self.num_local_heads * self.v_head_dim
         o_parts = [
             o_w[:, i * o_per_dev : (i + 1) * o_per_dev]
             for i in range(self.num_devices)
@@ -235,7 +234,7 @@ class GQAAttention(TileRTModule):
             for i in range(self.num_devices)
         ]
         k_norm_parts = [
-            k_norm_w[i * self.num_local_kv_heads * self.head_dim : (i + 1) * self.num_local_kv_heads * self.head_dim]
+            k_norm_w[i * self.num_local_kv_heads * self.v_head_dim : (i + 1) * self.num_local_kv_heads * self.v_head_dim]
             for i in range(self.num_devices)
         ]
 
@@ -270,7 +269,7 @@ class GQAAttention(TileRTModule):
         self.out = torch.zeros(
             batch_size,
             seq_len,
-            self.n_heads * self.head_dim,
+            self.n_heads * self.v_head_dim,
             dtype=torch.bfloat16,
             device=device,
         )
@@ -278,26 +277,26 @@ class GQAAttention(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
-        qkv_out = (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
+        qkv_out = self.n_heads * self.head_dim + 2 * self.n_kv_heads * self.v_head_dim
         qkv_w = torch.randn(
             qkv_out,
-            self.num_local_heads * self.head_dim,
+            self.dim,
             dtype=torch.bfloat16,
             device=device,
         )
         o_w = torch.randn(
-            self.num_local_heads * self.head_dim,
-            self.num_local_heads * self.head_dim,
+            self.dim,
+            self.n_heads * self.v_head_dim,
             dtype=torch.bfloat16,
             device=device,
         )
         q_norm_w = torch.randn(
-            self.num_local_heads * self.head_dim,
+            self.n_heads * self.head_dim,
             dtype=torch.float32,
             device=device,
         )
         k_norm_w = torch.randn(
-            self.num_local_kv_heads * self.head_dim,
+            self.n_kv_heads * self.v_head_dim,
             dtype=torch.float32,
             device=device,
         )
@@ -310,8 +309,8 @@ class GQAAttention(TileRTModule):
         ) = converter.convert_to_general(
             [
                 qkv_w,
-                torch.empty(0, device=device),
-                torch.empty(0, device=device),
+                torch.empty(0, dtype=torch.bfloat16, device=device),
+                torch.empty(0, dtype=torch.bfloat16, device=device),
                 o_w,
                 q_norm_w,
                 k_norm_w,
@@ -337,21 +336,25 @@ class GQAAttention(TileRTModule):
         assert self.o_proj_weights is not None
         bsz, seq_len, _ = x.shape
 
-        hidden_dim = self.num_local_heads * self.head_dim
         qkv = x @ self.qkv_proj_weights.T
         q, k, v = torch.split(
             qkv,
             [
                 self.num_local_heads * self.head_dim,
-                self.num_local_kv_heads * self.head_dim,
-                self.num_local_kv_heads * self.head_dim,
+                self.num_local_kv_heads * self.v_head_dim,
+                self.num_local_kv_heads * self.v_head_dim,
             ],
             dim=-1,
         )
 
         q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim).transpose(1, 2)
+
+        # apply_rotary_emb expects (bsz, seq_len, n_heads, head_dim);
+        # transpose so dim 1 is the sequence dimension, then restore.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
 
         rope_dim = self.rope_dim
         no_pe_dim = self.head_dim - rope_dim
@@ -360,10 +363,14 @@ class GQAAttention(TileRTModule):
 
         from tilert.models.utils import apply_rotary_emb
 
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=False)
-        k_pe = apply_rotary_emb(k_pe, freqs_cis, interleaved=False)
+        local_freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
+        q_pe = apply_rotary_emb(q_pe, local_freqs_cis, interleaved=False)
+        k_pe = apply_rotary_emb(k_pe, local_freqs_cis, interleaved=False)
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
 
         k_cache[:bsz, start_pos : start_pos + seq_len] = k.transpose(1, 2)
         v_cache[:bsz, start_pos : start_pos + seq_len] = v.transpose(1, 2)

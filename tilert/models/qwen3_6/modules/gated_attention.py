@@ -82,6 +82,9 @@ class QwenAttentionRef(TileRTModule):
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
         del batch_size, seq_len
 
+    def tilert_forward(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("QwenAttentionRef is reference-only")
+
     @staticmethod
     def _rmsnorm_heads(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         """Apply RMSNorm along the head dimension.
@@ -216,8 +219,14 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reference GQA forward."""
-        out, k_cache, v_cache = self.attn_ref.golden_forward(
+        """Reference GQA forward.
+
+        Weights are lazily initialized with random values on first call so the
+        module can be sanity-tested without a checkpoint.
+        """
+        if self.attn.qkv_proj_weights is None:
+            self.attn.init_random_weights(device=str(x.device))
+        out, k_cache, v_cache = self.attn.golden_forward(
             x, start_pos, freqs_cis, k_cache, v_cache, mask
         )
         return out, k_cache, v_cache

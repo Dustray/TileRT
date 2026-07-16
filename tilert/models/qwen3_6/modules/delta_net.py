@@ -12,10 +12,7 @@ from tilert.models.qwen3_6.ops.delta_net import (
     DeltaNetOp,
     DeltaNetAlgorithm,
 )
-from tilert.models.qwen3_6.ops.rmsnorm_up_gate_silu import (
-    RMSNormUpGateSiLU,
-    RMSNormUpGateSiLUAlgorithm,
-)
+from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
 
 
 class QwenDeltaNetRef(TileRTModule):
@@ -41,8 +38,10 @@ class QwenDeltaNetRef(TileRTModule):
             num_devices=num_devices,
         )
         self.delta_q_heads = model_args.delta_q_heads
-        self.delta_kv_heads = model_args.delta_kv_heads
-        self.delta_head_dim = model_args.delta_head_dim
+        self.delta_k_heads = model_args.delta_k_heads
+        self.delta_v_heads = model_args.delta_v_heads
+        self.delta_key_head_dim = model_args.delta_key_head_dim
+        self.delta_value_head_dim = model_args.delta_value_head_dim
 
         self.in_proj_qkv_weight: torch.Tensor | None = None
         self.in_proj_z_weight: torch.Tensor | None = None
@@ -86,6 +85,26 @@ class QwenDeltaNetRef(TileRTModule):
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
         del batch_size, seq_len
 
+    def golden_forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference forward: simple DeltaNet wrapper.
+
+        Delegates to ``DeltaNetOp.golden_forward`` to keep the reference
+        computation in one place.  Weights are lazily initialized with random
+        values on first call so the module can be sanity-tested without a
+        checkpoint.
+        """
+        if self.attn.in_proj_qkv_weights is None:
+            self.attn.init_random_weights(device=str(x.device))
+        return self.attn.golden_forward(x, start_pos, state)
+
+    def tilert_forward(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("QwenDeltaNetRef is reference-only")
+
 
 class DeltaNet(SerializableTileRTModule):
     """DeltaNet linear attention layer for Qwen3.6.
@@ -110,6 +129,7 @@ class DeltaNet(SerializableTileRTModule):
         device_id: int,
         num_devices: int,
         remove_selected: bool = False,
+        ffn_op: QwenMoeBlock | None = None,
     ):
         super().__init__(
             model_args=model_args,
@@ -131,11 +151,14 @@ class DeltaNet(SerializableTileRTModule):
         )
         self.register_op(self.attn)
 
-        self.ffn = RMSNormUpGateSiLU(
-            model_args=model_args,
-            device_id=device_id,
-            num_devices=num_devices,
-            algorithm=RMSNormUpGateSiLUAlgorithm.FP8MMA,
+        self.ffn = (
+            ffn_op
+            if ffn_op is not None
+            else QwenMoeBlock(
+                model_args=model_args,
+                device_id=device_id,
+                num_devices=num_devices,
+            )
         )
         self.register_op(self.ffn)
 
@@ -145,12 +168,18 @@ class DeltaNet(SerializableTileRTModule):
         start_pos: int,
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Reference forward: DeltaNet linear attention + FFN."""
+        """Reference forward: DeltaNet linear attention + FFN.
+
+        Weights are lazily initialized with random values on first call so the
+        module can be sanity-tested without a checkpoint.
+        """
+        if self.attn.in_proj_qkv_weights is None:
+            self.attn.init_random_weights(device=str(x.device))
+        if self.ffn.moe.rmsnorm_expert_proj.ref_rmsnorm is None:
+            self.ffn.init_random_weights()
         prev_state = state.get("delta_state") if state is not None else None
         attn_out, new_state = self.attn.golden_forward(x, start_pos, prev_state)
         ffn_out = self.ffn.golden_forward(attn_out)
-        if ffn_out.dim() == 4:
-            ffn_out = ffn_out.sum(dim=2)
         next_state = {"delta_state": new_state} if state is not None else None
         return ffn_out, next_state
 
@@ -160,12 +189,10 @@ class DeltaNet(SerializableTileRTModule):
         start_pos: int,
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Optimized forward using ``DeltaNetOp`` + ``RMSNormUpGateSiLU``."""
+        """Optimized forward using ``DeltaNetOp`` + ``QwenMoeBlock``."""
         prev_state = state.get("delta_state") if state is not None else None
         attn_out, new_state = self.attn.forward(x, start_pos, prev_state)
         ffn_out = self.ffn.forward(attn_out)
-        if ffn_out.dim() == 4:
-            ffn_out = ffn_out.sum(dim=2)
         next_state = {"delta_state": new_state} if state is not None else None
         return ffn_out, next_state
 

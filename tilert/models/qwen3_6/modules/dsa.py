@@ -63,6 +63,7 @@ class QwenDsa(SerializableTileRTModule):
                     model_args=model_args,
                     device_id=device_id,
                     num_devices=num_devices,
+                    ffn_op=ffn_op,
                 )
             else:
                 block = GatedAttention(
@@ -169,7 +170,7 @@ class QwenDsa(SerializableTileRTModule):
                 self.model_args.max_batch_size,
                 cache_seq_len,
                 self.model_args.n_kv_heads,
-                self.model_args.qk_head_dim,
+                self.model_args.v_head_dim,
                 dtype=torch.bfloat16,
                 device=dev,
             ),

@@ -184,11 +184,14 @@ class DeltaNetOp(TileRTModule):
         )
         self.algorithm = algorithm
         self.n_heads = model_args.delta_q_heads
-        self.n_kv_heads = model_args.delta_kv_heads
-        self.head_dim = model_args.delta_head_dim
+        self.n_k_heads = model_args.delta_k_heads
+        self.n_v_heads = model_args.delta_v_heads
+        self.head_dim = model_args.delta_key_head_dim
+        self.value_head_dim = model_args.delta_value_head_dim
         self.dim = model_args.dim
         self.num_local_heads = self.n_heads // num_devices
-        self.num_local_kv_heads = max(1, self.n_kv_heads // num_devices)
+        self.num_local_k_heads = max(1, self.n_k_heads // num_devices)
+        self.num_local_v_heads = max(1, self.n_v_heads // num_devices)
 
         self.tilert_weights_alias = DeltaNetTilertWeightsAlias()
         self.ref_weights_alias = DeltaNetRefWeightsAlias()
@@ -400,20 +403,19 @@ class DeltaNetOp(TileRTModule):
         """
         bsz, seq_len, _ = q.shape
         q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.n_k_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.n_v_heads, self.value_head_dim).transpose(1, 2)
 
-        # Expand k/v to match q head count for the per-head recurrence.
-        if self.n_heads != self.n_kv_heads:
-            reps = self.n_heads // self.n_kv_heads
-            k = k.repeat_interleave(reps, dim=1)
-            v = v.repeat_interleave(reps, dim=1)
+        # Expand q/k to match v head count for the per-head recurrence.
+        reps = self.n_v_heads // self.n_k_heads
+        q = q.repeat_interleave(reps, dim=1)
+        k = k.repeat_interleave(reps, dim=1)
 
         if state is None:
             state = torch.zeros(
                 bsz,
-                self.n_heads,
-                self.head_dim,
+                self.n_v_heads,
+                self.value_head_dim,
                 self.head_dim,
                 dtype=q.dtype,
                 device=q.device,
@@ -428,10 +430,7 @@ class DeltaNetOp(TileRTModule):
             out_t = (qt.unsqueeze(-1) * state).sum(dim=-2)
             outputs.append(out_t)
         output = torch.stack(outputs, dim=2)
-        # Collapse from n_heads to n_kv_heads by averaging groups.
-        if self.n_heads != self.n_kv_heads:
-            output = output.view(bsz, self.n_kv_heads, reps, seq_len, self.head_dim).mean(dim=2)
-        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_kv_heads * self.head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_v_heads * self.value_head_dim)
         return output, state
 
     def golden_forward(
@@ -453,13 +452,12 @@ class DeltaNetOp(TileRTModule):
             qkv,
             [
                 self.n_heads * self.head_dim,
-                self.n_kv_heads * self.head_dim,
-                self.n_kv_heads * self.head_dim,
+                self.n_k_heads * self.head_dim,
+                self.n_v_heads * self.value_head_dim,
             ],
             dim=-1,
         )
         attn_out, new_state = self._linear_attention(q, k, v, state)
-        # Project only the KV-head portion (n_heads may differ from n_kv_heads).
         out = attn_out @ self.out_proj_weights.T
         return out, new_state
 

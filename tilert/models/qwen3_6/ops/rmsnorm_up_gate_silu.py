@@ -187,6 +187,7 @@ class RMSNormUpGateSiLU(TileRTModule):
                 key_prefix,
                 weights_dict,
                 self.num_devices,
+                self.inter_dim,
             )
         )
         gate_weights = gate_weights.reshape(self.n_experts, self.num_devices, -1, self.dim)
@@ -324,6 +325,10 @@ class RMSNormUpGateSiLU(TileRTModule):
         bsz = x_in.shape[0]
         seq_len = x_in.shape[1]
         assert bsz == 1
+        if self.ref_norm_gamma.device != x_in.device:
+            self.ref_norm_gamma = self.ref_norm_gamma.to(x_in.device)
+            self.ref_gate = self.ref_gate.to(x_in.device)
+            self.ref_up = self.ref_up.to(x_in.device)
         x_in_rmsnorm = torch.nn.functional.rms_norm(
             x_in.float(), [x_in.size(-1)], self.ref_norm_gamma, self.eps
         )

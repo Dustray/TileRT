@@ -125,7 +125,8 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
         num_sms = 128
         dim_per_sm = dim // num_sms
         dim_scale_dim = dim // args.block_size
-        expert_dim = args.inter_dim // 8
+        base_inter_dim = getattr(args, "moe_inter_dim", args.inter_dim)
+        expert_dim = base_inter_dim // self.num_devices
         k_chunks = expert_dim // 32
         scale_cols = expert_dim // args.block_size
 
@@ -450,8 +451,10 @@ class ExpertDownAllReduce(TileRTModule):
         device_id: int = 0,
     ) -> None:
         sharded_list = self.device_sharding(state_dict, key_prefix)
-        down_weights = sharded_list[0][device_id]
-        down_scales = sharded_list[1][device_id]
+        # ``device_sharding`` returns (n_experts, num_devices, ...); select the
+        # requested device across all experts.
+        down_weights = sharded_list[0][:, device_id]
+        down_scales = sharded_list[1][:, device_id]
 
         down_list = [
             weight_dequant(down_weight, down_scale)
@@ -481,6 +484,8 @@ class ExpertDownAllReduce(TileRTModule):
     def init_random_weights(self, device_id: int | None = None) -> None:
         if device_id is None:
             device_id = self.device_id
+        if device_id is None:
+            device_id = 0
         dev = f"cuda:{device_id}"
         shared_down = torch.randn(
             self.dim, self.moe_inter_dim, dtype=torch.bfloat16, device=dev
@@ -513,8 +518,10 @@ class ExpertDownAllReduce(TileRTModule):
         )
         self.init_reference_weights(state_dict, "mlp", device_id)
         sharded_list = self.device_sharding(state_dict, "mlp")
+        # ``sharded_list`` has shape (n_experts, num_devices, ...); select all
+        # experts for the requested device.
         sharded_state_dict = {
-            alias: sharded_list[i][device_id] for i, alias in enumerate(self.tensor_alias)
+            alias: sharded_list[i][:, device_id] for i, alias in enumerate(self.tensor_alias)
         }
         self.init_tilert_weights(sharded_state_dict)
 
@@ -526,15 +533,21 @@ class ExpertDownAllReduce(TileRTModule):
     ) -> torch.Tensor:
         assert self.ref_down is not None
         assert vec_in.dim() == 4 and vec_in.size(0) == 1
+        # ``rmsnorm_expert_proj`` returns scores as a 2-D tensor when the input
+        # batch dimension is 1 (it calls ``view(-1, dim)``).  Promote back to
+        # ``[1, seq_len, ...]`` so the token-wise indexing below is consistent.
+        if indices.ndim == 2:
+            indices = indices.unsqueeze(0)
+            scores = scores.unsqueeze(0)
         seq_len = vec_in.shape[1]
         hidden_out_list = []
         for s in range(seq_len):
             hidden_out_w2_list = []
-            hidden_out_w2_shared = vec_in[0, s, 0].float() @ self.ref_down[0].float().T
+            hidden_out_w2_shared = vec_in[0, s, 0].float() @ self.ref_down[0].float().mT
             hidden_out_w2_list.append(hidden_out_w2_shared)
             ref_down_sel = self.ref_down[1:][indices[0, s]]
             for i in range(self.n_activated_experts):
-                hidden_out_w2_sel = vec_in[0, s, i + 1].float() @ ref_down_sel[i].float().T
+                hidden_out_w2_sel = vec_in[0, s, i + 1].float() @ ref_down_sel[i].float().mT
                 hidden_out_w2_list.append(hidden_out_w2_sel * scores[0, s, i])
             hidden_out_w2 = torch.stack(hidden_out_w2_list, dim=0).to(torch.bfloat16)
             hidden_out_w2 = torch.sum(hidden_out_w2, dim=0)

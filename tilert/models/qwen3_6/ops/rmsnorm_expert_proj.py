@@ -126,8 +126,9 @@ class RMSNormExpertProj(TileRTModule):
         self.is_tilert_weights_init = True
 
     def init_random_weights(self) -> None:
-        proj_weight = torch.randn(self.n_routed_experts, self.dim)
-        rms_norm_weight = torch.randn(self.dim, dtype=torch.float32)
+        device = f"cuda:{self.device_id}" if torch.cuda.is_available() else "cpu"
+        proj_weight = torch.randn(self.n_routed_experts, self.dim, device=device)
+        rms_norm_weight = torch.randn(self.dim, dtype=torch.float32, device=device)
         ref_state_dict = dict(
             zip(
                 self.ref_weights_alias(),

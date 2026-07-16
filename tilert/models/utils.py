@@ -33,12 +33,14 @@ def precompute_freqs_cis(  # type: ignore[no-untyped-def]
     Returns:
         torch.Tensor: Precomputed complex exponential values for positional embeddings.
     """
-    dim = args.qk_rope_head_dim
+    dim = getattr(args, "qk_rope_head_dim", getattr(args, "rope_dim", None))
+    if dim is None:
+        raise AttributeError("args must contain qk_rope_head_dim or rope_dim")
     seqlen = args.max_seq_len
-    beta_fast = args.beta_fast
-    beta_slow = args.beta_slow
+    beta_fast = getattr(args, "beta_fast", 32)
+    beta_slow = getattr(args, "beta_slow", 1)
     base = args.rope_theta if theta_override is _THETA_OVERRIDE_UNSET else theta_override
-    factor = args.rope_factor if factor_override is _FACTOR_OVERRIDE_UNSET else factor_override
+    factor = getattr(args, "rope_factor", None) if factor_override is _FACTOR_OVERRIDE_UNSET else factor_override
 
     def find_correction_dim(num_rotations: float, dim: int, base: float, max_seq_len: int) -> float:
         """
@@ -108,8 +110,10 @@ def precompute_freqs_cis(  # type: ignore[no-untyped-def]
         return torch.clamp(linear_func, 0, 1)
 
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    if factor is not None and seqlen > args.original_seq_len:
-        low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
+    if factor is not None and seqlen > getattr(args, "original_seq_len", seqlen):
+        low, high = find_correction_range(
+            beta_fast, beta_slow, dim, base, getattr(args, "original_seq_len", seqlen)
+        )
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
