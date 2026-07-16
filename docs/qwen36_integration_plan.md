@@ -372,13 +372,51 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 - 所有 `qwen3_6/ops/*.py` 通过 AST 语法检查。
 - 所有 `qwen3_6/modules/*.py` 通过 AST 语法检查。
 - `weight_converter.py` 通过 AST 语法检查。
-- **2025-07-17**: `WeightConverter(..., test_mode=True).to_tilert_weights()` 在真实 Qwen3.6-35B-A3B checkpoint 上成功完成；CLI `--model_type qwen3_6` 同步可用，输出 9 个 safetensors shard（共 497 张量）。
+- **2025-07-17**: `WeightConverter(..., test_mode=True).to_tilert_weights()` 在真实 Qwen3.6-35B-A3B checkpoint 上成功完成；CLI `--model_type qwen3_6` 同步可用。
+- **2025-07-17**: 完整 40 层非 test_mode 转换成功，输出 9 个 shard，共 6497 张量，总大小约 24.9 GB。
+
+### 8.8 原始 checkpoint 与 TileRT 输出差异说明
+
+| 模块 | 原始 checkpoint 中张量数 | 原始大小 | 当前处理方式 |
+|---|---|---|---|
+| `model.language_model.*`（40 层文本模型） | 692 | 68.3 GB | ✅ 完整转换；输出 6497 张量 |
+| `model.visual.*`（多模态视觉塔） | 333 | 0.89 GB | ⚠️ 首版跳过，不参与转换 |
+| `mtp.*` / `mtp.layers.*`（1 层 MTP） | 19 | 1.69 GB | ⚠️ 首版跳过，不参与转换 |
+| `lm_head.weight` 等顶层 | 1 | 1.02 GB | ✅ 已包含在最终 `layer_40_*` head 输出中 |
+
+- 原始 checkpoint 总大小约 **71.9 GB**（1045 张量）。
+- TileRT 输出约 **24.9 GB**，约为原始语言模型部分（68.3 GB）的 **36.5%**。
+- 尺寸差异来源：
+  1. **视觉塔和 MTP 被跳过**：共约 2.58 GB 未进入输出。
+  2. **转换格式改变**：原始权重为 bf16；TileRT 输出中权重保持 bf16，但每个 expert 增加了 float32 `weight_scale_inv`（fake all-ones），且按 device 拆分产生重复/广播的 scale 张量，导致部分层尺寸非线性下降。
+  3. **当前 scale 广播策略**：Qwen3.6 `inter_dim=512`，`block_size=128`，每个 expert 的 scale 行数只有 4 行，少于 `num_devices=8`，因此 scale 在 device 维度广播而不是拆分，整体张量数增加但单张尺寸减小。
+
   - `linear_attention` 层（0, 30）输出 `linear_attn.*` 权重。
   - `full_attention` 层（39）输出 `self_attn.*` 权重。
   - MoE 堆叠 expert 权重被正确拆分并生成 fake float32 `weight_scale_inv`。
   - 缺失的 `mlp.gate.e_score_correction_bias` 默认补 0；缺失的 FP8 scales 由 op 合成全 1。
 
-### 8.8 待办事项
+### 8.9 模块引用持有者对齐 (2026-07-16)
+
+- 更新 `tilert/models/qwen3_6/modules/delta_net.py` 中的 `QwenDeltaNetRef`：
+  - 字段从旧的 `self_attn.q/k/v/o_proj_weight` 改为与 `ops/delta_net.py` 的
+    `DeltaNetRefWeightsAlias` 对齐的 `linear_attn.*` 字段：
+    `in_proj_qkv_weight`、`in_proj_z_weight`、`in_proj_a_weight`、
+    `in_proj_b_weight`、`conv1d_weight`、`A_log`、`dt_bias`、
+    `norm_weight`、`out_proj_weight`。
+  - `init_reference_weights` 改为读取 `linear_attn.in_proj_qkv.weight`、
+    `linear_attn.in_proj_z.weight` 等键。
+- 更新 `tilert/models/qwen3_6/modules/gated_attention.py` 中的 `QwenAttentionRef`：
+  - 新增 `q_norm_weight` 和 `k_norm_weight` 字段，与 `ops/gqa_attention.py` 的
+    `GQAAttentionRefWeightsAlias` 对齐。
+  - `init_reference_weights` 改为同时读取 `self_attn.q_norm.weight` 和
+    `self_attn.k_norm.weight`。
+  - `golden_forward` 在 RoPE 之前对 Q/K 投影结果应用 per-head RMSNorm。
+- 两个 reference-only holder 仍只实现 `golden_forward`；因 `TileRTModule` 基类要求
+  同时实现 `tilert_forward`，直接实例化会触发抽象类错误。它们仅作为
+  `DeltaNet` / `GatedAttention` 的注册子 op 使用，由父模块转发调用。
+
+### 8.10 待办事项
 
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
@@ -391,5 +429,6 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | P2 | `transform_attention` 补全 | ✅ 已按 `linear/full_attention` 分支读取真实权重名 |
 | P2 | `transform_moe` 补全 | ✅ 已适配堆叠 expert 权重格式 |
 | P2 | `transform_mtp` 补全 | ⚠️ 仍为 stub；checkpoint 含 `mtp.*`，但首版可跳过 |
-| P3 | 完整 40 层转换 | 关闭 test_mode 验证全量转换 |
-| P4 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |
+| P3 | 完整 40 层转换 | ✅ 已完成（9 shards，6497 tensors，~24.9 GB） |
+| P4 | 模块引用持有者对齐 | ✅ 已完成（`delta_net.py`、`gated_attention.py`） |
+| P5 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |

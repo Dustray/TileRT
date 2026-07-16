@@ -21,8 +21,9 @@ from tilert.models.qwen3_6.ops.unproj_o_allreduce import (
 class QwenAttentionRef(TileRTModule):
     """Lightweight reference-only holder for GQA weights.
 
-    Holds q/k/v/o_proj and input/output layernorm weights for the golden
-    forward path.  The optimized path uses the TileRT ops below.
+    Mirrors the weight aliases in ``ops.gqa_attention.GQAAttentionRefWeightsAlias``.
+    Holds q/k/v/o_proj, q_norm/k_norm, and input/output layernorm weights for
+    the golden forward path.  The optimized path uses the TileRT ops below.
     """
 
     def __init__(
@@ -49,6 +50,8 @@ class QwenAttentionRef(TileRTModule):
         self.k_proj_weight: torch.Tensor | None = None
         self.v_proj_weight: torch.Tensor | None = None
         self.o_proj_weight: torch.Tensor | None = None
+        self.q_norm_weight: torch.Tensor | None = None
+        self.k_norm_weight: torch.Tensor | None = None
         self.input_layernorm_weight: torch.Tensor | None = None
         self.post_attention_layernorm_weight: torch.Tensor | None = None
 
@@ -60,10 +63,13 @@ class QwenAttentionRef(TileRTModule):
         return {}
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        self.q_proj_weight = state_dict["self_attn.q_proj.weight"]
-        self.k_proj_weight = state_dict["self_attn.k_proj.weight"]
-        self.v_proj_weight = state_dict["self_attn.v_proj.weight"]
-        self.o_proj_weight = state_dict["self_attn.o_proj.weight"]
+        prefix = "self_attn"
+        self.q_proj_weight = state_dict[f"{prefix}.q_proj.weight"]
+        self.k_proj_weight = state_dict[f"{prefix}.k_proj.weight"]
+        self.v_proj_weight = state_dict[f"{prefix}.v_proj.weight"]
+        self.o_proj_weight = state_dict[f"{prefix}.o_proj.weight"]
+        self.q_norm_weight = state_dict[f"{prefix}.q_norm.weight"]
+        self.k_norm_weight = state_dict[f"{prefix}.k_norm.weight"]
         self.input_layernorm_weight = state_dict["input_layernorm.weight"]
         self.post_attention_layernorm_weight = state_dict["post_attention_layernorm.weight"]
 
@@ -75,6 +81,21 @@ class QwenAttentionRef(TileRTModule):
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
         del batch_size, seq_len
+
+    @staticmethod
+    def _rmsnorm_heads(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Apply RMSNorm along the head dimension.
+
+        Args:
+            x: Tensor of shape (bsz, n_heads, seq_len, head_dim).
+            weight: Per-head or per-element weight, broadcastable to head_dim.
+            eps: Small constant for numerical stability.
+
+        Returns:
+            Normalized tensor with the same shape as ``x``.
+        """
+        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+        return x * weight / rms
 
     def golden_forward(
         self,
@@ -101,6 +122,12 @@ class QwenAttentionRef(TileRTModule):
         q = h.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply per-head RMSNorm to Q/K query/key projections when present.
+        if self.q_norm_weight is not None:
+            q = self._rmsnorm_heads(q, self.q_norm_weight)
+        if self.k_norm_weight is not None:
+            k = self._rmsnorm_heads(k, self.k_norm_weight)
 
         q_pe, q_no_pe = torch.split(q, [self.rope_dim, self.no_pe_dim], dim=-1)
         k_pe, k_no_pe = torch.split(k, [self.rope_dim, self.no_pe_dim], dim=-1)

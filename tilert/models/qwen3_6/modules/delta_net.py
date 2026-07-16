@@ -21,10 +21,11 @@ from tilert.models.qwen3_6.ops.rmsnorm_up_gate_silu import (
 class QwenDeltaNetRef(TileRTModule):
     """Reference-only holder for DeltaNet weights.
 
-    This module stores the per-layer q_proj/k_proj/v_proj/o_proj and the two
-    RMSNorm weights needed by the DeltaNet block.  It is not used on the
-    optimized path; it exists so that the golden path can be implemented as
-    soon as the exact DeltaNet math is available.
+    Mirrors the weight aliases in ``ops.delta_net.DeltaNetRefWeightsAlias``.
+    The original checkpoint stores the linear attention weights under the
+    ``linear_attn.*`` prefix; this holder keeps those tensors available for
+    the golden/reference path while the optimized path consumes the TileRT
+    sharded aliases produced by the weight converter.
     """
 
     def __init__(
@@ -43,10 +44,15 @@ class QwenDeltaNetRef(TileRTModule):
         self.delta_kv_heads = model_args.delta_kv_heads
         self.delta_head_dim = model_args.delta_head_dim
 
-        self.q_proj_weight: torch.Tensor | None = None
-        self.k_proj_weight: torch.Tensor | None = None
-        self.v_proj_weight: torch.Tensor | None = None
-        self.o_proj_weight: torch.Tensor | None = None
+        self.in_proj_qkv_weight: torch.Tensor | None = None
+        self.in_proj_z_weight: torch.Tensor | None = None
+        self.in_proj_a_weight: torch.Tensor | None = None
+        self.in_proj_b_weight: torch.Tensor | None = None
+        self.conv1d_weight: torch.Tensor | None = None
+        self.A_log: torch.Tensor | None = None
+        self.dt_bias: torch.Tensor | None = None
+        self.norm_weight: torch.Tensor | None = None
+        self.out_proj_weight: torch.Tensor | None = None
         self.input_layernorm_weight: torch.Tensor | None = None
         self.post_attention_layernorm_weight: torch.Tensor | None = None
 
@@ -58,10 +64,16 @@ class QwenDeltaNetRef(TileRTModule):
         return {}
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        self.q_proj_weight = state_dict["self_attn.q_proj.weight"]
-        self.k_proj_weight = state_dict["self_attn.k_proj.weight"]
-        self.v_proj_weight = state_dict["self_attn.v_proj.weight"]
-        self.o_proj_weight = state_dict["self_attn.o_proj.weight"]
+        prefix = "linear_attn"
+        self.in_proj_qkv_weight = state_dict[f"{prefix}.in_proj_qkv.weight"]
+        self.in_proj_z_weight = state_dict[f"{prefix}.in_proj_z.weight"]
+        self.in_proj_a_weight = state_dict[f"{prefix}.in_proj_a.weight"]
+        self.in_proj_b_weight = state_dict[f"{prefix}.in_proj_b.weight"]
+        self.conv1d_weight = state_dict[f"{prefix}.conv1d.weight"]
+        self.A_log = state_dict[f"{prefix}.A_log"]
+        self.dt_bias = state_dict[f"{prefix}.dt_bias"]
+        self.norm_weight = state_dict[f"{prefix}.norm.weight"]
+        self.out_proj_weight = state_dict[f"{prefix}.out_proj.weight"]
         self.input_layernorm_weight = state_dict["input_layernorm.weight"]
         self.post_attention_layernorm_weight = state_dict["post_attention_layernorm.weight"]
 
