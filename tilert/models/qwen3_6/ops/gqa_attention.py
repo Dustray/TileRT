@@ -63,7 +63,7 @@ def gqa_attention(
 
 @dataclass
 class GQAAttentionRefWeightsAlias:
-    """Reference weights alias for GQA attention."""
+    """Reference weights alias for GQA attention (Qwen3.6 full_attention layer)."""
 
     key_prefix: str = "self_attn"
 
@@ -74,10 +74,8 @@ class GQAAttentionRefWeightsAlias:
             f"{self.key_prefix}.k_proj.weight",
             f"{self.key_prefix}.v_proj.weight",
             f"{self.key_prefix}.o_proj.weight",
-            f"{self.key_prefix}.q_proj.weight_scale_inv",
-            f"{self.key_prefix}.k_proj.weight_scale_inv",
-            f"{self.key_prefix}.v_proj.weight_scale_inv",
-            f"{self.key_prefix}.o_proj.weight_scale_inv",
+            f"{self.key_prefix}.q_norm.weight",
+            f"{self.key_prefix}.k_norm.weight",
         ]
 
     def __call__(self) -> list[str]:
@@ -89,17 +87,17 @@ class GQAAttentionTilertWeightsAlias:
     """TileRT weights alias for GQA attention."""
 
     qkv_proj_weights = "qkv_proj_weights"
-    qkv_proj_scales = "qkv_proj_scales"
     o_proj_weights = "o_proj_weights"
-    o_proj_scales = "o_proj_scales"
+    q_norm_weights = "q_norm_weights"
+    k_norm_weights = "k_norm_weights"
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
         return [
             self.qkv_proj_weights,
-            self.qkv_proj_scales,
             self.o_proj_weights,
-            self.o_proj_scales,
+            self.q_norm_weights,
+            self.k_norm_weights,
         ]
 
     def __call__(self) -> list[str]:
@@ -115,19 +113,17 @@ class GQAAttentionAlgorithm(Enum):
 class GQAAttentionWeightsConverter(TilertWeightsConverter):
     """GQA attention weights converter.
 
-    For now this converter simply packs q/k/v/o_proj (and their FP8 scales) into
-    the TileRT aliases.  The actual device sharding / swizzling will depend on the
-    kernel layout and will be filled in once the CUDA implementation is ready.
+    The checkpoint stores q/k/v/o_proj and the per-head q_norm/k_norm weights
+    in plain bf16.  We keep the original layout; the CUDA kernel will apply
+    RoPE and head-dim RMSNorm directly.
     """
 
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_proj_w, k_proj_w, v_proj_w, o_proj_w, q_s, k_s, v_s, o_s = weights_list
-        # Concatenate q/k/v along the output dimension.
+        q_proj_w, k_proj_w, v_proj_w, o_proj_w, q_norm_w, k_norm_w = weights_list
         qkv_proj_weights = torch.cat([q_proj_w, k_proj_w, v_proj_w], dim=0)
-        qkv_proj_scales = torch.cat([q_s, k_s, v_s], dim=0)
-        return qkv_proj_weights, qkv_proj_scales, o_proj_w, o_s
+        return qkv_proj_weights, o_proj_w, q_norm_w, k_norm_w
 
 
 class GQAAttention(TileRTModule):
@@ -162,9 +158,9 @@ class GQAAttention(TileRTModule):
         self.ref_weights_alias = GQAAttentionRefWeightsAlias()
 
         self.qkv_proj_weights: torch.Tensor | None = None
-        self.qkv_proj_scales: torch.Tensor | None = None
         self.o_proj_weights: torch.Tensor | None = None
-        self.o_proj_scales: torch.Tensor | None = None
+        self.q_norm_weights: torch.Tensor | None = None
+        self.k_norm_weights: torch.Tensor | None = None
 
         self.out: torch.Tensor | None = None
         self.profile_logs: torch.Tensor | None = None
@@ -181,9 +177,9 @@ class GQAAttention(TileRTModule):
     def get_weights_list(self) -> list[torch.Tensor]:
         return [
             self.qkv_proj_weights,
-            self.qkv_proj_scales,
             self.o_proj_weights,
-            self.o_proj_scales,
+            self.q_norm_weights,
+            self.k_norm_weights,
         ]
 
     def device_sharding(
@@ -202,9 +198,9 @@ class GQAAttention(TileRTModule):
         converter = GQAAttentionWeightsConverter(self.model_args, self.num_devices)
         (
             self.qkv_proj_weights,
-            self.qkv_proj_scales,
             self.o_proj_weights,
-            self.o_proj_scales,
+            self.q_norm_weights,
+            self.k_norm_weights,
         ) = converter.dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(
@@ -222,17 +218,44 @@ class GQAAttention(TileRTModule):
 
     def init_random_weights(self, device: str = "cuda") -> None:
         qkv_out = (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
-        qkv_w = torch.randn(qkv_out, self.num_local_heads * self.head_dim, dtype=torch.bfloat16, device=device)
-        qkv_s = torch.randn(qkv_out, self.head_dim // self.model_args.block_size, dtype=torch.float32, device=device)
-        o_w = torch.randn(self.num_local_heads * self.head_dim, self.num_local_heads * self.head_dim, dtype=torch.bfloat16, device=device)
-        o_s = torch.randn(self.num_local_heads * self.head_dim, self.head_dim // self.model_args.block_size, dtype=torch.float32, device=device)
+        qkv_w = torch.randn(
+            qkv_out,
+            self.num_local_heads * self.head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        o_w = torch.randn(
+            self.num_local_heads * self.head_dim,
+            self.num_local_heads * self.head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        q_norm_w = torch.randn(
+            self.num_local_heads * self.head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        k_norm_w = torch.randn(
+            self.num_local_kv_heads * self.head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
         converter = GQAAttentionWeightsConverter(self.model_args, self.num_devices)
         (
             self.qkv_proj_weights,
-            self.qkv_proj_scales,
             self.o_proj_weights,
-            self.o_proj_scales,
-        ) = converter.convert_to_general([qkv_w, torch.empty(0), torch.empty(0), o_w, qkv_s, torch.empty(0), torch.empty(0), o_s])
+            self.q_norm_weights,
+            self.k_norm_weights,
+        ) = converter.convert_to_general(
+            [
+                qkv_w,
+                torch.empty(0, device=device),
+                torch.empty(0, device=device),
+                o_w,
+                q_norm_w,
+                k_norm_w,
+            ]
+        )
 
     def golden_forward(
         self,

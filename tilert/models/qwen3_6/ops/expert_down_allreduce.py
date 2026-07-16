@@ -313,10 +313,10 @@ class ExpertDownAllReduce(TileRTModule):
         self.tilert_weights_alias = ExpertDownAllReduceTilertWeightsAlias()
         self.tensor_alias = ["exp_down_weights", "exp_down_scales"]
         self.ref_tensor_alias = (
-            ["mlp.shared_experts.down_proj.weight"]
-            + [f"mlp.experts.{i}.down_proj.weight" for i in range(self.n_routed_experts)]
-            + ["mlp.shared_experts.down_proj.weight_scale_inv"]
-            + [f"mlp.experts.{i}.down_proj.weight_scale_inv" for i in range(self.n_routed_experts)]
+            ["mlp.shared_expert.down_proj.weight"]
+            + ["mlp.experts.down_proj"]
+            + ["mlp.shared_expert.down_proj.weight_scale_inv"]
+            + ["mlp.experts.down_proj.weight_scale_inv"]
         )
 
     @property
@@ -331,30 +331,97 @@ class ExpertDownAllReduce(TileRTModule):
         key_prefix: str,
         weights_hf: dict[str, torch.Tensor],
         num_devices: int,
+        is_stacked_experts: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        down_proj_weight_key = f"{key_prefix}.down_proj.weight"
-        down_proj_scale_key = f"{key_prefix}.down_proj.weight_scale_inv"
-        down_proj_weight = weights_hf[down_proj_weight_key]
-        down_proj_scale = weights_hf[down_proj_scale_key]
+        """Extract and shard down weights.
 
-        dim = down_proj_weight.shape[-2]
-        dim_scale_dim = down_proj_scale.shape[-2]
-        moe_inter_dim = down_proj_weight.shape[-1]
-        in_scale_dim = down_proj_scale.shape[-1]
+        For Qwen3.6 routed experts the weight is the stacked tensor
+        ``(n_experts, dim, inter_dim)``.  Shared experts use the conventional
+        ``down_proj.weight`` tensor of shape ``(dim, inter_dim)``.
+        """
+        if is_stacked_experts:
+            down_proj_weight = weights_hf[f"{key_prefix}.down_proj"]
+            down_proj_scale = weights_hf.get(
+                f"{key_prefix}.down_proj.weight_scale_inv",
+                ExpertDownAllReduce._fake_ones_scale(down_proj_weight, is_stacked_experts=True),
+            )
+        else:
+            down_proj_weight = weights_hf[f"{key_prefix}.down_proj.weight"]
+            down_proj_scale = weights_hf.get(
+                f"{key_prefix}.down_proj.weight_scale_inv",
+                ExpertDownAllReduce._fake_ones_scale(down_proj_weight, is_stacked_experts=False),
+            )
+
+        if is_stacked_experts:
+            n_experts, dim, moe_inter_dim = down_proj_weight.shape
+            dim_scale_dim, in_scale_dim = down_proj_scale.shape[-2:]
+        else:
+            n_experts = 1
+            dim, moe_inter_dim = down_proj_weight.shape
+            dim_scale_dim, in_scale_dim = down_proj_scale.shape
         moe_inter_dim_per_device = moe_inter_dim // num_devices
-        in_scale_dim_per_device = in_scale_dim // num_devices
+        # Same scale-splitting safeguard as gate/up: if there are fewer scale
+        # rows than devices, broadcast the scale across devices.
+        if in_scale_dim >= num_devices and in_scale_dim % num_devices == 0:
+            in_scale_dim_per_device = in_scale_dim // num_devices
+        else:
+            in_scale_dim_per_device = in_scale_dim
 
-        down_proj_weight = down_proj_weight.reshape(dim, num_devices, moe_inter_dim_per_device)
-        down_proj_weight = down_proj_weight.transpose(0, 1).reshape(
-            num_devices, 1, dim, moe_inter_dim_per_device
-        )
-        down_proj_scale = down_proj_scale.reshape(
-            dim_scale_dim, num_devices, in_scale_dim_per_device
-        )
-        down_proj_scale = down_proj_scale.transpose(0, 1).reshape(
-            num_devices, 1, dim_scale_dim, in_scale_dim_per_device
-        )
+        if is_stacked_experts:
+            down_proj_weight = down_proj_weight.reshape(
+                n_experts, dim, num_devices, moe_inter_dim_per_device
+            )
+            down_proj_weight = down_proj_weight.transpose(1, 2).reshape(
+                n_experts, num_devices, dim, moe_inter_dim_per_device
+            )
+            if in_scale_dim >= num_devices:
+                down_proj_scale = down_proj_scale.reshape(
+                    n_experts, dim_scale_dim, num_devices, in_scale_dim_per_device
+                )
+                down_proj_scale = down_proj_scale.transpose(1, 2).reshape(
+                    n_experts, num_devices, dim_scale_dim, in_scale_dim_per_device
+                )
+            else:
+                # Scale shape is (n_experts, dim_scale_dim, in_scale_dim).  Add
+                # and move the device dimension to match (n_experts, num_devices,
+                # dim_scale_dim, in_scale_dim).
+                down_proj_scale = down_proj_scale[:, :, None, :].expand(
+                    n_experts, dim_scale_dim, num_devices, in_scale_dim
+                )
+                down_proj_scale = down_proj_scale.transpose(1, 2).contiguous()
+        else:
+            down_proj_weight = down_proj_weight.reshape(dim, num_devices, moe_inter_dim_per_device)
+            down_proj_weight = down_proj_weight.transpose(0, 1).reshape(
+                1, num_devices, dim, moe_inter_dim_per_device
+            )
+            if in_scale_dim >= num_devices:
+                down_proj_scale = down_proj_scale.reshape(
+                    dim_scale_dim, num_devices, in_scale_dim_per_device
+                )
+                down_proj_scale = down_proj_scale.transpose(0, 1).reshape(
+                    1, num_devices, dim_scale_dim, in_scale_dim_per_device
+                )
+            else:
+                down_proj_scale = down_proj_scale[None, None, :, :].expand(
+                    1, num_devices, dim_scale_dim, in_scale_dim
+                )
         return down_proj_weight, down_proj_scale
+
+    @staticmethod
+    def _fake_ones_scale(weight: torch.Tensor, is_stacked_experts: bool = False) -> torch.Tensor:
+        if is_stacked_experts:
+            _, dim, inter_dim = weight.shape
+        else:
+            *_, dim, inter_dim = weight.shape
+        block_size = 128
+        shape = (dim // block_size, inter_dim // block_size)
+        if is_stacked_experts:
+            shape = (weight.shape[0],) + shape
+        return torch.ones(
+            shape,
+            dtype=torch.float32,
+            device=weight.device,
+        )
 
     def device_sharding(
         self,
@@ -364,21 +431,22 @@ class ExpertDownAllReduce(TileRTModule):
         assert self.n_shared_experts == 1, "Only one shared expert is supported"
         down_weights_list = []
         down_scales_list = []
-        exp_prefix = f"{key_prefix}.shared_experts"
+        exp_prefix = f"{key_prefix}.shared_expert"
         down_weights, down_scales = self.process_down_weights(
-            exp_prefix, weights_dict, self.num_devices
+            exp_prefix, weights_dict, self.num_devices, is_stacked_experts=False
         )
         down_weights_list.append(down_weights)
         down_scales_list.append(down_scales)
-        for exp_id in range(self.n_routed_experts):
-            exp_prefix = f"{key_prefix}.experts.{exp_id}"
-            down_weights, down_scales = self.process_down_weights(
-                exp_prefix, weights_dict, self.num_devices
-            )
-            down_weights_list.append(down_weights)
-            down_scales_list.append(down_scales)
-        down_weights = torch.cat(down_weights_list, dim=1)
-        down_scales = torch.cat(down_scales_list, dim=1)
+        exp_prefix = f"{key_prefix}.experts"
+        down_weights, down_scales = self.process_down_weights(
+            exp_prefix, weights_dict, self.num_devices, is_stacked_experts=True
+        )
+        down_weights_list.append(down_weights)
+        down_scales_list.append(down_scales)
+        # Concatenate along the expert dimension (first dim).  Both shared and
+        # routed outputs now have rank 4: (n_experts, num_devices, ...).
+        down_weights = torch.cat(down_weights_list, dim=0)
+        down_scales = torch.cat(down_scales_list, dim=0)
         return down_weights.contiguous(), down_scales.contiguous()
 
     def init_reference_weights(
@@ -419,25 +487,34 @@ class ExpertDownAllReduce(TileRTModule):
     def init_random_weights(self, device_id: int | None = None) -> None:
         if device_id is None:
             device_id = self.device_id
-        n = self.n_routed_experts + 1
         dev = f"cuda:{device_id}"
-        down_weights = list(
-            torch.randn(n, self.dim, self.moe_inter_dim, dtype=torch.bfloat16, device=dev)
-            .to(torch.float8_e4m3fn)
-            .unbind(0)
-        )
+        shared_down = torch.randn(
+            self.dim, self.moe_inter_dim, dtype=torch.bfloat16, device=dev
+        ).to(torch.float8_e4m3fn)
+        routed_down = torch.randn(
+            self.n_routed_experts,
+            self.dim,
+            self.moe_inter_dim,
+            dtype=torch.bfloat16,
+            device=dev,
+        ).to(torch.float8_e4m3fn)
         dim_scale_dim = self.dim // self.block_size
         moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
         scale_dtype = torch.float32
-        down_scales = list(
-            torch.randn(
-                n, dim_scale_dim, moe_inter_dim_scale_dim, dtype=scale_dtype, device=dev
-            ).unbind(0)
+        shared_scale = torch.randn(
+            dim_scale_dim, moe_inter_dim_scale_dim, dtype=scale_dtype, device=dev
+        )
+        routed_scale = torch.randn(
+            self.n_routed_experts,
+            dim_scale_dim,
+            moe_inter_dim_scale_dim,
+            dtype=scale_dtype,
+            device=dev,
         )
         state_dict = dict(
             zip(
                 self.ref_tensor_alias,
-                [*down_weights, *down_scales],
+                [shared_down, routed_down, shared_scale, routed_scale],
             )
         )
         self.init_reference_weights(state_dict, "mlp", device_id)

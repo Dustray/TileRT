@@ -37,11 +37,7 @@ class ModelArgsQwen36:
     vocab_size: int = 248320
     dim: int = 2048  # Hidden dimension
 
-    # Attention
-    n_heads: int = 16          # Query heads
-    n_kv_heads: int = 2        # KV heads (GQA)
-    qk_head_dim: int = 256    # Head dimension
-    rope_dim: int = 64        # RoPE dimension
+    # RoPE
     rope_theta: float = 10000000.0  # 10M for YaRN
 
     # MLP / MoE
@@ -55,6 +51,9 @@ class ModelArgsQwen36:
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
     route_scale: float = 2.5
 
+    # Layer structure: exact heterogeneous pattern from text_config.layer_types
+    layer_types: list[str] | None = None  # e.g. ["linear_attention", ...]
+
     # Layer structure: 10 blocks of [3 DeltaNet + 1 Gated Attention]
     n_blocks: int = 10
     n_delta_per_block: int = 3  # DeltaNet layers per block
@@ -64,10 +63,26 @@ class ModelArgsQwen36:
     n_delta_layers: int = 30   # Total DeltaNet layers (10 × 3)
     n_gated_layers: int = 10   # Total Gated Attention layers (10 × 1)
 
+    # Full attention (Gated Attention / GQA)
+    qk_head_dim: int = 256
+    rope_dim: int = 64         # partial_rotary_factor * head_dim
+    n_heads: int = 16
+    n_kv_heads: int = 2
+
     # DeltaNet specific
     delta_q_heads: int = 16
     delta_kv_heads: int = 32   # V=32, QK=16
-    delta_head_dim: int = 128
+    delta_key_head_dim: int = 128
+    delta_value_head_dim: int = 128
+    delta_conv_kernel_dim: int = 4
+    delta_conv_dim: int = 8192  # key_dim * 2 + value_dim
+    delta_v_dim: int = 4096  # value_dim
+    delta_gate_dim: int = 4096  # value_dim (z projection)
+    delta_a_dim: int = 32  # num_v_heads decay gate projection a
+    delta_b_dim: int = 32  # num_v_heads decay gate projection b
+
+    # MTP
+    n_mtp_layers: int = 1
 
     # Quantization / KV cache
     kv_cache_pad: int = 8

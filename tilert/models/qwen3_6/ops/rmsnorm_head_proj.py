@@ -173,7 +173,12 @@ class RMSNormHeadProj(TileRTModule):
         """
         rmsnorm_gamma_key = "model.norm.weight"
         head_proj_key = "lm_head.weight"
-        rmsnorm_gamma = weights_dict[rmsnorm_gamma_key][None, ...]
+        # Qwen3.6 checkpoint stores final norm under model.language_model.norm.weight.
+        qwen36_norm_key = "model.language_model.norm.weight"
+        if qwen36_norm_key in weights_dict:
+            rmsnorm_gamma = weights_dict[qwen36_norm_key][None, ...]
+        else:
+            rmsnorm_gamma = weights_dict[rmsnorm_gamma_key][None, ...]
         rmsnorm_gamma = rmsnorm_gamma.repeat(self.num_devices, 1)
         head_proj = weights_dict[head_proj_key]
 

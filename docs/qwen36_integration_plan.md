@@ -24,8 +24,8 @@
 | 专家数 | 256 | 256 | 256 |
 | 激活专家 | 8 + 1 shared | 8 | 8 + 1 shared |
 | MTP | **有**（layer 61） | 无 | 无 |
-| 层模式 | 同构（除前 3 层 MLP） | 同构 | **异构**：10 × [3 DeltaNet + 1 Gated Attn] |
-| TileRT 移植难度 | 基准 | 小（改 dim/scale dtype） | 大（需新 op + 异构调度） |
+| 层模式 | 同构（除前 3 层 MLP） | 同构 | **异构**：10 × [3 linear_attention + 1 full_attention] |
+| TileRT 移植难度 | 基准 | 小（改 dim/scale dtype） | 大（需新 op + 异构调度 + 真实权重格式与假设不符） |
 
 #### DeepSeek-V3.2
 - 核心特点：通过 MLA 把 KV cache 压缩到低维 latent，配合 MTP 做多 token 预测。
@@ -37,58 +37,74 @@
 
 #### Qwen3.6-35B-A3B
 - 核心特点：
-  - 不用 MLA，用更传统的 **GQA** + 新型线性注意力 **DeltaNet**。
-  - 层间异构：**DeltaNet 层**负责记忆/状态压缩，**Gated Attention 层**负责长程注意。
+  - 不用 MLA，用 **GQA** + 新型线性注意力 **DeltaNet**（checkpoint 中分别叫 `full_attention` 与 `linear_attention`）。
+  - 层间异构：30 层 `linear_attention` + 10 层 `full_attention`，由 `text_config.layer_types` 显式指定。
   - 规模更小（2048 dim vs 7168/6144），但**每层都是 MoE**。
+  - checkpoint 同时包含 `model.visual.*`（多模态视觉塔）和 `mtp.*`（1 层 MTP），文本权重位于 `model.language_model.*` 下。
 - TileRT 适配：
   - 不需要 MLA 相关 op。
-  - 可复用 MoE 通信类 op（改 inter_dim=512）。
+  - MoE op 需要支持 Qwen3.6 的**堆叠 expert 权重**格式（`experts.down_proj` / `experts.gate_up_proj`）。
   - 需要新增 `gqa_attention.py`、`delta_net.py` 等 wrapper 及对应 CUDA kernel。
 
 ## 1. 架构差异分析
 
 | 特性 | DeepSeek-V3.2 | Qwen3.6-35B-A3B | 适配策略 |
 |------|---------------|-----------------|----------|
-| 注意力 | MLA (Multi-Head Latent) | **GQA** (Grouped Query) | 需新实现 GQA kernel |
-| 层结构 | 61层同质 | **40层异质** (DeltaNet + Gated Attn) | 需要分层调度 |
-| MoE inter_dim | 2048 | **512** | 可复用，调整参数 |
-| 专家数 | 256 | 256 | 可复用 |
+| 注意力 | MLA (Multi-Head Latent) | **GQA** (`full_attention`) + **DeltaNet** (`linear_attention`) | 需新实现两种 kernel |
+| 层结构 | 61层同质 | **40层异质** (30 linear + 10 full) | 需要分层调度 |
+| MoE inter_dim | 2048 | **512** | 需适配堆叠 expert 权重格式 |
+| 专家数 | 256 | 256 | 可复用路由逻辑 |
 | 激活专家 | 8+1 | 8+1 | 可复用 |
-| 多模态 | 否 | 是 | 首版跳过 |
+| MTP | 有 | **1 层** (`mtp_num_hidden_layers=1`) | 首版可跳过 |
+| 多模态 | 否 | 是 (`model.visual.*`) | 首版跳过 |
 
 ## 2. Qwen3.6 隐藏层结构
 
 ```
-10 × [3 × (DeltaNet → MoE) → 1 × (Gated Attention → MoE)]
+10 × [3 × (linear_attention → MoE) → 1 × (full_attention → MoE)]
 ```
 
-- **DeltaNet 层**: 线性注意力 + MoE
-- **Gated Attention 层**: GQA + MoE
+- **linear_attention 层**: DeltaNet 线性注意力 + MoE（30 层）
+- **full_attention 层**: GQA + MoE（10 层）
 - 循环: 10 次，每次 4 层 = 40 层
+- 每层的具体类型由 `text_config.layer_types` 数组给出，例如前 4 层为
+  `["linear_attention", "linear_attention", "linear_attention", "full_attention", ...]`
 
 ## 3. 关键参数 (ModelArgsQwen36)
 
 ```python
 vocab_size: int = 248320
-dim: int = 2048           # 隐藏层维度
-inter_dim: int = 512      # MoE 中间层 (远小于 DeepSeek 的 2048)
-n_layers: int = 40        # 总层数
-n_heads: int = 16         # Query 头数
-n_kv_heads: int = 2       # KV 头数 (GQA)
-qk_head_dim: int = 256    # 头维度
-rope_dim: int = 64        # RoPE 维度
+dim: int = 2048              # 隐藏层维度
+inter_dim: int = 512         # MoE / shared expert 中间层
+n_layers: int = 40           # 总层数
+
+# full_attention (GQA)
+n_heads: int = 16             # Query 头数
+n_kv_heads: int = 2           # KV 头数 (GQA)
+qk_head_dim: int = 256        # Q/K 头维度 (self_attn q/k/v/o 的 out dim = 4096, 即 n_heads * head_dim)
+rope_dim: int = 64            # partial_rotary_factor * head_dim
+
+# linear_attention (DeltaNet)
+linear_num_key_heads: int = 16
+linear_num_value_heads: int = 32
+linear_key_head_dim: int = 128
+linear_value_head_dim: int = 128
+linear_conv_kernel_dim: int = 4
 
 # MoE 配置
 n_routed_experts: int = 256
 n_activated_experts: int = 8
 n_shared_experts: int = 1
 
-# 层结构
-n_delta_layers: int = 30   # 3 × 10
-n_gated_layers: int = 10   # 1 × 10
+# 层结构 (由 text_config.layer_types 显式给出)
+n_delta_layers: int = 30      # linear_attention 层数
+n_gated_layers: int = 10      # full_attention 层数
+n_mtp_layers: int = 1        # checkpoint 含 1 层 MTP
 
 # 上下文
 max_seq_len: int = 262144
+rope_theta: float = 1e7
+rms_norm_eps: float = 1e-6
 ```
 
 ## 4. 实现组件清单
@@ -311,13 +327,21 @@ for layer_idx, layer_type in enumerate(self.layer_types):
   - `num_dense_layers = n_delta_layers` (30)
   - `num_moe_layers = n_gated_layers` (10)
   - `num_mtp_layers = 0`
-- `transform_mla` 重命名为 `transform_attention`；Qwen3.6 不再返回空字典，而是导出每层的
-  `q_proj.weight`、`k_proj.weight`、`v_proj.weight`、`o_proj.weight` 以及两个 layer norm 权重，
-  供 `QwenAttentionRef` / `QwenDeltaNetRef` 直接加载。
+- `transform_attention` 已按 Qwen3.6 调整前缀，但**真实 checkpoint 的 attention 权重名与最初假设不同**：
+  - `full_attention` 层：`self_attn.q_proj.weight`、`k_proj.weight`、`v_proj.weight`、`o_proj.weight`，以及 **新增的 `q_norm.weight`、`k_norm.weight`**。
+  - `linear_attention` 层：不使用 `self_attn.*`，而是 `linear_attn.in_proj_qkv.weight`、`in_proj_a.weight`、`in_proj_b.weight`、`in_proj_z.weight`、`conv1d.weight`、`dt_bias`、`A_log`、`norm.weight`、`out_proj.weight`。
+  - 因此 weight converter 需要按 `layer_types[layer_id]` 分支读取，并返回不同的权重别名。
 - `convert_a_layer`：Qwen3.6 每层都是 MoE，统一走 `transform_moe`。
-- `transform_moe`：对 Qwen3.6 gate weight reshape 为 `(n_routed_experts, dim)`。
+- `transform_moe`：Qwen3.6 的 expert 权重在 checkpoint 中是**按 expert 堆叠的张量**：
+  - `mlp.experts.down_proj`: `(256, 2048, 512)`
+  - `mlp.experts.gate_up_proj`: `(256, 1024, 2048)`
+  - `mlp.gate.weight`: `(256, 2048)`
+  - `mlp.shared_expert.down_proj.weight`: `(2048, 512)`
+  - `mlp.shared_expert.gate_proj.weight / up_proj.weight`: `(512, 2048)`
+  - `mlp.shared_expert_gate.weight`: `(1, 2048)`
+  - 需要先把堆叠张量拆成 per-expert 的 `gate_proj / up_proj / down_proj`，再喂给现有 `ExpertSelectUpGateSiLU` / `ExpertDownAllReduce` 进行 device sharding。
 - `transform_mlp`：Qwen3.6 不使用，但若被调用则切换为 Qwen3.6 的 `RMSNormUpGateSiLU` / `DownAllReduce`。
-- `transform_mtp`：Qwen3.6 直接返回空字典。
+- `transform_mtp`：当前返回空字典。但 checkpoint 实际包含 `mtp.*` 和 `mtp.layers.*`（1 层），`text_config.mtp_num_hidden_layers=1`。若后续需要 MTP 投机解码，需补充转换。
 - `__process_head_weights`：Qwen3.6 使用 `qwen3_6/ops/rmsnorm_head_proj.py`。
 - CLI 新增 `--model_type qwen3_6` 分支。
 
@@ -341,13 +365,18 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 - `GQAAttentionOp.tilert_forward` 与 `DeltaNetOp.tilert_forward` 目前会调用尚未注册的
   `torch.ops.tilert.gqa_attention_op` / `delta_net_op`，需等 CUDA kernel 完成后才能真正跑通。
-- 因环境缺少 `torch` 运行库，尚未做运行时 import / 数值验证。
+- 当前 conversion 在 `test_mode=True` 下只转换 3 个代表层（0, 30, 39）+ head/embedding；完整 40 层转换需关闭 test mode 并验证内存/磁盘。
 
 ### 8.7 验证状态
 
 - 所有 `qwen3_6/ops/*.py` 通过 AST 语法检查。
 - 所有 `qwen3_6/modules/*.py` 通过 AST 语法检查。
 - `weight_converter.py` 通过 AST 语法检查。
+- **2025-07-17**: `WeightConverter(..., test_mode=True).to_tilert_weights()` 在真实 Qwen3.6-35B-A3B checkpoint 上成功完成；CLI `--model_type qwen3_6` 同步可用，输出 9 个 safetensors shard（共 497 张量）。
+  - `linear_attention` 层（0, 30）输出 `linear_attn.*` 权重。
+  - `full_attention` 层（39）输出 `self_attn.*` 权重。
+  - MoE 堆叠 expert 权重被正确拆分并生成 fake float32 `weight_scale_inv`。
+  - 缺失的 `mlp.gate.e_score_correction_bias` 默认补 0；缺失的 FP8 scales 由 op 合成全 1。
 
 ### 8.8 待办事项
 
@@ -359,5 +388,8 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | P0 | 实现 `modules/dsa.py` | ✅ 已完成 |
 | P1 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py` ✅ 已完成 |
 | P2 | 硬编码参数清理 | `rmsnorm_up_gate_silu.py`、`expert_down_allreduce.py` ✅ 已完成 |
-| P2 | `transform_attention` 补全 | Qwen3.6 attention 权重导出 ✅ 已完成 |
-| P3 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |
+| P2 | `transform_attention` 补全 | ✅ 已按 `linear/full_attention` 分支读取真实权重名 |
+| P2 | `transform_moe` 补全 | ✅ 已适配堆叠 expert 权重格式 |
+| P2 | `transform_mtp` 补全 | ⚠️ 仍为 stub；checkpoint 含 `mtp.*`，但首版可跳过 |
+| P3 | 完整 40 层转换 | 关闭 test_mode 验证全量转换 |
+| P4 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |

@@ -65,21 +65,22 @@ def delta_net(
 
 @dataclass
 class DeltaNetRefWeightsAlias:
-    """Reference weights alias for DeltaNet."""
+    """Reference weights alias for DeltaNet (Qwen3.6 linear_attention layer)."""
 
-    key_prefix: str = "self_attn"
+    key_prefix: str = "linear_attn"
 
     @property
     def ref_tensor_alias(self) -> list[str]:
         return [
-            f"{self.key_prefix}.q_proj.weight",
-            f"{self.key_prefix}.k_proj.weight",
-            f"{self.key_prefix}.v_proj.weight",
-            f"{self.key_prefix}.o_proj.weight",
-            f"{self.key_prefix}.q_proj.weight_scale_inv",
-            f"{self.key_prefix}.k_proj.weight_scale_inv",
-            f"{self.key_prefix}.v_proj.weight_scale_inv",
-            f"{self.key_prefix}.o_proj.weight_scale_inv",
+            f"{self.key_prefix}.in_proj_qkv.weight",
+            f"{self.key_prefix}.in_proj_z.weight",
+            f"{self.key_prefix}.in_proj_a.weight",
+            f"{self.key_prefix}.in_proj_b.weight",
+            f"{self.key_prefix}.conv1d.weight",
+            f"{self.key_prefix}.A_log",
+            f"{self.key_prefix}.dt_bias",
+            f"{self.key_prefix}.norm.weight",
+            f"{self.key_prefix}.out_proj.weight",
         ]
 
     def __call__(self) -> list[str]:
@@ -90,18 +91,28 @@ class DeltaNetRefWeightsAlias:
 class DeltaNetTilertWeightsAlias:
     """TileRT weights alias for DeltaNet."""
 
-    qkv_proj_weights = "qkv_proj_weights"
-    qkv_proj_scales = "qkv_proj_scales"
-    o_proj_weights = "o_proj_weights"
-    o_proj_scales = "o_proj_scales"
+    in_proj_qkv_weights = "in_proj_qkv_weights"
+    in_proj_z_weights = "in_proj_z_weights"
+    in_proj_a_weights = "in_proj_a_weights"
+    in_proj_b_weights = "in_proj_b_weights"
+    conv1d_weights = "conv1d_weights"
+    A_log = "A_log"
+    dt_bias = "dt_bias"
+    norm_weights = "norm_weights"
+    out_proj_weights = "out_proj_weights"
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
         return [
-            self.qkv_proj_weights,
-            self.qkv_proj_scales,
-            self.o_proj_weights,
-            self.o_proj_scales,
+            self.in_proj_qkv_weights,
+            self.in_proj_z_weights,
+            self.in_proj_a_weights,
+            self.in_proj_b_weights,
+            self.conv1d_weights,
+            self.A_log,
+            self.dt_bias,
+            self.norm_weights,
+            self.out_proj_weights,
         ]
 
     def __call__(self) -> list[str]:
@@ -115,15 +126,40 @@ class DeltaNetAlgorithm(Enum):
 
 
 class DeltaNetWeightsConverter(TilertWeightsConverter):
-    """DeltaNet weights converter (placeholder)."""
+    """DeltaNet weights converter.
+
+    The checkpoint stores the linear attention weights in plain bf16.  The
+    converter preserves the original layout so the CUDA kernel can interpret the
+    tensors directly; no FP8 quantization is performed for Qwen3.6.
+    """
 
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_proj_w, k_proj_w, v_proj_w, o_proj_w, q_s, k_s, v_s, o_s = weights_list
-        qkv_proj_weights = torch.cat([q_proj_w, k_proj_w, v_proj_w], dim=0)
-        qkv_proj_scales = torch.cat([q_s, k_s, v_s], dim=0)
-        return qkv_proj_weights, qkv_proj_scales, o_proj_w, o_s
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, conv1d, A_log, dt_bias, norm, out_proj = (
+            weights_list
+        )
+        return (
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_a,
+            in_proj_b,
+            conv1d,
+            A_log,
+            dt_bias,
+            norm,
+            out_proj,
+        )
 
 
 class DeltaNetOp(TileRTModule):
@@ -157,10 +193,15 @@ class DeltaNetOp(TileRTModule):
         self.tilert_weights_alias = DeltaNetTilertWeightsAlias()
         self.ref_weights_alias = DeltaNetRefWeightsAlias()
 
-        self.qkv_proj_weights: torch.Tensor | None = None
-        self.qkv_proj_scales: torch.Tensor | None = None
-        self.o_proj_weights: torch.Tensor | None = None
-        self.o_proj_scales: torch.Tensor | None = None
+        self.in_proj_qkv_weights: torch.Tensor | None = None
+        self.in_proj_z_weights: torch.Tensor | None = None
+        self.in_proj_a_weights: torch.Tensor | None = None
+        self.in_proj_b_weights: torch.Tensor | None = None
+        self.conv1d_weights: torch.Tensor | None = None
+        self.A_log: torch.Tensor | None = None
+        self.dt_bias: torch.Tensor | None = None
+        self.norm_weights: torch.Tensor | None = None
+        self.out_proj_weights: torch.Tensor | None = None
 
         self.hidden_out: torch.Tensor | None = None
         self.state_out: torch.Tensor | None = None
@@ -177,10 +218,15 @@ class DeltaNetOp(TileRTModule):
 
     def get_weights_list(self) -> list[torch.Tensor]:
         return [
-            self.qkv_proj_weights,
-            self.qkv_proj_scales,
-            self.o_proj_weights,
-            self.o_proj_scales,
+            self.in_proj_qkv_weights,
+            self.in_proj_z_weights,
+            self.in_proj_a_weights,
+            self.in_proj_b_weights,
+            self.conv1d_weights,
+            self.A_log,
+            self.dt_bias,
+            self.norm_weights,
+            self.out_proj_weights,
         ]
 
     def device_sharding(
@@ -197,10 +243,15 @@ class DeltaNetOp(TileRTModule):
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
         converter = DeltaNetWeightsConverter(self.model_args, self.num_devices)
         (
-            self.qkv_proj_weights,
-            self.qkv_proj_scales,
-            self.o_proj_weights,
-            self.o_proj_scales,
+            self.in_proj_qkv_weights,
+            self.in_proj_z_weights,
+            self.in_proj_a_weights,
+            self.in_proj_b_weights,
+            self.conv1d_weights,
+            self.A_log,
+            self.dt_bias,
+            self.norm_weights,
+            self.out_proj_weights,
         ) = converter.dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(
@@ -225,19 +276,46 @@ class DeltaNetOp(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
-        qkv_out = (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
-        hidden = self.num_local_heads * self.head_dim
-        qkv_w = torch.randn(qkv_out, hidden, dtype=torch.bfloat16, device=device)
-        qkv_s = torch.randn(qkv_out, self.head_dim // self.model_args.block_size, dtype=torch.float32, device=device)
-        o_w = torch.randn(hidden, hidden, dtype=torch.bfloat16, device=device)
-        o_s = torch.randn(hidden, self.head_dim // self.model_args.block_size, dtype=torch.float32, device=device)
+        args = self.model_args
+        in_proj_qkv = torch.randn(
+            args.delta_conv_dim, args.dim, dtype=torch.bfloat16, device=device
+        )
+        in_proj_z = torch.randn(
+            args.delta_gate_dim, args.dim, dtype=torch.bfloat16, device=device
+        )
+        in_proj_a = torch.randn(
+            args.delta_a_dim, args.dim, dtype=torch.bfloat16, device=device
+        )
+        in_proj_b = torch.randn(
+            args.delta_b_dim, args.dim, dtype=torch.bfloat16, device=device
+        )
+        conv1d = torch.randn(
+            args.delta_conv_dim,
+            1,
+            args.delta_conv_kernel_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        A_log = torch.randn(args.delta_a_dim, dtype=torch.float32, device=device)
+        dt_bias = torch.randn(args.delta_b_dim, dtype=torch.float32, device=device)
+        norm = torch.randn(args.delta_value_head_dim, dtype=torch.float32, device=device)
+        out_proj = torch.randn(
+            args.dim, args.delta_v_dim, dtype=torch.bfloat16, device=device
+        )
         converter = DeltaNetWeightsConverter(self.model_args, self.num_devices)
         (
-            self.qkv_proj_weights,
-            self.qkv_proj_scales,
-            self.o_proj_weights,
-            self.o_proj_scales,
-        ) = converter.convert_to_general([qkv_w, torch.empty(0), torch.empty(0), o_w, qkv_s, torch.empty(0), torch.empty(0), o_s])
+            self.in_proj_qkv_weights,
+            self.in_proj_z_weights,
+            self.in_proj_a_weights,
+            self.in_proj_b_weights,
+            self.conv1d_weights,
+            self.A_log,
+            self.dt_bias,
+            self.norm_weights,
+            self.out_proj_weights,
+        ) = converter.convert_to_general(
+            [in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, conv1d, A_log, dt_bias, norm, out_proj]
+        )
 
     def _linear_attention(
         self,
@@ -293,23 +371,27 @@ class DeltaNetOp(TileRTModule):
         start_pos: int,
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference forward using simple linear attention."""
+        """Reference forward using simple linear attention.
+
+        Uses only ``in_proj_qkv`` and ``out_proj`` for a quick sanity check.
+        The full gated delta-net recurrence requires the FLA kernel.
+        """
         del start_pos
-        assert self.qkv_proj_weights is not None
-        assert self.o_proj_weights is not None
-        qkv = x @ self.qkv_proj_weights.T
+        assert self.in_proj_qkv_weights is not None
+        assert self.out_proj_weights is not None
+        qkv = x @ self.in_proj_qkv_weights.T
         q, k, v = torch.split(
             qkv,
             [
-                self.num_local_heads * self.head_dim,
-                self.num_local_kv_heads * self.head_dim,
-                self.num_local_kv_heads * self.head_dim,
+                self.n_heads * self.head_dim,
+                self.n_kv_heads * self.head_dim,
+                self.n_kv_heads * self.head_dim,
             ],
             dim=-1,
         )
         attn_out, new_state = self._linear_attention(q, k, v, state)
         # Project only the KV-head portion (n_heads may differ from n_kv_heads).
-        out = attn_out @ self.o_proj_weights.T
+        out = attn_out @ self.out_proj_weights.T
         return out, new_state
 
     def tilert_forward(

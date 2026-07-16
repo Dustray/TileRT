@@ -50,24 +50,32 @@ def expert_select_up_gate_silu(
 
 @dataclass
 class ExpertSelectUpGateSiLURefWeightsAlias:
-    """Reference weights alias for ExpertSelectUpGateSiLU."""
+    """Reference weights alias for ExpertSelectUpGateSiLU (Qwen3.6).
+
+    Qwen3.6 stores the routed experts as stacked tensors:
+      - ``mlp.experts.gate_up_proj`` (n_routed_experts, 2*inter_dim, dim)
+      - ``mlp.experts.down_proj``    (n_routed_experts, dim, inter_dim)
+    The shared expert uses conventional per-tensor gate/up/down weights:
+      - ``mlp.shared_expert.gate_proj.weight`` (shared_inter_dim, dim)
+      - ``mlp.shared_expert.up_proj.weight``   (shared_inter_dim, dim)
+      - ``mlp.shared_expert_gate.weight``      (1, dim)
+    The checkpoint is bf16 only, so fake all-ones ``weight_scale_inv`` tensors are
+    synthesised by the converter to satisfy the existing FP8 converters.
+    """
 
     key_prefix: str = "mlp"
     n_routed_experts: int = 256
 
     @property
     def ref_tensor_alias(self) -> list[str]:
-        n = self.n_routed_experts
         return (
-            [f"{self.key_prefix}.gate.e_score_correction_bias"]
-            + [f"{self.key_prefix}.shared_experts.gate_proj.weight"]
-            + [f"{self.key_prefix}.experts.{i}.gate_proj.weight" for i in range(n)]
-            + [f"{self.key_prefix}.shared_experts.up_proj.weight"]
-            + [f"{self.key_prefix}.experts.{i}.up_proj.weight" for i in range(n)]
-            + [f"{self.key_prefix}.shared_experts.gate_proj.weight_scale_inv"]
-            + [f"{self.key_prefix}.experts.{i}.gate_proj.weight_scale_inv" for i in range(n)]
-            + [f"{self.key_prefix}.shared_experts.up_proj.weight_scale_inv"]
-            + [f"{self.key_prefix}.experts.{i}.up_proj.weight_scale_inv" for i in range(n)]
+            [f"{self.key_prefix}.shared_expert.gate_proj.weight"]
+            + [f"{self.key_prefix}.shared_expert.up_proj.weight"]
+            + [f"{self.key_prefix}.experts.gate_up_proj"]
+            + [f"{self.key_prefix}.shared_expert.gate_proj.weight_scale_inv"]
+            + [f"{self.key_prefix}.shared_expert.up_proj.weight_scale_inv"]
+            + [f"{self.key_prefix}.experts.gate_up_proj.weight_scale_inv"]
+            + [f"{self.key_prefix}.gate.e_score_correction_bias"]
         )
 
     def __call__(self) -> list[str]:
@@ -441,29 +449,132 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         key_prefix: str,
         weights_hf: dict[str, torch.Tensor],
         num_devices: int,
+        inter_dim: int,
+        is_stacked_experts: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        gate_proj_weight_key = f"{key_prefix}.gate_proj.weight"
-        gate_proj_scale_key = f"{key_prefix}.gate_proj.weight_scale_inv"
-        up_proj_weight_key = f"{key_prefix}.up_proj.weight"
-        up_proj_scale_key = f"{key_prefix}.up_proj.weight_scale_inv"
+        """Extract and shard gate/up weights.
 
-        gate_proj_weight = weights_hf[gate_proj_weight_key]
-        gate_proj_scale = weights_hf[gate_proj_scale_key]
-        up_proj_weight = weights_hf[up_proj_weight_key]
-        up_proj_scale = weights_hf[up_proj_scale_key]
+        For Qwen3.6 routed experts the weight is a stacked ``gate_up_proj`` tensor
+        of shape ``(n_experts, 2*inter_dim, dim)``.  It is split along the
+        output dimension into gate and up, then sharded across devices.
+        Shared experts use conventional ``gate_proj`` / ``up_proj`` tensors of
+        shape ``(inter_dim, dim)``.
+
+        Because the checkpoint is bf16 only, when ``weight_scale_inv`` is
+        absent a tensor of ones is generated.
+        """
+        if is_stacked_experts:
+            gate_up_proj = weights_hf[f"{key_prefix}.gate_up_proj"]
+            # gate_up_proj has shape (n_experts, 2 * inter_dim, dim); split it
+            # into gate and up along the output dimension.
+            gate_proj_weight = gate_up_proj[:, :inter_dim, :]
+            up_proj_weight = gate_up_proj[:, inter_dim:, :]
+            gate_proj_scale = weights_hf.get(
+                f"{key_prefix}.gate_up_proj.weight_scale_inv",
+                ExpertSelectUpGateSiLU._fake_ones_scale(gate_proj_weight, is_stacked_experts=True),
+            )
+            # The HF checkpoint stores one scale for the fused tensor; reuse it
+            # for both gate and up so shapes stay consistent.
+            up_proj_scale = gate_proj_scale
+        else:
+            gate_proj_weight_key = f"{key_prefix}.gate_proj.weight"
+            gate_proj_scale_key = f"{key_prefix}.gate_proj.weight_scale_inv"
+            up_proj_weight_key = f"{key_prefix}.up_proj.weight"
+            up_proj_scale_key = f"{key_prefix}.up_proj.weight_scale_inv"
+
+            gate_proj_weight = weights_hf[gate_proj_weight_key]
+            up_proj_weight = weights_hf[up_proj_weight_key]
+            gate_proj_scale = weights_hf.get(
+                gate_proj_scale_key,
+                ExpertSelectUpGateSiLU._fake_ones_scale(gate_proj_weight, is_stacked_experts=False),
+            )
+            up_proj_scale = weights_hf.get(
+                up_proj_scale_key,
+                ExpertSelectUpGateSiLU._fake_ones_scale(up_proj_weight, is_stacked_experts=False),
+            )
+
         dim = gate_proj_weight.shape[-1]
         in_dim = gate_proj_weight.shape[-2]
         scale_dim = gate_proj_scale.shape[-1]
         in_scale_dim = gate_proj_scale.shape[-2]
         in_dim_per_device = in_dim // num_devices
-        in_scale_dim_per_device = in_scale_dim // num_devices
-        gate_proj_weight = gate_proj_weight.reshape(num_devices, 1, in_dim_per_device, dim)
-        gate_proj_scale = gate_proj_scale.reshape(
-            num_devices, 1, in_scale_dim_per_device, scale_dim
-        )
-        up_proj_weight = up_proj_weight.reshape(num_devices, 1, in_dim_per_device, dim)
-        up_proj_scale = up_proj_scale.reshape(num_devices, 1, in_scale_dim_per_device, scale_dim)
+        # Scale tensors are blocked by block_size (128).  When the intermediate
+        # dimension is small (e.g. Qwen3.6 inter_dim=512) the scale rows
+        # may be fewer than num_devices.  In that case we split the rows evenly
+        # in weight space and broadcast/share the same scale row for all
+        # devices that map to a single scale row.
+        if in_scale_dim >= num_devices and in_scale_dim % num_devices == 0:
+            in_scale_dim_per_device = in_scale_dim // num_devices
+        else:
+            in_scale_dim_per_device = in_scale_dim
+
+        if is_stacked_experts:
+            n_experts = gate_proj_weight.shape[0]
+            gate_proj_weight = gate_proj_weight.reshape(
+                n_experts, num_devices, in_dim_per_device, dim
+            )
+            # The scale shape is (n_experts, in_scale_dim, scale_dim).  When
+            # in_scale_dim < num_devices we keep the full scale row per device.
+            if in_scale_dim >= num_devices:
+                gate_proj_scale = gate_proj_scale.reshape(
+                    n_experts, num_devices, in_scale_dim_per_device, scale_dim
+                )
+            else:
+                gate_proj_scale = gate_proj_scale[:, None, :, :].expand(
+                    n_experts, num_devices, in_scale_dim, scale_dim
+                )
+            up_proj_weight = up_proj_weight.reshape(
+                n_experts, num_devices, in_dim_per_device, dim
+            )
+            if in_scale_dim >= num_devices:
+                up_proj_scale = up_proj_scale.reshape(
+                    n_experts, num_devices, in_scale_dim_per_device, scale_dim
+                )
+            else:
+                up_proj_scale = up_proj_scale[:, None, :, :].expand(
+                    n_experts, num_devices, in_scale_dim, scale_dim
+                )
+        else:
+            gate_proj_weight = gate_proj_weight.reshape(1, num_devices, in_dim_per_device, dim)
+            if in_scale_dim >= num_devices:
+                gate_proj_scale = gate_proj_scale.reshape(
+                    1, num_devices, in_scale_dim_per_device, scale_dim
+                )
+            else:
+                gate_proj_scale = gate_proj_scale[None, None, :, :].expand(
+                    1, num_devices, in_scale_dim, scale_dim
+                )
+            up_proj_weight = up_proj_weight.reshape(1, num_devices, in_dim_per_device, dim)
+            if in_scale_dim >= num_devices:
+                up_proj_scale = up_proj_scale.reshape(
+                    1, num_devices, in_scale_dim_per_device, scale_dim
+                )
+            else:
+                up_proj_scale = up_proj_scale[None, None, :, :].expand(
+                    1, num_devices, in_scale_dim, scale_dim
+                )
         return gate_proj_weight, gate_proj_scale, up_proj_weight, up_proj_scale
+
+    @staticmethod
+    def _fake_ones_scale(weight: torch.Tensor, is_stacked_experts: bool = True) -> torch.Tensor:
+        """Return a float32 all-ones scale tensor matching the expected layout."""
+        # The existing converter expects scales of shape (..., in_scale_dim, scale_dim)
+        # where scale_dim = dim // block_size and in_scale_dim = in_dim // block_size.
+        # However process_gate_up_weights reshapes the scale into
+        # (num_devices, 1, in_scale_dim, scale_dim); we only need to provide a tensor
+        # whose last two dimensions are in_scale_dim x scale_dim.
+        block_size = 128
+        if is_stacked_experts:
+            n_experts, in_dim, dim = weight.shape
+            in_scale_dim = in_dim // block_size
+            scale_dim = dim // block_size
+            shape = (n_experts, in_scale_dim, scale_dim)
+        else:
+            *_, in_dim, dim = weight.shape
+            in_scale_dim = in_dim // block_size
+            scale_dim = dim // block_size
+            shape = (in_scale_dim, scale_dim)
+        return torch.ones(shape, dtype=torch.float32, device=weight.device)
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """
@@ -479,7 +590,10 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         key_prefix = ref_alias.key_prefix
 
         bias_key = f"{key_prefix}.gate.e_score_correction_bias"
-        bias = weights_map[bias_key]
+        bias = weights_map.get(
+            bias_key,
+            torch.zeros(self.n_routed_experts, dtype=torch.float32),
+        )
         bias = bias[None, :].repeat(self.num_devices, 1)
 
         gate_weights_list = []
@@ -487,29 +601,34 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         up_weights_list = []
         up_scales_list = []
         assert self.n_shared_experts == 1, "Only one shared expert is supported"
-        exp_prefix = f"{key_prefix}.shared_experts"
-        gate_weights, gate_scales, up_weights, up_scales = self.process_gate_up_weights(
-            exp_prefix, weights_map, self.num_devices
+
+        # Shared expert uses conventional gate/up tensors (no expert dim).
+        exp_prefix = f"{key_prefix}.shared_expert"
+        shared_gate, shared_gate_s, shared_up, shared_up_s = self.process_gate_up_weights(
+            exp_prefix,
+            weights_map,
+            self.num_devices,
+            inter_dim=self.model_args.inter_dim,
+            is_stacked_experts=False,
         )
-        gate_weights_list.append(gate_weights)
-        gate_scales_list.append(gate_scales)
-        up_weights_list.append(up_weights)
-        up_scales_list.append(up_scales)
 
-        for exp_id in range(self.n_routed_experts):
-            exp_prefix = f"{key_prefix}.experts.{exp_id}"
-            gate_weights, gate_scales, up_weights, up_scales = self.process_gate_up_weights(
-                exp_prefix, weights_map, self.num_devices
-            )
-            gate_weights_list.append(gate_weights)
-            gate_scales_list.append(gate_scales)
-            up_weights_list.append(up_weights)
-            up_scales_list.append(up_scales)
+        # Routed experts use Qwen3.6 stacked ``gate_up_proj`` (expert dim first).
+        exp_prefix = f"{key_prefix}.experts"
+        routed_gate, routed_gate_s, routed_up, routed_up_s = self.process_gate_up_weights(
+            exp_prefix,
+            weights_map,
+            self.num_devices,
+            inter_dim=self.model_args.inter_dim,
+            is_stacked_experts=True,
+        )
 
-        gate_weights = torch.cat(gate_weights_list, dim=1)
-        gate_scales = torch.cat(gate_scales_list, dim=1)
-        up_weights = torch.cat(up_weights_list, dim=1)
-        up_scales = torch.cat(up_scales_list, dim=1)
+        # The TileRT layout expects a single tensor for both routed and shared
+        # experts.  Both now have rank 4: (n_experts, num_devices, in_dim_per_device, dim).
+        # Concatenate along the expert dimension.
+        gate_weights = torch.cat([shared_gate, routed_gate], dim=0)
+        gate_scales = torch.cat([shared_gate_s, routed_gate_s], dim=0)
+        up_weights = torch.cat([shared_up, routed_up], dim=0)
+        up_scales = torch.cat([shared_up_s, routed_up_s], dim=0)
         tilert_alias = self.tilert_weights_alias
         return {
             tilert_alias.exp_bias: bias,
@@ -603,35 +722,44 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         """
         n = self.n_routed_experts + 1
         bias = torch.randn(self.n_routed_experts, dtype=torch.float32, device=device)
-        gate_weights = list(
-            torch.randn(n, self.moe_inter_dim, self.dim, dtype=torch.bfloat16, device=device)
-            .to(torch.float8_e4m3fn)
-            .unbind(0)
-        )
-        up_weights = list(
-            torch.randn(n, self.moe_inter_dim, self.dim, dtype=torch.bfloat16, device=device)
-            .to(torch.float8_e4m3fn)
-            .unbind(0)
-        )
+        # Shared expert first.
+        shared_gate = torch.randn(
+            self.moe_inter_dim, self.dim, dtype=torch.bfloat16, device=device
+        ).to(torch.float8_e4m3fn)
+        shared_up = torch.randn(
+            self.moe_inter_dim, self.dim, dtype=torch.bfloat16, device=device
+        ).to(torch.float8_e4m3fn)
+        routed_gate_up = torch.randn(
+            self.n_routed_experts,
+            2 * self.moe_inter_dim,
+            self.dim,
+            dtype=torch.bfloat16,
+            device=device,
+        ).to(torch.float8_e4m3fn)
         moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
         dim_scale_dim = self.dim // self.block_size
         scale_dtype = torch.float32 if self.arch_name in ("glm_5", "qwen3_6") else torch.bfloat16
-        gate_scales = list(
-            torch.randn(
-                n, moe_inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=device
-            ).unbind(0)
+        shared_gate_scale = torch.randn(
+            moe_inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=device
         )
-        up_scales = list(
-            torch.randn(
-                n, moe_inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=device
-            ).unbind(0)
+        shared_up_scale = torch.randn(
+            moe_inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=device
+        )
+        routed_scale = torch.randn(
+            self.n_routed_experts,
+            2 * moe_inter_dim_scale_dim,
+            dim_scale_dim,
+            dtype=scale_dtype,
+            device=device,
         )
         tensor_list = [
             bias,
-            *gate_weights,
-            *up_weights,
-            *gate_scales,
-            *up_scales,
+            shared_gate,
+            shared_up,
+            routed_gate_up,
+            shared_gate_scale,
+            shared_up_scale,
+            routed_scale,
         ]
         ref_state_dict = dict(zip(self.ref_weights_alias(), tensor_list))
         self.init_reference_weights(ref_state_dict)
