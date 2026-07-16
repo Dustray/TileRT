@@ -8,13 +8,14 @@ import torch.nn.functional as F
 from tilert.models.base import SerializableTileRTModule, TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
-from tilert.models.qwen3_6.ops.qkv_rope import QKVRoPE
-from tilert.models.qwen3_6.ops.rotate import Rotate
+from tilert.models.qwen3_6.ops.gqa_attention import (
+    GQAAttention as GQAAttentionOp,
+    GQAAttentionAlgorithm,
+)
 from tilert.models.qwen3_6.ops.unproj_o_allreduce import (
     UnProjOAllReduce,
     UnProjOAllReduceAlgorithm,
 )
-from tilert.models.utils import apply_rotary_emb
 
 
 class QwenAttentionRef(TileRTModule):
@@ -163,15 +164,13 @@ class GatedAttention(SerializableTileRTModule):
         )
         self.register_op(self.attn_ref)
 
-        self.qkv_rope = QKVRoPE(
-            model_args=model_args, num_devices=num_devices, device_id=device_id
+        self.attn = GQAAttentionOp(
+            model_args=model_args,
+            device_id=device_id,
+            num_devices=num_devices,
+            algorithm=GQAAttentionAlgorithm.GENERAL,
         )
-        self.register_op(self.qkv_rope)
-
-        self.rotate = Rotate(
-            model_args=model_args, num_devices=num_devices, device_id=device_id
-        )
-        self.register_op(self.rotate)
+        self.register_op(self.attn)
 
         self.unproj_o_allreduce = UnProjOAllReduce(
             model_args=model_args,
@@ -205,18 +204,17 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """TileRT forward placeholder.
+        """Optimized forward using ``GQAAttentionOp`` + ``UnProjOAllReduce``.
 
-        A real implementation would:
-          1. run qkv_rope on the RoPE portion,
-          2. rotate the QK vectors,
-          3. dispatch a GQA flash-attention kernel,
-          4. unproj_o_allreduce the result.
-        For now, this delegates to the reference path so the module stack can
-        be wired end-to-end before the dedicated GQA kernel exists.
+        Currently ``GQAAttentionOp.tilert_forward`` is itself a placeholder that
+        calls into ``torch.ops.tilert.gqa_attention_op``; it will become
+        functional once the CUDA kernel is registered.
         """
-        del mask
-        return self.golden_forward(x, start_pos, freqs_cis, k_cache, v_cache)
+        attn_out, k_cache, v_cache = self.attn.forward(
+            x, start_pos, freqs_cis, k_cache, v_cache, mask
+        )
+        out = self.unproj_o_allreduce.forward(attn_out)
+        return out, k_cache, v_cache
 
     def forward(
         self,

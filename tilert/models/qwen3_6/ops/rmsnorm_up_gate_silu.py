@@ -121,10 +121,12 @@ class RMSNormUpGateSiLU(TileRTModule):
 
         self.tilert_norm_gamma: torch.Tensor | None = None
         self.tilert_weights: torch.Tensor | None = None
-        # TODO: derive scale buffer shape from (n_experts, inter_dim_scale_dim, dim_scale_dim)
-        # instead of hard-coding DSv32/GLM5 dimensions.
         self.tilert_scales = torch.zeros(
-            9, 4, 64, dtype=torch.float32, device=torch.device("cuda")
+            self.n_experts,
+            self.inter_dim_per_device // self.block_size,
+            self.dim // self.block_size,
+            dtype=torch.float32,
+            device=torch.device("cuda"),
         )
 
         self.hidden_out: torch.Tensor | None = None

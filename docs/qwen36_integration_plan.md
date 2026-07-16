@@ -211,7 +211,7 @@ self.decode_layer = ShowHandsDSALayer(
 self.decode_layer = None  # placeholder
 ```
 
-**影响**: 无法进行实际推理，需要创建 `QwenShowHandsDSALayer`
+**影响**: 无法进行实际推理，需要创建 `QwenShowHandsDSALayer`（Python 层 op 完成后下一步）。
 
 #### 问题 2: dsa.py 子模块未初始化 ✅ 已解决
 
@@ -236,9 +236,9 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
 | P0 | 创建 QwenShowHandsDSALayer | 端到端解码层 |
-| P0 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py`（在 CUDA kernel 之前） |
-| P1 | 补全 golden_forward | DeltaNet / Gated Attention 真实参考计算 |
-| P2 | 硬编码参数清理 | `expert_down_allreduce.py`、`rmsnorm_up_gate_silu.py` tile/scale 形状适配 2048-dim |
+| P0 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py` ✅ 已完成 |
+| P1 | 补全 golden_forward | DeltaNet / Gated Attention 真实参考计算 ✅ 已完成 |
+| P2 | 硬编码参数清理 | `expert_down_allreduce.py`、`rmsnorm_up_gate_silu.py` tile/scale 形状适配 2048-dim ✅ 已完成 |
 | P3 | 实现 MTP 支持 | 投机解码 |
 | P4 | 构建 CUDA kernels | `libtilert_qwen36.so`（`gqa_attention_op`、`delta_net_op`） |
 
@@ -297,7 +297,8 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 | 文件 | 调整内容 |
 |------|----------|
-| `rmsnorm_up_gate_silu.py` | 移除 BF16MMA 支持；scale buffer dtype 改为 float32；适配 `inter_dim=512` |
+| `rmsnorm_up_gate_silu.py` | 移除 BF16MMA 支持；scale buffer dtype 改为 float32；适配 `inter_dim=512`；`tilert_scales` 形状改为 `(n_experts, inter_dim_per_device/block_size, dim/block_size)` |
+| `expert_down_allreduce.py` | 移除 BF16MMA 支持；Qwen3.6 分支仅处理 `dim_per_sm=16` 的 16 行 tile，GLM5 保留原 48+8 拆分；scale padding 改为按 `dim_per_sm * scale_cols` 计算 |
 | `unproj_o_allreduce.py` | 仅保留 FP16MMA；`v_head_dim` → `qk_head_dim` |
 | `qkv_rope.py` | `qk_rope_head_dim` → `rope_dim` |
 | `rotate.py` | `qk_rope_head_dim` → `rope_dim`；`index_n_heads` → `n_heads`；`index_head_dim` → `qk_head_dim` |
@@ -310,7 +311,9 @@ for layer_idx, layer_type in enumerate(self.layer_types):
   - `num_dense_layers = n_delta_layers` (30)
   - `num_moe_layers = n_gated_layers` (10)
   - `num_mtp_layers = 0`
-- `transform_mla` 重命名为 `transform_attention`；Qwen3.6 暂无 MLA 分片，返回空字典。
+- `transform_mla` 重命名为 `transform_attention`；Qwen3.6 不再返回空字典，而是导出每层的
+  `q_proj.weight`、`k_proj.weight`、`v_proj.weight`、`o_proj.weight` 以及两个 layer norm 权重，
+  供 `QwenAttentionRef` / `QwenDeltaNetRef` 直接加载。
 - `convert_a_layer`：Qwen3.6 每层都是 MoE，统一走 `transform_moe`。
 - `transform_moe`：对 Qwen3.6 gate weight reshape 为 `(n_routed_experts, dim)`。
 - `transform_mlp`：Qwen3.6 不使用，但若被调用则切换为 Qwen3.6 的 `RMSNormUpGateSiLU` / `DownAllReduce`。
@@ -318,20 +321,35 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 - `__process_head_weights`：Qwen3.6 使用 `qwen3_6/ops/rmsnorm_head_proj.py`。
 - CLI 新增 `--model_type qwen3_6` 分支。
 
-### 8.4 当前限制
+### 8.4 新增 op 包装（2026-07-16）
 
-- `GatedAttention.tilert_forward` 与 `DeltaNet.tilert_forward` 目前均 fallback 到 `golden_forward`，待专用 CUDA kernel 完成后替换。
-- `RMSNormUpGateSiLU.tilert_scales` 形状硬编码为 `(9, 4, 64)`，需根据 `dim=2048`、`inter_dim=512` 推导。
-- `ExpertDownAllReduceWeightsConverter.convert_to_general` 使用 128-SM 布局；对 Qwen3.6 的 `dim=2048`，`dim_per_sm=16`，tile 划分可能需要重新调整。
+- `tilert/models/qwen3_6/ops/gqa_attention.py`：新增 `GQAAttention` / `GQAAttentionWeightsConverter`，
+  定义 `gqa_attention_op` 的 Python 调用接口与 weight alias，golden forward 提供标准 GQA 参考实现。
+- `tilert/models/qwen3_6/ops/delta_net.py`：新增 `DeltaNetOp` / `DeltaNetWeightsConverter`，
+  定义 `delta_net_op` 的 Python 调用接口与 weight alias，golden forward 提供简单线性 attention 参考实现。
+- `ops/__init__.py` 导出新增四个公开符号：`delta_net`、`DeltaNetOp`、`gqa_attention`、`GQAAttention`。
+
+### 8.5 模块接入新 op
+
+- `modules/gated_attention.py`：移除 `QKVRoPE` + `Rotate` 占位，改用 `GQAAttentionOp`；
+  tilert forward 路径为 `GQAAttentionOp -> UnProjOAllReduce`。
+- `modules/delta_net.py`：接入 `DeltaNetOp`；golden/tilert forward 均走 `DeltaNetOp -> RMSNormUpGateSiLU`。
+- `modules/dsa.py`：统一 KV cache 共享给所有 GatedAttention 层，DeltaNet  recurrent state
+  按层索引保存在 `caches["delta_state"]` 中。
+
+### 8.6 当前限制
+
+- `GQAAttentionOp.tilert_forward` 与 `DeltaNetOp.tilert_forward` 目前会调用尚未注册的
+  `torch.ops.tilert.gqa_attention_op` / `delta_net_op`，需等 CUDA kernel 完成后才能真正跑通。
 - 因环境缺少 `torch` 运行库，尚未做运行时 import / 数值验证。
 
-### 8.5 验证状态
+### 8.7 验证状态
 
 - 所有 `qwen3_6/ops/*.py` 通过 AST 语法检查。
 - 所有 `qwen3_6/modules/*.py` 通过 AST 语法检查。
 - `weight_converter.py` 通过 AST 语法检查。
 
-### 8.6 待办事项
+### 8.8 待办事项
 
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
@@ -339,7 +357,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | P0 | 实现 `modules/gated_attention.py` | ✅ 已完成 |
 | P0 | 实现 `modules/delta_net.py` | ✅ 已完成 |
 | P0 | 实现 `modules/dsa.py` | ✅ 已完成 |
-| P1 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py`（CUDA kernel 之前） |
-| P2 | 硬编码参数清理 | 检查 `expert_down_allreduce.py`、`rmsnorm_up_gate_silu.py` tile/scale 形状是否适配 2048-dim |
-| P2 | `transform_attention` 补全 | Qwen3.6 无 MLA，但需按 GQA/DeltaNet 实际分片补充转换逻辑 |
+| P1 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py` ✅ 已完成 |
+| P2 | 硬编码参数清理 | `rmsnorm_up_gate_silu.py`、`expert_down_allreduce.py` ✅ 已完成 |
+| P2 | `transform_attention` 补全 | Qwen3.6 attention 权重导出 ✅ 已完成 |
 | P3 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |

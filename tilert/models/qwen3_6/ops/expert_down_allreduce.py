@@ -111,13 +111,17 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert weights to general (tilert) format."""
+        """Convert weights to general (tilert) format.
+
+        The weight layout is architecture-specific because ``dim_per_sm`` must evenly
+        divide ``dim``. For Qwen3.6 ``dim=2048`` we use 128 SMs -> ``dim_per_sm=16``;
+        the swizzling therefore only processes 16-row tiles. GLM5 ``dim=6144`` keeps
+        the original 48+8 split used by DSv32.
+        """
         args = self.model_args
         assert args.arch_name in ("qwen3_6", "glm_5")
         arch_name = args.arch_name
         dim = args.dim
-        # TODO: 128 SM layout is hard-coded for DSv32/GLM5. For Qwen3.6 (dim=2048)
-        # this gives dim_per_sm=16; kernel layout may need a different tiling.
         num_sms = 128
         dim_per_sm = dim // num_sms
         dim_scale_dim = dim // args.block_size
@@ -129,34 +133,41 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
             mat_in, scale_in = weights_list
             exp_num = mat_in.shape[0]
             mat_in_s = mat_in.reshape(exp_num, num_sms, dim_per_sm, expert_dim)
-            mat_in_0 = (
-                mat_in_s[:, :, :16].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
-            )
-            mat_in_0 = self._swizzle_qmma_16x32(mat_in_0).reshape(exp_num, 128, -1)
-            mat_in_1 = (
-                mat_in_s[:, :, 16:32].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
-            )
-            mat_in_1 = self._swizzle_qmma_16x32(mat_in_1).reshape(exp_num, 128, -1)
-            mat_in_2 = (
-                mat_in_s[:, :, 32:48].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
-            )
-            mat_in_2 = self._swizzle_qmma_16x32(mat_in_2).reshape(exp_num, 128, -1)
-            mats_to_cat = [mat_in_0, mat_in_1, mat_in_2]
+
             if arch_name == "qwen3_6":
+                assert dim_per_sm == 16, f"Qwen3.6 expects dim_per_sm=16, got {dim_per_sm}"
+                mat_in_0 = (
+                    mat_in_s[:, :, :16].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
+                )
+                mat_in_0 = self._swizzle_qmma_16x32(mat_in_0).reshape(exp_num, num_sms, -1)
+                mat_in_swizzled = mat_in_0.reshape(exp_num, dim, expert_dim)
+            else:
+                mat_in_0 = (
+                    mat_in_s[:, :, :16].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
+                )
+                mat_in_0 = self._swizzle_qmma_16x32(mat_in_0).reshape(exp_num, num_sms, -1)
+                mat_in_1 = (
+                    mat_in_s[:, :, 16:32].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
+                )
+                mat_in_1 = self._swizzle_qmma_16x32(mat_in_1).reshape(exp_num, num_sms, -1)
+                mat_in_2 = (
+                    mat_in_s[:, :, 32:48].reshape(exp_num, num_sms, 16, k_chunks, 32).transpose(2, 3)
+                )
+                mat_in_2 = self._swizzle_qmma_16x32(mat_in_2).reshape(exp_num, num_sms, -1)
+                mats_to_cat = [mat_in_0, mat_in_1, mat_in_2]
                 mat_in_3 = (
                     mat_in_s[:, :, 48:56].reshape(exp_num, num_sms, 8, k_chunks, 32).transpose(2, 3)
                 )
-                mat_in_3 = self._swizzle_qmma_8x32(mat_in_3).reshape(exp_num, 128, -1)
+                mat_in_3 = self._swizzle_qmma_8x32(mat_in_3).reshape(exp_num, num_sms, -1)
                 mats_to_cat.append(mat_in_3)
-            mat_in_swizzled = torch.cat(mats_to_cat, dim=2)
-            mat_in_swizzled = mat_in_swizzled.reshape(exp_num, dim, expert_dim)
+                mat_in_swizzled = torch.cat(mats_to_cat, dim=2).reshape(exp_num, dim, expert_dim)
 
             mat_scale_tilert = (
                 scale_in.reshape(exp_num, dim_scale_dim, 1, scale_cols)
-                .repeat(1, 1, 16, 1)
+                .repeat(1, 1, dim_per_sm, 1)
                 .reshape(exp_num, num_sms, -1)
             )
-            target_cols_per_sm = 1024 * scale_cols // num_sms
+            target_cols_per_sm = dim_per_sm * scale_cols
             pad_amount = target_cols_per_sm - mat_scale_tilert.shape[-1]
             if pad_amount > 0:
                 padding_zeros = torch.zeros(
@@ -165,7 +176,9 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
                     device=scale_in.device,
                 )
                 mat_scale_tilert = torch.cat([mat_scale_tilert, padding_zeros], dim=2)
-            mat_scale_tilert = mat_scale_tilert.reshape(exp_num, 1024, scale_cols)
+            elif pad_amount < 0:
+                mat_scale_tilert = mat_scale_tilert[:, :, :target_cols_per_sm]
+            mat_scale_tilert = mat_scale_tilert.reshape(exp_num, dim, scale_cols)
             if mat_scale_tilert.dtype != torch.float32:
                 print(
                     "Warning: ExpertDownAllReduceWeightsConverter: "
@@ -180,7 +193,7 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pack FP8 weights for the BF16 MMA kernel (DSv32 only)."""
         args = self.model_args
-        assert args.arch_name == "qwen3_6", "BF16 MMA only wired for DSv32."
+        assert args.arch_name == "deepseek_v3_2", "BF16 MMA layout is only valid for DSv32."
         dim = args.dim
         num_sms = 128
         dim_per_sm = dim // num_sms

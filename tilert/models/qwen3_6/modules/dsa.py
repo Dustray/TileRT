@@ -106,15 +106,22 @@ class QwenDsa(SerializableTileRTModule):
             caches = self._init_layer_caches(freqs_cis)
 
         h = x
-        for block in self.exec_seq:
-            layer_idx = int(block.prefix_seq[0].split("_")[1]) if hasattr(block, "prefix_seq") else 0
-            layer_cache = caches.setdefault(layer_idx, {
-                "k_cache": caches.get("k_cache"),
-                "v_cache": caches.get("v_cache"),
+        shared_k_cache = caches["k_cache"]
+        shared_v_cache = caches["v_cache"]
+        for layer_idx, block in enumerate(self.exec_seq):
+            layer_cache = {
+                "k_cache": shared_k_cache,
+                "v_cache": shared_v_cache,
                 "freqs_cis": freqs_cis,
-                "delta_state": None,
-            })
+                "delta_state": caches.get("delta_state", {}).get(layer_idx),
+            }
             h, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
+            shared_k_cache = layer_cache["k_cache"]
+            shared_v_cache = layer_cache["v_cache"]
+            if "delta_state" in layer_cache:
+                caches.setdefault("delta_state", {})[layer_idx] = layer_cache["delta_state"]
+        caches["k_cache"] = shared_k_cache
+        caches["v_cache"] = shared_v_cache
         return h, caches
 
     def tilert_forward(
@@ -145,7 +152,7 @@ class QwenDsa(SerializableTileRTModule):
     def _init_layer_caches(self, freqs_cis: torch.Tensor) -> dict[str, Any]:
         """Allocate KV caches for Gated Attention layers.
 
-        DeltaNet layers carry their own recurrent state in ``layer_cache``.
+        DeltaNet layers carry their own recurrent state in ``caches["delta_state"]``.
         """
         dev = f"cuda:{self.device_id}"
         cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
@@ -167,6 +174,7 @@ class QwenDsa(SerializableTileRTModule):
                 device=dev,
             ),
             "freqs_cis": freqs_cis,
+            "delta_state": {},
         }
 
     def get_tilert_weights_alias(self) -> list[str]:

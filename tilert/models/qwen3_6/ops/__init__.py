@@ -3,6 +3,14 @@
 from tilert.models.qwen3_6.ops.broadcast_selected_token_ids import (
     broadcast_selected_token_ids,
 )
+from tilert.models.qwen3_6.ops.delta_net import (
+    DeltaNetAlgorithm,
+    DeltaNetOp,
+    DeltaNetRefWeightsAlias,
+    DeltaNetTilertWeightsAlias,
+    DeltaNetWeightsConverter,
+    delta_net,
+)
 from tilert.models.qwen3_6.ops.down_allreduce import (
     DownAllReduce,
     DownAllReduceAlgorithm,
@@ -12,6 +20,14 @@ from tilert.models.qwen3_6.ops.eh_proj_allreduce import (
     EHProjAllReduce,
     EHProjAllReduceAlgorithm,
     eh_proj_allreduce,
+)
+from tilert.models.qwen3_6.ops.gqa_attention import (
+    GQAAttention,
+    GQAAttentionAlgorithm,
+    GQAAttentionRefWeightsAlias,
+    GQAAttentionTilertWeightsAlias,
+    GQAAttentionWeightsConverter,
+    gqa_attention,
 )
 from tilert.models.qwen3_6.ops.expert_down_allreduce import (
     ExpertDownAllReduce,
@@ -66,9 +82,21 @@ from tilert.models.qwen3_6.ops.unproj_o_allreduce import (
 )
 
 __all__ = [
+    "delta_net",
+    "DeltaNetOp",
+    "DeltaNetAlgorithm",
+    "DeltaNetRefWeightsAlias",
+    "DeltaNetTilertWeightsAlias",
+    "DeltaNetWeightsConverter",
     "down_allreduce",
     "DownAllReduce",
     "DownAllReduceAlgorithm",
+    "gqa_attention",
+    "GQAAttention",
+    "GQAAttentionAlgorithm",
+    "GQAAttentionRefWeightsAlias",
+    "GQAAttentionTilertWeightsAlias",
+    "GQAAttentionWeightsConverter",
     "expert_down_allreduce",
     "ExpertDownAllReduce",
     "ExpertDownAllReduceAlgorithm",

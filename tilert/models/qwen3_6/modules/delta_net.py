@@ -8,6 +8,10 @@ import torch.nn.functional as F
 from tilert.models.base import SerializableTileRTModule, TileRTModule
 from tilert.models.common import RMSNorm, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
+from tilert.models.qwen3_6.ops.delta_net import (
+    DeltaNetOp,
+    DeltaNetAlgorithm,
+)
 from tilert.models.qwen3_6.ops.rmsnorm_up_gate_silu import (
     RMSNormUpGateSiLU,
     RMSNormUpGateSiLUAlgorithm,
@@ -107,6 +111,14 @@ class DeltaNet(SerializableTileRTModule):
         )
         self.register_op(self.delta_ref)
 
+        self.attn = DeltaNetOp(
+            model_args=model_args,
+            device_id=device_id,
+            num_devices=num_devices,
+            algorithm=DeltaNetAlgorithm.GENERAL,
+        )
+        self.register_op(self.attn)
+
         self.ffn = RMSNormUpGateSiLU(
             model_args=model_args,
             device_id=device_id,
@@ -121,18 +133,14 @@ class DeltaNet(SerializableTileRTModule):
         start_pos: int,
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Reference forward placeholder.
-
-        A full implementation would run the DeltaNet linear attention
-        recurrence and then the FFN.  Until the exact recurrence is available,
-        this returns the FFN-only output so the module stack can be wired.
-        """
-        del start_pos
-        ffn_out = self.ffn.golden_forward(x)
-        # Sum over the per-SM expert dimension to collapse back to (B, S, dim).
+        """Reference forward: DeltaNet linear attention + FFN."""
+        prev_state = state.get("delta_state") if state is not None else None
+        attn_out, new_state = self.attn.golden_forward(x, start_pos, prev_state)
+        ffn_out = self.ffn.golden_forward(attn_out)
         if ffn_out.dim() == 4:
             ffn_out = ffn_out.sum(dim=2)
-        return ffn_out, state
+        next_state = {"delta_state": new_state} if state is not None else None
+        return ffn_out, next_state
 
     def tilert_forward(
         self,
@@ -140,12 +148,14 @@ class DeltaNet(SerializableTileRTModule):
         start_pos: int,
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """TileRT forward placeholder.
-
-        The optimized path will invoke a dedicated ``delta_net_op`` kernel.
-        For now it falls back to the golden path.
-        """
-        return self.golden_forward(x, start_pos, state)
+        """Optimized forward using ``DeltaNetOp`` + ``RMSNormUpGateSiLU``."""
+        prev_state = state.get("delta_state") if state is not None else None
+        attn_out, new_state = self.attn.forward(x, start_pos, prev_state)
+        ffn_out = self.ffn.forward(attn_out)
+        if ffn_out.dim() == 4:
+            ffn_out = ffn_out.sum(dim=2)
+        next_state = {"delta_state": new_state} if state is not None else None
+        return ffn_out, next_state
 
     def forward(
         self,

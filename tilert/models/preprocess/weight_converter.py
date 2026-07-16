@@ -259,7 +259,28 @@ class WeightConverter:
         """Shard attention/MLA weights across devices."""
         if self.is_qwen36:
             # Qwen3.6 has no MLA LoRA weights; attention weights are handled per-layer.
-            return {f"dev_{dev_id}": {} for dev_id in range(self.num_devices)}
+            # The transformer self_attn weights (q/k/v/o_proj) and the two
+            # layer norms live in the per-device modules, so they are extracted
+            # here with their original HF keys and written into the shard dict
+            # under stable aliases that ``QwenAttentionRef`` / ``QwenDeltaNetRef``
+            # can consume directly.
+            q_proj = weights_hf[f"model.layers.{layer_id}.self_attn.q_proj.weight"]
+            k_proj = weights_hf[f"model.layers.{layer_id}.self_attn.k_proj.weight"]
+            v_proj = weights_hf[f"model.layers.{layer_id}.self_attn.v_proj.weight"]
+            o_proj = weights_hf[f"model.layers.{layer_id}.self_attn.o_proj.weight"]
+            input_ln = weights_hf[f"model.layers.{layer_id}.input_layernorm.weight"]
+            post_attn_ln = weights_hf[f"model.layers.{layer_id}.post_attention_layernorm.weight"]
+            return {
+                f"dev_{dev_id}": {
+                    "q_proj.weight": q_proj,
+                    "k_proj.weight": k_proj,
+                    "v_proj.weight": v_proj,
+                    "o_proj.weight": o_proj,
+                    "input_layernorm.weight": input_ln,
+                    "post_attention_layernorm.weight": post_attn_ln,
+                }
+                for dev_id in range(self.num_devices)
+            }
 
         mla_weights: dict[str, dict[str, torch.Tensor]] = {
             f"dev_{dev_id}": {} for dev_id in range(self.num_devices)
