@@ -129,9 +129,11 @@ class QKVRoPE(TileRTModule):
     def init_random_weights(self) -> None:
         pass
 
-    def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
+    def init_tilert_vars(
+        self, batch_size: int, seq_len: int, device: str = "cuda"
+    ) -> None:
         del batch_size, seq_len
-        self.profile_logs = get_profile_log_tensor()
+        self.profile_logs = get_profile_log_tensor(device=device)
         self.is_var_init = True
 
     def golden_forward(

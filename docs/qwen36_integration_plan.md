@@ -432,3 +432,43 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | P3 | 完整 40 层转换 | ✅ 已完成（9 shards，6497 tensors，~24.9 GB） |
 | P4 | 模块引用持有者对齐 | ✅ 已完成（`delta_net.py`、`gated_attention.py`） |
 | P5 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |
+
+## 9. Python 层 op 完成度审计与修复 (2026-07-17)
+
+本次审计范围为 `tilert/models/qwen3_6/ops/*.py`，不包含 CUDA kernel 和 `tilert_forward`
+实现。目标是把 reference 路径（`init_reference_weights`、`device_sharding`、
+`golden_forward`、`init_tilert_vars`）以及 weight converter 的 stub 补齐。
+
+### 9.1 已完成的修复
+
+| 文件 | 修复内容 | 状态 |
+|------|----------|------|
+| `ops/gqa_attention.py` | 实现 `device_sharding`（按 `n_heads/n_kv_heads` 拆分 Q/KV/O，按 `rope_dim` 拆分 rope 缓存）和 `init_reference_weights`（加载本地 shard 并反量化） | ✅ 完成 |
+| `ops/delta_net.py` | 实现 `device_sharding`（按 `qkv/z/a/b` 输出维度拆分）和 `init_reference_weights`；新增 `_get_local_out_slices` 辅助 | ✅ 完成 |
+| `ops/rotate.py` | `init_tilert_vars` 增加 `device` 参数，output buffer 与 profile log tensor 显式分配到指定设备 | ✅ 完成 |
+| `ops/qkv_rope.py` | `init_tilert_vars` 增加 `device` 参数，profile log tensor 显式分配 | ✅ 完成 |
+| `ops/expert_down_allreduce.py` | 删除重复的 `convert_to_bf16mma` 方法（Qwen3.6 已不支持 BF16MMA） | ✅ 完成 |
+
+### 9.2 验证结果
+
+- `ops/gqa_attention.py`、`ops/delta_net.py`、`ops/rotate.py`、`ops/qkv_rope.py` 语法检查通过。
+- `ops/expert_down_allreduce.py` 因环境缺少 `torch` 包导致 import 无法解析（其他文件同样依赖 `torch` 但 Pylance 已能解析），代码本身无语法/AST 错误；删除重复方法后 `ExpertDownAllReduceWeightsConverter.dispatch` 仍能正确路由到 `convert_to_general`。
+
+### 9.3 剩余待办
+
+| 优先级 | 任务 | 说明 |
+|--------|------|------|
+| P1 | 端到端 reference forward 验证 | 运行 `modules/dsa.py` 的 golden forward，确认 40 层输出数值合理 |
+| P2 | `transform_mtp` 补全 | checkpoint 含 1 层 MTP；当前 stub，首版可跳过 |
+| P3 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |
+| P4 | `generator.py` 接入 | 在 op 全部完成后实现 `QwenShowHandsDSALayer` |
+
+### 9.4 注意事项
+
+- `GQAAttention` / `DeltaNetOp` 的 `init_tilert_weights` 仍依赖 `dispatch` 调用各自
+  `WeightsConverter`，与 `tilert_forward` 一并留到 CUDA kernel 阶段实现。
+- `tilert/models/qwen3_6/modules/delta_net.py` 与 `gated_attention.py` 中的
+  `QwenDeltaNetRef` / `QwenAttentionRef` 属于 reference-only holder，没有
+  `tilert_forward`；不能单独实例化，需通过父模块 `DeltaNet` / `GatedAttention` 调用。
+- 下一步建议：先实现端到端 golden forward 的 sanity run，确认 reference 路径能
+  在真实权重上产生合理结果，再进入 CUDA kernel 开发。

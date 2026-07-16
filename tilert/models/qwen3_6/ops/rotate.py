@@ -190,12 +190,15 @@ class Rotate(TileRTModule):
     def init_random_weights(self) -> None:
         pass
 
-    def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
+    def init_tilert_vars(
+        self, batch_size: int, seq_len: int, device: str = "cuda"
+    ) -> None:
         self.output = torch.zeros(
             (batch_size, seq_len, self.index_n_heads, self.index_head_dim),
             dtype=torch.bfloat16,
+            device=device,
         )
-        self.profile_logs = get_profile_log_tensor()
+        self.profile_logs = get_profile_log_tensor(device=device)
         self.is_init = True
 
     def golden_forward(

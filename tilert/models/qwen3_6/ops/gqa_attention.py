@@ -185,13 +185,74 @@ class GQAAttention(TileRTModule):
     def device_sharding(
         self, weights_map: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        del weights_map
-        # Placeholder: real sharding depends on the kernel layout.
-        return {}
+        """Shard GQA reference weights across devices.
+
+        For the reference/golden path we split q/k/v/o_proj and q_norm/k_norm
+        along the head dimension so each device owns ``num_local_heads`` Q
+        heads and ``num_local_kv_heads`` KV heads.
+        """
+        prefix = self.ref_weights_alias.key_prefix
+        q_w = weights_map[f"{prefix}.q_proj.weight"]
+        k_w = weights_map[f"{prefix}.k_proj.weight"]
+        v_w = weights_map[f"{prefix}.v_proj.weight"]
+        o_w = weights_map[f"{prefix}.o_proj.weight"]
+        q_norm_w = weights_map[f"{prefix}.q_norm.weight"]
+        k_norm_w = weights_map[f"{prefix}.k_norm.weight"]
+
+        q_out, _ = q_w.shape
+        k_out, _ = k_w.shape
+        v_out, _ = v_w.shape
+        q_per_dev = self.num_local_heads * self.head_dim
+        kv_per_dev = self.num_local_kv_heads * self.head_dim
+        qkv_parts = [
+            q_w[i * q_per_dev : (i + 1) * q_per_dev]
+            for i in range(self.num_devices)
+        ]
+        k_parts = [
+            k_w[i * kv_per_dev : (i + 1) * kv_per_dev]
+            for i in range(self.num_devices)
+        ]
+        v_parts = [
+            v_w[i * kv_per_dev : (i + 1) * kv_per_dev]
+            for i in range(self.num_devices)
+        ]
+        # o_proj input dim equals the Q head count * head_dim.
+        o_per_dev = self.num_local_heads * self.head_dim
+        o_parts = [
+            o_w[:, i * o_per_dev : (i + 1) * o_per_dev]
+            for i in range(self.num_devices)
+        ]
+
+        qkv_stacked = []
+        for i in range(self.num_devices):
+            qkv_stacked.append(
+                torch.cat([qkv_parts[i], k_parts[i], v_parts[i]], dim=0)
+            )
+
+        # q_norm/k_norm are per-head weights; split accordingly.
+        q_norm_parts = [
+            q_norm_w[i * self.num_local_heads * self.head_dim : (i + 1) * self.num_local_heads * self.head_dim]
+            for i in range(self.num_devices)
+        ]
+        k_norm_parts = [
+            k_norm_w[i * self.num_local_kv_heads * self.head_dim : (i + 1) * self.num_local_kv_heads * self.head_dim]
+            for i in range(self.num_devices)
+        ]
+
+        return {
+            self.tilert_weights_alias.qkv_proj_weights: torch.stack(qkv_stacked, dim=0).contiguous(),
+            self.tilert_weights_alias.o_proj_weights: torch.stack(o_parts, dim=0).contiguous(),
+            self.tilert_weights_alias.q_norm_weights: torch.stack(q_norm_parts, dim=0).contiguous(),
+            self.tilert_weights_alias.k_norm_weights: torch.stack(k_norm_parts, dim=0).contiguous(),
+        }
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        del state_dict
-        pass
+        sharded = self.device_sharding(state_dict)
+        did = self.device_id
+        self.qkv_proj_weights = sharded[self.tilert_weights_alias.qkv_proj_weights][did]
+        self.o_proj_weights = sharded[self.tilert_weights_alias.o_proj_weights][did]
+        self.q_norm_weights = sharded[self.tilert_weights_alias.q_norm_weights][did]
+        self.k_norm_weights = sharded[self.tilert_weights_alias.k_norm_weights][did]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]

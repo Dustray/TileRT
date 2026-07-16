@@ -243,12 +243,6 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
 
             return mat_swizzled.contiguous(), mat_scale_tilert.contiguous()
 
-    def convert_to_bf16mma(
-        self, weights_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """BF16MMA is not supported for Qwen3.6."""
-        raise ValueError("BF16MMA is not supported for qwen3_6")
-
 
 @dataclass
 class ExpertDownAllReduceTilertWeightsAlias:

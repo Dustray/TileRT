@@ -232,12 +232,81 @@ class DeltaNetOp(TileRTModule):
     def device_sharding(
         self, weights_map: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        del weights_map
-        return {}
+        """Shard DeltaNet reference weights across devices.
+
+        Splits the column dimensions of the projection weights so each device
+        owns a contiguous slice.  The output dimensions differ per tensor:
+
+        - in_proj_qkv: (n_q_heads + 2*n_kv_heads) * head_dim
+        - in_proj_z/out_proj: value_dim (n_kv_heads * value_head_dim)
+        - in_proj_a/in_proj_b: n_kv_heads * a/b dim
+        - conv1d: same as in_proj_qkv
+        - A_log/dt_bias/norm: small per-head/per-value vectors, split similarly
+        """
+        prefix = self.ref_weights_alias.key_prefix
+        aliases = self.ref_weights_alias.ref_tensor_alias
+        out_slices = self._get_local_out_slices()
+
+        sharded: dict[str, list[torch.Tensor]] = {alias: [] for alias in self.tilert_weights_alias()}
+        for dev in range(self.num_devices):
+            slc = out_slices[dev]
+            qkv = weights_map[aliases[0]][slc[0]]
+            z = weights_map[aliases[1]][slc[1]]
+            a = weights_map[aliases[2]][slc[2]]
+            b = weights_map[aliases[3]][slc[3]]
+            conv1d = weights_map[aliases[4]][:, :, slc[0]]
+            A_log = weights_map[aliases[5]][slc[2]]
+            dt_bias = weights_map[aliases[6]][slc[3]]
+            norm = weights_map[aliases[7]][slc[1]]
+            out_proj = weights_map[aliases[8]][:, slc[1]]
+            sharded[self.tilert_weights_alias.in_proj_qkv_weights].append(qkv)
+            sharded[self.tilert_weights_alias.in_proj_z_weights].append(z)
+            sharded[self.tilert_weights_alias.in_proj_a_weights].append(a)
+            sharded[self.tilert_weights_alias.in_proj_b_weights].append(b)
+            sharded[self.tilert_weights_alias.conv1d_weights].append(conv1d)
+            sharded[self.tilert_weights_alias.A_log].append(A_log)
+            sharded[self.tilert_weights_alias.dt_bias].append(dt_bias)
+            sharded[self.tilert_weights_alias.norm_weights].append(norm)
+            sharded[self.tilert_weights_alias.out_proj_weights].append(out_proj)
+
+        return {
+            alias: torch.stack(tensors, dim=0).contiguous()
+            for alias, tensors in sharded.items()
+        }
+
+    def _get_local_out_slices(self) -> list[list[slice]]:
+        """Return per-device column slices for each DeltaNet projection."""
+        args = self.model_args
+        qkv_out = args.delta_conv_dim  # n_q_heads * head_dim + 2 * n_kv_heads * head_dim
+        z_out = args.delta_gate_dim    # n_kv_heads * value_head_dim
+        a_out = args.delta_a_dim       # n_kv_heads * a_dim
+        b_out = args.delta_b_dim       # n_kv_heads * b_dim
+        qkv_per_dev = qkv_out // self.num_devices
+        z_per_dev = z_out // self.num_devices
+        a_per_dev = a_out // self.num_devices
+        b_per_dev = b_out // self.num_devices
+        slices = []
+        for dev in range(self.num_devices):
+            slices.append([
+                slice(dev * qkv_per_dev, (dev + 1) * qkv_per_dev),
+                slice(dev * z_per_dev, (dev + 1) * z_per_dev),
+                slice(dev * a_per_dev, (dev + 1) * a_per_dev),
+                slice(dev * b_per_dev, (dev + 1) * b_per_dev),
+            ])
+        return slices
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        del state_dict
-        pass
+        sharded = self.device_sharding(state_dict)
+        did = self.device_id
+        self.in_proj_qkv_weights = sharded[self.tilert_weights_alias.in_proj_qkv_weights][did]
+        self.in_proj_z_weights = sharded[self.tilert_weights_alias.in_proj_z_weights][did]
+        self.in_proj_a_weights = sharded[self.tilert_weights_alias.in_proj_a_weights][did]
+        self.in_proj_b_weights = sharded[self.tilert_weights_alias.in_proj_b_weights][did]
+        self.conv1d_weights = sharded[self.tilert_weights_alias.conv1d_weights][did]
+        self.A_log = sharded[self.tilert_weights_alias.A_log][did]
+        self.dt_bias = sharded[self.tilert_weights_alias.dt_bias][did]
+        self.norm_weights = sharded[self.tilert_weights_alias.norm_weights][did]
+        self.out_proj_weights = sharded[self.tilert_weights_alias.out_proj_weights][did]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
