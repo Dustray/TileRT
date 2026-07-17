@@ -8,6 +8,12 @@ from transformers import AutoTokenizer
 
 from tilert import logger
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
+from tilert.models.qwen3_6.modules.end2end import (
+    QwenShowHandsLayer,
+    _extract_ffn_ops,
+    _get_moe_weight_keys,
+)
+from tilert.models.qwen3_6.temp_var_indices import Idx
 from tilert.tilert_init import tilert_init
 
 __all__ = [
@@ -30,8 +36,10 @@ def stats_time(time_list: list[float], title: str) -> None:
 class Qwen36Generator:
     """Generator for Qwen3.6-35B-A3B.
 
-    This is a placeholder implementation. The actual implementation requires
-    the corresponding CUDA kernels to be built first.
+    The generator owns a ``QwenShowHandsLayer`` decode layer.  When the
+    Qwen3.6 CUDA kernels are built, ``forward()`` will automatically use them;
+    until then the generator runs a Python reference path for end-to-end smoke
+    tests and architecture alignment.
     """
 
     def __init__(
@@ -82,9 +90,14 @@ class Qwen36Generator:
 
         self.default_device = torch.device("cuda:0")
 
-        # Placeholder for the actual decode layer
-        # Will be implemented after CUDA kernels are ready
-        self.decode_layer = None
+        self.decode_layer = QwenShowHandsLayer(
+            model_args=self.config,
+            model_path=self.model_weights_dir,
+            with_mtp=with_mtp,
+            use_topp=use_topp,
+            top_p=top_p,
+            top_k=top_k,
+        )
 
         self.mtp_seq_len = 4 if with_mtp else 1
 
@@ -106,14 +119,40 @@ class Qwen36Generator:
 
     def init_random_weights(self) -> None:
         """Initialize weights randomly (for testing)."""
-        logger.warning("init_random_weights: Not yet implemented for Qwen3.6")
-        # TODO: Implement random weight initialization
+        self.decode_layer.init_random_weights()
 
     def from_pretrained(self) -> None:
         """Load the model weights from the given path."""
         logger.info(f"Loading weights from: {self.model_weights_dir}")
-        # TODO: Implement weight loading
-        # This requires the CUDA kernels to be built first
+        self.decode_layer.from_pretrained(self.model_weights_dir)
+
+    def extract_ffn_cache(self) -> tuple[dict[int, list], dict[int, set[str]]]:
+        """Extract MOE/MLP op objects and skip keys from current loaded weights.
+
+        Returns:
+            Tuple of (cached_ffn_ops_per_device, skip_keys_per_device).
+        """
+        cached_ffn_ops: dict[int, list] = {}
+        skip_keys: dict[int, set[str]] = {}
+        for device_id in range(self.decode_layer.num_devices):
+            stack = self.decode_layer._stack_objects[device_id]
+            if stack is None:
+                raise RuntimeError(
+                    f"Device {device_id} QwenTransformerStack not available for cache extraction"
+                )
+            cached_ffn_ops[device_id] = _extract_ffn_ops(stack)
+            skip_keys[device_id] = _get_moe_weight_keys(stack)
+        return cached_ffn_ops, skip_keys
+
+    def from_pretrained_with_cache(
+        self,
+        cached_ffn_ops_per_device: dict[int, list],
+        skip_keys_per_device: dict[int, set[str]],
+    ) -> None:
+        """Load weights reusing cached MOE/MLP ops."""
+        self.decode_layer.from_pretrained_with_cache(
+            self.model_weights_dir, cached_ffn_ops_per_device, skip_keys_per_device
+        )
 
     def update_sampling_params(
         self,
@@ -127,31 +166,286 @@ class Qwen36Generator:
         self.use_topp = use_topp
         self.top_p = top_p
         self.top_k = top_k
-        logger.debug(
-            f"Updated sampling params: temp={temperature}, top_p={top_p}, "
-            f"top_k={top_k}, use_topp={use_topp}"
+        self.decode_layer.update_sampling_config(
+            temperature=temperature, top_p=top_p, top_k=top_k, use_topp=use_topp
         )
 
-    def generate(self, prompt: str) -> str:
-        """Generate text from a prompt.
+    def set_cur_pos(self, cur_pos: int, with_mtp: bool | None = None) -> None:
+        """Set the current decode position for RoPE."""
+        active_mtp = with_mtp if with_mtp is not None else self.with_mtp
+        self.decode_layer.set_cur_pos(cur_pos, with_mtp=active_mtp)
 
-        Note: This is a placeholder. Actual generation requires CUDA kernels.
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt: str,
+        print_log: bool = True,
+        with_mtp: bool | None = None,
+        prompt_tokens: list[int] | None = None,
+    ) -> tuple[str, list[float], list[int], int]:
+        """Main function to perform single sequence generation.
+
+        Args:
+            prompt: The input prompt string.
+            print_log: Whether to print generation logs.
+            with_mtp: Override MTP mode for this call. None uses self.with_mtp.
+                Requires MTP weights to have been loaded (self.with_mtp=True).
+            prompt_tokens: Pre-tokenized prompt tokens. If provided, skip tokenization
+                and use these tokens directly (useful for exact-length benchmarking).
+
+        Returns:
+            Tuple of (result_text, time_list, accepted_counts, prompt_len).
+            accepted_counts is empty for non-MTP mode.
         """
-        logger.warning("generate: Qwen3.6 CUDA kernels not yet implemented")
+        active_mtp = with_mtp if with_mtp is not None else self.with_mtp
+        if active_mtp and not self.with_mtp:
+            raise ValueError("Cannot use MTP mode: MTP weights were not loaded")
+        self.decode_layer.set_sampling_seed(self.sampling_seed, with_mtp=active_mtp)
+        if active_mtp:
+            return self._generate_with_mtp(prompt, print_log, prompt_tokens=prompt_tokens)
+        result, time_list, prompt_len = self._generate_without_mtp(
+            prompt, print_log, with_mtp=active_mtp, prompt_tokens=prompt_tokens
+        )
+        return result, time_list, [], prompt_len
 
-        # Tokenize
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
-        input_ids = input_ids.to(self.default_device)
+    def _generate_without_mtp(
+        self,
+        prompt: str,
+        print_log: bool = True,
+        with_mtp: bool = False,
+        prompt_tokens: list[int] | None = None,
+    ) -> tuple[str, list[float], int]:
+        """Standard generation without MTP."""
+        if prompt_tokens is None:
+            prompt_tokens = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                thinking=self.enable_thinking,
+            )
 
-        # Placeholder: return the input as-is (for testing the interface)
-        output = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        return output
+        max_seq_len = self.config.max_seq_len
+        prompt_len = len(prompt_tokens)
+        total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
+
+        tokens = torch.full(
+            (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
+        )
+        tokens[0, :prompt_len] = torch.tensor(
+            prompt_tokens, dtype=torch.long, device=self.default_device
+        )
+        prompt_mask = tokens != -1
+
+        prev_pos = 0
+        finished = torch.tensor(
+            [False] * self.batch_size, dtype=torch.bool, device=self.default_device
+        )
+
+        time_list = []
+        for cur_pos_val in range(1, total_len):
+            start_time = time.time()
+            multi_devices_results = self.decode_layer.forward(
+                tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos
+            )
+            end_time = time.time()
+            time_list.append(end_time - start_time)
+
+            intermediates, *_ = multi_devices_results[0]
+            next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
+
+            next_token = torch.where(
+                prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token
+            )
+            tokens[0, cur_pos_val] = next_token
+            finished |= torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
+            prev_pos = cur_pos_val
+            if cur_pos_val >= prompt_len:
+                decoded_tokens = self.tokenizer.decode(
+                    [next_token.item()], skip_special_tokens=True
+                )
+                if print_log:
+                    print(decoded_tokens, end="", flush=True)
+
+            if finished.all():
+                break
+
+        if print_log:
+            print("\n")
+            logger.info(f"--Number of tokens generated: {len(time_list)}")
+
+            stats_time(time_list, "==== Performance ====")
+            print("\n")
+
+        self.decode_layer.reset_sequence()
+
+        completion_tokens = []
+        for _, toks in enumerate(tokens.tolist()):
+            toks = toks[prompt_len : prompt_len + self.max_new_tokens]
+            if self.eos_id in toks:
+                toks = toks[: toks.index(self.eos_id)]
+            completion_tokens.append(toks)
+
+        decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
+
+        return f"{decoded_tokens[0]}\n" if decoded_tokens else "", time_list, prompt_len
+
+    def _generate_with_mtp(
+        self,
+        prompt: str,
+        print_log: bool = True,
+        prompt_tokens: list[int] | None = None,
+    ) -> tuple[str, list[float], list[int], int]:
+        """Generation with MTP (Multi-Token Prediction) speculative decoding."""
+        if prompt_tokens is None:
+            prompt_tokens = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                thinking=self.enable_thinking,
+            )
+
+        max_seq_len = self.config.max_seq_len
+        prompt_len = len(prompt_tokens)
+        total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
+
+        tokens = torch.full(
+            (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
+        )
+        tokens[0, :prompt_len] = torch.tensor(
+            prompt_tokens, dtype=torch.long, device=self.default_device
+        )
+
+        prefill_time_list = []
+        decode_time_list = []
+        decode_accepted_counts = []
+        cur_pos = 0
+
+        while cur_pos < prompt_len - 1:
+            draft_end = min(cur_pos + self.mtp_seq_len, prompt_len)
+            draft_tokens = tokens[0, cur_pos:draft_end].clone()
+            actual_token_count = draft_tokens.shape[0]
+
+            if actual_token_count < self.mtp_seq_len:
+                pad_token = draft_tokens[-1].item()
+                padding = torch.full(
+                    (self.mtp_seq_len - actual_token_count,),
+                    pad_token,
+                    dtype=torch.long,
+                    device=self.default_device,
+                )
+                draft_tokens = torch.cat([draft_tokens, padding])
+
+            draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
+
+            mtp_extra_pos = cur_pos + self.mtp_seq_len
+            if mtp_extra_pos < prompt_len:
+                mtp_extra_token = int(tokens[0, mtp_extra_pos].item())
+            else:
+                mtp_extra_token = int(tokens[0, draft_end - 1].item())
+            self.decode_layer.set_prefill_mtp_extra_token(mtp_extra_token)
+
+            self.decode_layer.set_prefill_valid_tokens(actual_token_count)
+
+            start_time = time.time()
+            self.decode_layer.forward(draft_tokens, with_mtp=True, cur_pos=cur_pos)
+            end_time = time.time()
+            prefill_time_list.append(end_time - start_time)
+
+            cur_pos += actual_token_count
+
+        cur_pos = prompt_len - 1
+        self.set_cur_pos(prompt_len - 1)
+
+        self.decode_layer.set_prefill_valid_tokens(0)
+
+        finished = False
+        while cur_pos < total_len - 1 and not finished:
+            if cur_pos == prompt_len - 1:
+                last_token = tokens[0, prompt_len - 1].item()
+                draft_tokens = torch.full(
+                    (self.mtp_seq_len,),
+                    last_token,
+                    dtype=torch.long,
+                    device=self.default_device,
+                )
+                draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
+            else:
+                draft_tokens = self.decode_layer.get_next_draft_tokens(0).reshape(
+                    1, self.mtp_seq_len
+                )
+
+            start_time = time.time()
+            self.decode_layer.forward(draft_tokens, with_mtp=True, cur_pos=cur_pos)
+            end_time = time.time()
+            decode_time_list.append(end_time - start_time)
+
+            num_accepted = self.decode_layer.get_num_accepted(0)
+            predicted_tokens = self.decode_layer.get_predicted_tokens(0).flatten()
+            decode_accepted_counts.append(num_accepted)
+
+            num_output_tokens = num_accepted
+            for i in range(num_output_tokens):
+                if cur_pos + 1 + i >= total_len:
+                    break
+                new_token = int(predicted_tokens[i].item())
+                tokens[0, cur_pos + 1 + i] = new_token
+
+                if cur_pos + 1 + i >= prompt_len and print_log:
+                    decoded_text = self.tokenizer.decode([new_token], skip_special_tokens=True)
+                    print(decoded_text, end="", flush=True)
+
+                if new_token == self.eos_id:
+                    finished = True
+                    break
+
+            cur_pos += num_accepted
+
+        if print_log:
+            print("\n")
+            total_tokens = sum(decode_accepted_counts)
+            logger.info(f"--Number of forward calls (decode): {len(decode_accepted_counts)}")
+            logger.info(f"--Total tokens generated: {total_tokens}")
+            if len(decode_accepted_counts) > 0:
+                avg_accepted = sum(decode_accepted_counts) / len(decode_accepted_counts)
+                min_accepted = min(decode_accepted_counts)
+                max_accepted = max(decode_accepted_counts)
+                logger.info(
+                    f"--Accepted tokens per call: mean={avg_accepted:.2f}, "
+                    f"min={min_accepted}, max={max_accepted}"
+                )
+
+            if decode_time_list:
+                total_decode_time = sum(decode_time_list)
+                effective_tps = total_tokens / total_decode_time if total_decode_time > 0 else 0
+                avg_time_ms = total_decode_time / len(decode_time_list) * 1000
+                logger.info(f"--Avg forward time: {avg_time_ms:.2f}ms")
+                logger.info(f"--Effective TPS (with MTP): {effective_tps:.2f} tokens/s")
+
+            print("\n")
+
+        self.decode_layer.reset_sequence()
+
+        completion_tokens = []
+        for _, toks in enumerate(tokens.tolist()):
+            toks = toks[prompt_len : prompt_len + self.max_new_tokens]
+            toks = [t for t in toks if t != -1]
+            if self.eos_id in toks:
+                toks = toks[: toks.index(self.eos_id)]
+            completion_tokens.append(toks)
+
+        decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
+
+        return (
+            f"{decoded_tokens[0]}\n" if decoded_tokens else "",
+            decode_time_list,
+            decode_accepted_counts,
+            prompt_len,
+        )
 
     def generate_streaming(self, prompt: str):
         """Generate text with streaming output.
 
-        Note: This is a placeholder. Actual generation requires CUDA kernels.
+        Note: Streaming generation is not yet supported.  This method yields
+        the final output once generation completes.
         """
-        logger.warning("generate_streaming: Qwen3.6 CUDA kernels not yet implemented")
-        result = self.generate(prompt)
+        logger.warning("generate_streaming: Qwen3.6 streaming not yet implemented")
+        result, *_ = self.generate(prompt)
         yield result

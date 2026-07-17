@@ -23,7 +23,7 @@
 | MoE inter_dim | 2048 | 2048 | **512** |
 | 专家数 | 256 | 256 | 256 |
 | 激活专家 | 8 + 1 shared | 8 | 8 + 1 shared |
-| MTP | **有**（layer 61） | 无 | 无 |
+| MTP | **有**（layer 61） | 无 | 1 层（可跳过） |
 | 层模式 | 同构（除前 3 层 MLP） | 同构 | **异构**：10 × [3 linear_attention + 1 full_attention] |
 | TileRT 移植难度 | 基准 | 小（改 dim/scale dtype） | 大（需新 op + 异构调度 + 真实权重格式与假设不符） |
 
@@ -45,6 +45,7 @@
   - 不需要 MLA 相关 op。
   - MoE op 需要支持 Qwen3.6 的**堆叠 expert 权重**格式（`experts.down_proj` / `experts.gate_up_proj`）。
   - 需要新增 `gqa_attention.py`、`delta_net.py` 等 wrapper 及对应 CUDA kernel。
+  - 已新增 `QwenShowHandsLayer` 与 `QwenTempVarIdx`，端到端 Python 层路径已就绪。
 
 ## 1. 架构差异分析
 
@@ -125,7 +126,7 @@ tilert/models/qwen3_6/
 │   ├── moe.py            # MoE (可复用 DSv3.2)
 │   ├── mlp.py            # MLP
 │   ├── mtp.py            # MTP (可选)
-│   └── end2end.py        # 端到端层
+│   └── end2end.py        # QwenShowHandsLayer 端到端层（去 DSA 命名）
 └── ops/                   # CUDA 算子 (需新开发)
     ├── gqa_attention.py
     ├── delta_net.py
@@ -178,6 +179,8 @@ tilert/models/qwen3_6/
 | `tilert/models/qwen3_6/modules/moe.py` | ✅ 实现 | MoE block 组合 RMSNormExpertProj / ExpertSelectUpGateSiLU / ExpertDownAllReduce |
 | `tilert/models/qwen3_6/modules/mlp.py` | ⚠️ 框架 | 占位实现 |
 | `tilert/models/qwen3_6/modules/mtp.py` | ⚠️ 框架 | 占位实现 |
+| `tilert/models/qwen3_6/modules/end2end.py` | ✅ 实现 | `QwenShowHandsLayer`：多设备并行加载、weight layout、temp_vars 布局与 DSv3.2/GLM5 show-hands 对齐，CUDA kernel 未就绪时自动回退到 Python/golden 路径 |
+| `tilert/models/qwen3_6/temp_var_indices.py` | ✅ 实现 | `QwenTempVarIdx`：35 个固定槽位，覆盖 X、hidden/embedding RMSNorm、DeltaNet/GQA 中间量、MoE 张量、head projection、采样配置、MTP 预留槽、logprobs 调试槽；含 `validate_temp_vars_layout` 校验 |
 | `tilert/__init__.py` | ✅ 完成 | 后端注册 |
 | `tilert/generate.py` | ✅ 完成 | 模型类型支持 |
 
@@ -210,7 +213,7 @@ def forward(self, *args, **kwargs):
 
 ### 6.3 发现的问题
 
-#### 问题 1: generator.py 缺少核心解码层
+#### 问题 1: generator.py / end2end.py 缺少核心解码层 ✅ 已解决
 
 **DeepSeek 实现**:
 ```python
@@ -222,14 +225,28 @@ self.decode_layer = ShowHandsDSALayer(
 )
 ```
 
-**Qwen3.6 当前**:
+**Qwen3.6 实现（当前）**:
 ```python
-self.decode_layer = None  # placeholder
+self.decode_layer = QwenShowHandsLayer(
+    model_args=self.config,
+    model_path=self.model_weights_dir,
+    with_mtp=with_mtp,
+    use_topp=use_topp,
+    top_p=top_p,
+    top_k=top_k,
+)
 ```
 
-**影响**: 无法进行实际推理，需要创建 `QwenShowHandsLayer`（Python 层 op 完成后下一步）。注意：Qwen3.6 不使用 DeepSeek 的 DSA，show-hands 层只是对端到端推理调度层的沿用命名。
+**说明**:
+- 已新增 `tilert/models/qwen3_6/modules/end2end.py`，实现 `QwenShowHandsLayer`。
+- `QwenShowHandsLayer` 继承 `SerializableTileRTModule`，完全复用 DSv3.2/GLM5 的 show-hands 生命周期：
+  - `_init_weights()`: 多线程 per-device weight loading；支持 `from_pretrained` 与 `init_random_weights` 两种模式；注入 `cached_ffn_ops` 共享 `QwenMoeBlock`。
+  - `_get_temp_vars()`: 按 `QwenTempVarIdx` 分配固定槽位临时张量，保证未来 CUDA-graph kernel 的 buffer 布局一致。
+  - `_golden_forward_device()`: 单设备 golden 路径：embedding → `QwenTransformerStack` → `RMSNormHeadProj` → sampling。
+  - `forward()`: 优先调用 `qwen36_show_hands` CUDA graph 算子；当 `libtilert_qwen36.so` 未就绪时自动回退到 golden 路径。
+- 注意：Qwen3.6 不使用 DeepSeek 的 DSA，show-hands 层只是对端到端推理调度层的沿用命名。
 
-#### 问题 2: dsa.py 子模块未初始化 ✅ 已解决
+#### 问题 2: transformer_stack.py 子模块未初始化 ✅ 已解决
 
 **当前实现** (异构层):
 ```python
@@ -252,31 +269,36 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
-| P0 | 创建 QwenShowHandsLayer | 端到端解码层（Qwen3.6 不使用 DSA，命名去 DSA） |
+| P0 | 创建 QwenShowHandsLayer | 端到端解码层（Qwen3.6 不使用 DSA，命名去 DSA）✅ 已完成 |
+| P0 | generator.py 接入 | `QwenShowHandsLayer` 与 generate / MTP 辅助函数 ✅ 已完成 |
 | P0 | 新增 op wrapper | `gqa_attention.py`、`delta_net.py` ✅ 已完成 |
 | P1 | 补全 golden_forward | DeltaNet / Gated Attention 真实参考计算 ✅ 已完成 |
 | P2 | 硬编码参数清理 | `expert_down_allreduce.py`、`rmsnorm_up_gate_silu.py` tile/scale 形状适配 2048-dim ✅ 已完成 |
 | P3 | 实现 MTP 支持 | 投机解码 |
-| P4 | 构建 CUDA kernels | `libtilert_qwen36.so`（`gqa_attention_op`、`delta_net_op`） |
+| P3 | 构建 CUDA kernels | `libtilert_qwen36.so`（`gqa_attention_op`、`delta_net_op`、`qwen36_show_hands*`） |
+| P4 | 真实权重端到端推理 | 加载转换后的 24.9 GB weights，跑通 token-by-token generation |
 
 ## 7. 工作量估算
 
 | 组件 | 工作量 | 备注 |
 |------|--------|------|
-| ModelArgs 配置 | 0.5 天 | 参数定义 |
-| Generator 接口 | 1 天 | 复用 GLM5 模板 |
-| Transformer 层栈模块 | 3 天 | 适配异质层结构 |
-| GQA 算子 | 3 天 | 基于 MLA 改造 |
-| DeltaNet 算子 | 5 天 | 全新开发 |
-| MoE 适配 | 1 天 | 调整 inter_dim |
-| 端到端集成 | 2 天 | 测试调通 |
-| **总计** | **~15 天** | 纯语言版 |
+| ModelArgs 配置 | 0.5 天 | 参数定义 ✅ |
+| Generator 接口 | 1 天 | 复用 GLM5 模板 ✅ |
+| Transformer 层栈模块 | 3 天 | 适配异质层结构 ✅ |
+| GQA 算子（Python wrapper） | 3 天 | 基于 MLA 改造 ✅ |
+| DeltaNet 算子（Python wrapper） | 5 天 | 全新开发 ✅ |
+| MoE 适配 | 1 天 | 调整 inter_dim ✅ |
+| 端到端集成（Python） | 2 天 | `QwenShowHandsLayer` + generator ✅ |
+| CUDA kernel 开发 | 8–10 天 | `gqa_attention_op`、`delta_net_op`、`qwen36_show_hands*` |
+| 真实权重端到端验证 | 2–3 天 | 转换 → 单步 → 多 token生成 |
+| **总计（Python 层）** | **~15 天** | 已完成 |
+| **总计（含 CUDA kernel）** | **~25–28 天** | 进行中 |
 
 ## 7. 下一步行动
 
-1. 确认是否需要 MTP (多 token 预测) 支持
-2. 获取模型 config.json 确认具体参数
-3. 开始实现基础代码结构
+1. ✅ 已实现 `QwenShowHandsLayer` 与 generator 接入（无 MTP 的 reference 路径已就绪）。
+2. ✅ 已确认模型 `config.json` 参数并写入 `ModelArgsQwen36`。
+3. 待完成：CUDA kernel（`libtilert_qwen36.so`）与真实权重端到端生成验证。
 
 ## 8. Python 层 op 适配进展 (2026-07-15)
 
@@ -457,7 +479,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | `ops/expert_down_allreduce.py` | 修复 `convert_to_general` 硬编码 `//8` 为 `base_inter_dim // num_devices`；修复 device 维度索引；`golden_forward` 处理 2-D indices/weights 并 `.T` → `.mT` | ✅ 完成 |
 | `modules/moe.py` | 新增 `QwenMoeBlock`，串联 `RMSNormExpertProj -> ExpertSelectUpGateSiLU -> ExpertDownAllReduce` | ✅ 完成 |
 | `modules/delta_net.py` | FFN 由 `RMSNormUpGateSiLU` 替换为 `QwenMoeBlock`；支持 `ffn_op` 共享实例 | ✅ 完成 |
-| `modules/dsa.py` | 构造共享 `cached_ffn_ops` 并传给所有 `DeltaNet` 层；40 层 golden forward 通过 | ✅ 完成 |
+| `modules/transformer_stack.py` | 构造共享 `cached_ffn_ops` 并传给所有 `DeltaNet` 层；40 层 golden forward 通过；引入 `residual_scale = 1.0 / n_layers` 保证随机初始化 sanity test 数值稳定 | ✅ 完成 |
 | `models/utils.py` | 兼容 `qk_rope_head_dim` / `rope_dim`、`rope_factor`、`beta_fast`/`beta_slow`、`original_seq_len` | ✅ 完成 |
 | `models/model_args.py` | 补齐 Qwen3.6 相关 RoPE/YaRN 参数默认值 | ✅ 完成 |
 
@@ -480,7 +502,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | P2 | `transform_mtp` 补全 | checkpoint 含 1 层 MTP；当前 stub，首版可跳过 |
 | P2 | 真实权重重新转换 | 建议重新运行；MoE device 分片索引修复后旧转换结果可能 expert 维度错误 |
 | P3 | CUDA kernel 开发 | `gqa_attention_op`、`delta_net_op` |
-| P4 | `generator.py` 接入 | 在 op 全部完成后实现 `QwenShowHandsLayer`（去 DSA 命名） |
+| P4 | `generator.py` 接入 | ✅ 已完成；`QwenShowHandsLayer` 已实例化为 `self.decode_layer` |
 
 ### 9.4 注意事项
 
@@ -517,7 +539,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | 文件 | 修复内容 |
 |------|----------|
 | `tilert/models/qwen3_6/ops/delta_net.py` | `_linear_attention` 改用 elu+1 核函数 + 累积和归一化 + `1/sqrt(head_dim)` 温度缩放，输出稳定不再随位置爆炸。 |
-| `tilert/models/qwen3_6/modules/dsa.py` | 在 40 层异构栈的残差相加中引入 `residual_scale = 1.0 / n_layers`；**仅用于随机初始化 sanity test**，加载 pretrained weights 后应移除或条件化。 |
+| `tilert/models/qwen3_6/modules/transformer_stack.py` | 在 40 层异构栈的残差相加中引入 `residual_scale = 1.0 / n_layers`；**仅用于随机初始化 sanity test**，加载 pretrained weights 后应移除或条件化。 |
 | `tilert/models/qwen3_6/modules/delta_net.py` | 补齐 input RMSNorm、post-attention RMSNorm、attention 残差、FFN 残差；RMSNorm 权重延迟初始化为 1.0。 |
 | `tilert/models/qwen3_6/modules/gated_attention.py` | 补齐 input RMSNorm、post-attention RMSNorm、attention 残差、FFN 残差；RMSNorm 权重延迟初始化为 1.0。 |
 | `tilert/models/qwen3_6/ops/gqa_attention.py` | 修复 K/V split 使用 `v_head_dim` 的 bug；随机初始化时 Q/K/V/O 按 `1/sqrt(fan_in)` 缩放；`device_sharding` 在 `n_kv_heads < num_devices` 时复制 KV heads，避免 8 卡 stack 尺寸不一致。 |
@@ -529,7 +551,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 - **随机初始化缩放**：所有线性层权重（包括 DeltaNet/GQA/MoE 的 projection 矩阵）
   都按 `1/sqrt(fan_in)` 初始化，RMSNorm 权重初始化为 1.0，
   使无 pretrained weights 时 reference 输出仍保持有界。
-- **残差缩放仅用于测试**：`dsa.py` 中的 `residual_scale` 明确标记为
+- **残差缩放仅用于测试**：`transformer_stack.py` 中的 `residual_scale` 明确标记为
   "random-init sanity test only"。真实权重加载后，
   Qwen3.6 的真实初始化/归一化设计已经保证数值稳定，应回退到标准残差相加。
 - **KV head 复制**：Qwen3.6 只有 2 个 KV heads，在 8 设备场景下无法均匀切片；
@@ -556,11 +578,11 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 ### 10.5 与真实权重的衔接建议
 
-- 移除或加配置开关：`dsa.py` 中的 `residual_scale`。
+- 移除或加配置开关：`transformer_stack.py` 中的 `residual_scale`。
 - 验证真实 pretrained weights 转换后的 MoE scale 张量是否正确广播
   （`inter_dim=512`、`block_size=128` 时每个 expert 的 scale 行数只有 4 行，
   小于 `num_devices=8`，必须 broadcast 而非 split）。
-- 实现 `QwenShowHandsDSALayer` 与 `generator.py` 端到端解码，
+- 实现 `QwenShowHandsLayer` 与 `generator.py` 端到端解码，
   用真实 weights 跑通 token-by-token generation。
 ## 11. 三大模型（DSv3.2 / GLM-5 / Qwen3.6）代码架构统一性对比
 
@@ -570,7 +592,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 |---|---|---|---|---|
 | 基础架构 | 原创实现 | 从 DSv3.2 复制后微调 | 参考 DSv3.2/GLM5 模式但独立实现 | Qwen3.6 与 DS/GLM 差异较大 |
 | `ModelArgs` | 独立 dataclass | 完全复制 DSv3.2 的 `ModelArgs`，甚至 `arch_name` 仍是 `"deepseek_v3_2"` | 独立 `ModelArgsQwen36` | GLM5 与 DS 高度统一；Qwen 独立 |
-| DSA 层调度 | 同构 61 层，按 `n_dense_layers` 分 Mlp/Moe | 同构 78 层，复用相同逻辑 | 异构 40 层（DeltaNet/GatedAttention） | 差异来自模型本身 |
+| Transformer 层栈调度 | 同构 61 层，按 `n_dense_layers` 分 Mlp/Moe | 同构 78 层，复用相同逻辑 | 异构 40 层（DeltaNet/GatedAttention） | 差异来自模型本身 |
 | Block 结构 | `MlpBlock`/`MoeBlock` = MLA + Mlp/Moe | 与 DS 一致 | `DeltaNet`/`GatedAttention` 内部自包含 Attention + MoE | Qwen 把 FFN 放进子层 |
 | MoE 模块 | `Moe`/`MoeBlock` 均为 `SerializableTileRTModule` | 与 DS 一致 | `QwenMoe` 是普通类，`QwenMoeBlock` 是 `TileRTModule`（非 Serializable） | 基类不一致，需注意注册/权重别名 |
 | Op 目录 | 完整 MLA + MoE ops | 裁剪少量算法，主体复用 | 删除 MLA ops，新增 GQA/DeltaNet，保留可复用 MoE ops | Qwen 新增大量文件 |
@@ -591,11 +613,12 @@ for layer_idx, layer_type in enumerate(self.layer_types):
   以及 DeltaNet 专用字段）。这是合理的，因为架构差异大，
   但 `models/utils.py` 需要同时兼容两套命名。
 
-#### 11.2.2 DSA 模块
+#### 11.2.2 Transformer 层栈模块
 
 - **DSv3.2 / GLM5**：`Dsa.__init__` 遍历 `range(n_layers)`，
   根据 `layer_idx < n_dense_layers` 决定创建 `MlpBlock` 或 `MoeBlock`；
-  每个 Block 内部再组合 `MLA + Mlp/Moe`。
+  每个 Block 内部再组合 `MLA + Mlp/Moe`。DSv3.2/GLM5 的 DSA 模块特指
+  DeepSeek Sparse Attention + MLA 的层调度。
 - **Qwen3.6**：`QwenTransformerStack.__init__` 根据 `layer_types` 模式
   `[0,0,0,1] × n_blocks` 决定创建 `DeltaNet` 或 `GatedAttention`；
   每个子层内部已经包含自己的 MoE FFN。
@@ -646,9 +669,13 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 - **DSv3.2 / GLM5**：都有 `modules/end2end.py` 中的 `ShowHandsDSALayer`，
   负责多设备 DSA 对象管理、CUDA graph 准备、weight loading、MTP 支持等。
-- **Qwen3.6**：目前缺失 `end2end.py` 和 `temp_var_indices.py`，
-  `generator.py` 也是 placeholder。这是合理状态，因为 CUDA kernel 还未完成；
-  但要实现端到端推理，这是下一步必须补齐的组件。
+- **Qwen3.6**：已实现 `modules/end2end.py` 中的 `QwenShowHandsLayer`，
+  并新增 `temp_var_indices.py` 定义 `QwenTempVarIdx`。`generator.py` 已完成接入。
+  `QwenShowHandsLayer` 的接口与 `ShowHandsDSALayer` 对齐，区别仅在于内部调用
+  `QwenTransformerStack`（非 DSA）且不分配 P2P buffer。
+  当前 CUDA kernel（`libtilert_qwen36.so`）未就绪，`forward` 自动回退到 Python/golden
+  路径；kernel 完成后可直接替换。`temp_var_indices.py` 与
+  `QwenShowHandsLayer` 的临时变量槽位已经对齐。
 
 ### 11.3 统一性风险与改进建议
 
@@ -657,7 +684,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | `ModelArgs.arch_name` 不一致 | GLM5 仍使用 `"deepseek_v3_2"`，导致运行时判断 arch | 将 GLM5 的 `arch_name` 改为 `"glm_5"`；或在 Qwen3.6 的 end2end 中明确判断 `"qwen3_6"` |
 | Qwen MoE 基类不一致 | `QwenMoe` 不是 `SerializableTileRTModule`，`QwenMoeBlock` 是 `TileRTModule` | 统一改为 `SerializableTileRTModule`，使 `register_op` / `exec_seq` / `prefix_seq` 自动可用 |
 | Qwen 缺少 `temp_var_indices.py` | show-hands C++ 接口依赖固定 temp_vars 布局 | 后续实现 `QwenTempVarIdx` 时，尽量复用 DS 的索引名，新增 DeltaNet/GQA 专用 buffer |
-| Qwen `generator.py` 占位 | 无法实际生成文本 | CUDA kernel 完成后实现 `QwenShowHandsDSALayer` 并接入 |
+| Qwen `generator.py` 占位 | 无法实际生成文本 | CUDA kernel 完成后实现 `QwenShowHandsLayer` 并接入 |
 | FFN cache 机制差异 | DS/GLM 在 `MoeBlock`/`MlpBlock` 层级复用；Qwen 在 `DeltaNet` 内部复用 `QwenMoeBlock` | 统一成 "每个 layer 一个 ffn_op，可外部注入" 的语义即可 |
 | Op 算法枚举 | Qwen 删除 BF16MMA，仅保留 GENERAL/FP8MMA/FP16MMA | 保持现状；不同模型支持不同 kernel 是正常的 |
 
@@ -667,18 +694,19 @@ for layer_idx, layer_type in enumerate(self.layer_types):
   `model_args` 数值、少量 op 算法选择、MTP 开关和 chat template 处理。
   这是 TileRT 架构复用的理想形态。
 - **Qwen3.6 由于注意力机制（GQA + DeltaNet）和层间异构**，
-  不得不在 DSA、Block、Op 等层面独立实现。
+  不得不在 TransformerStack、Block、Op 等层面独立实现。
   当前 Python 层 reference 路径已经按统一风格（`golden_forward`/`tilert_forward`、
   `register_op`、`TileRTModule` 基类）完成，
   所有 op 的 `golden_forward` 已适配 Qwen3.6 维度与多设备切分规则。
-  但在 MoE 基类选择、部分 `__call__` 分支、show-hands end2end、temp_var 布局等方面尚未完全对齐。
+  `QwenShowHandsLayer` 与 `QwenTempVarIdx` 已补齐，show-hands end2end 架构统一。
+  在 MoE 基类选择、部分 `__call__` 分支等方面仍略有差异。
 - 下一步若要接入 C++ 推理框架，优先补齐：
   1. `QwenMoe` / `QwenMoeBlock` 基类统一为 `SerializableTileRTModule`；
   2. `down_allreduce.py`、`rmsnorm_up_gate_silu.py`、`unproj_o_allreduce.py`
      的 `__call__` 接入 `flag_enable_tilert` 分支；
-  3. `tilert/models/qwen3_6/temp_var_indices.py`；
-  4. `tilert/models/qwen3_6/modules/end2end.py`；
-  5. `generator.py` 中的 `QwenShowHandsDSALayer`。
+  3. 实现 `libtilert_qwen36.so` CUDA kernels：`gqa_attention_op`、`delta_net_op`、
+     `qwen36_show_hands`；
+  4. 真实权重端到端推理验证：加载 24.9 GB TileRT weights，跑通 token-by-token generation。
 
 ### 11.5 Qwen3.6 op `golden_forward` 适配状态
 
@@ -691,9 +719,9 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | `gqa_attention.py` | ✅ | ✅ | KV head 复制已处理 | K 用 `qk_head_dim`，V/O 用 `v_head_dim` 已正确 |
 | `expert_sel_up_gate_silu.py` | ✅ | ✅ | scale 行数 < device 数时广播 | `convert_to_mma` 已用实际 scale 行数 |
 | `expert_down_allreduce.py` | ✅ | ✅ | scale 行数 < device 数时广播/折叠 | `scale_cols==0` 已处理，`ref_down` 转 bf16 |
-| `down_allreduce.py` | ✅ | ✅ | 按 expert/device 切分 | dense MLP 用，当前 Qwen DSA 未调用 |
+| `down_allreduce.py` | ✅ | ✅ | 按 expert/device 切分 | dense MLP 用，当前 Qwen3.6 未调用 |
 | `unproj_o_allreduce.py` | ✅ | ✅ | 支持 Q head 不能整除 device 数时的 padding | `head_dim` 已改为 `v_head_dim` |
-| `rmsnorm_up_gate_silu.py` | ✅ | ✅ | 复用 expert gate/up sharding | dense MLP 用，当前 Qwen DSA 未调用 |
+| `rmsnorm_up_gate_silu.py` | ✅ | ✅ | 复用 expert gate/up sharding | dense MLP 用，当前 Qwen3.6 未调用 |
 | `rmsnorm_expert_proj.py` | ✅ | ✅ | gamma 复制 | gate 打分用 |
 | `rmsnorm_head_proj.py` | ✅ | ✅ | gamma 复制，head 按 device 切 | final norm + lm_head |
 | `qkv_rope.py` | ✅ | 无权重 | 无需切分 | 复用 DS/GLM 逻辑 |
@@ -708,10 +736,63 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 **待改进项（低优先级，当前未影响 reference 路径）**：
 - `down_allreduce.py`、`rmsnorm_up_gate_silu.py`、`unproj_o_allreduce.py`
   的 `__call__` 目前直接返回 `golden_forward`，未判断
-  `self.flag_enable_tilert`。虽然这三个 op 当前未被 Qwen3.6 DSA 直接调用，
+  `self.flag_enable_tilert`。虽然这三个 op 当前未被 Qwen3.6 TransformerStack 直接调用，
   但为保持 `TileRTModule` 行为一致性，建议后续改为：
   ```python
   if self.flag_enable_tilert:
       return self.tilert_forward(...)
   return self.golden_forward(...)
   ```
+
+## 12. `QwenShowHandsLayer` 与 `QwenTempVarIdx` 实现说明（2026-07-17）
+
+### 12.1 新增文件
+
+| 文件 | 作用 |
+|------|------|
+| `tilert/models/qwen3_6/temp_var_indices.py` | 定义 `QwenTempVarIdx`（35 个固定槽位）与 `validate_temp_vars_layout()`，保证 Python 层与后续 CUDA-graph kernel 的 `temp_vars` 布局一致。 |
+| `tilert/models/qwen3_6/modules/end2end.py` | 实现 `QwenShowHandsLayer`：多设备并行 weight loading、`cached_ffn_ops` 注入、`temp_vars` 分配、CUDA-graph 调用约定封装、golden fallback。 |
+
+### 12.2 `QwenTempVarIdx` 槽位设计
+
+| 范围 | 槽位 | 说明 |
+|------|------|------|
+| 激活 | `X`, `HIDDEN_RMSNORM`, `EMBEDDING_RMSNORM` | embedding 后、每层、head 前的隐藏状态 |
+| Attention | `DELTA_OUT`, `GQA_OUT`, `ROPE_FREQS`, `CUR_POS`, `TOKEN_ID` | DeltaNet/GQA 输出与 RoPE/位置信息 |
+| MoE | `X_MLP_IN`, `SCORES`, `SEL_PROBS`, `SEL_INDICES`, `UP_GATE`, `EXP_OUT` | router、top-k、专家 gate/up、聚合输出 |
+| Head / Sampling | `LOGITS_OUT`, `TOKEN_OUT`, `SAMPLING_*`, `TOP_P_*` | 采样配置与输出 |
+| Quant / Reserved | `X_QUANT`, `X_SCALE`, `MOE_UP_GATE` | FP8 量化与 fused-MoE 工作区 |
+| MTP | `DRAFT_TOKENS` ~ `LAST_HIDDEN_STATES` | 预留 MTP 投机解码槽位 |
+| Debug | `TOP_N_LOG_PROBS`, `TOP_N_INDICES`, `LOGPROBS_FLAG` | logprobs 调试 |
+
+### 12.3 `QwenShowHandsLayer` 关键接口
+
+- `from_pretrained(model_path)`: 并行加载 8 设备 safetensors shard，自动注入 `cached_ffn_ops` 复用 `QwenMoeBlock`。
+- `init_random_weights()`: 随机初始化权重用于 smoke test。
+- `forward(token_id, with_mtp, cur_pos)`: 优先尝试 `qwen36_show_hands*` CUDA graph 调用；后端未注册时回退到 `_golden_forward_device()`。
+- `update_sampling_config()`: 更新 `Idx.SAMPLING_CONFIG` 并重新 capture CUDA graph（后端可用时）。
+- `set_sampling_seed() / reset_sequence() / cleanup()`: 与 `ShowHandsDSALayer` 生命周期对齐。
+- `set_prefill_valid_tokens() / set_prefill_mtp_extra_token()`: 预留 MTP prefill 接口。
+
+### 12.4 与 DSv3.2/GLM5 的 show-hands 架构对比
+
+| 项目 | DSv3.2/GLM5 `ShowHandsDSALayer` | Qwen3.6 `QwenShowHandsLayer` |
+|------|---------------------------------|------------------------------|
+| 底层 stack | `Dsa` (MLA + Mlp/MoeBlock) | `QwenTransformerStack` (DeltaNet + GatedAttention) |
+| P2P buffer | `v2_peer_bufs`, `ll_buf` | **无**（非 DSA/MLA） |
+| temp_vars | `DsaTempVarIdx` (56 槽) | `QwenTempVarIdx` (35 槽) |
+| MTP | 完整支持 | 接口预留，当前 stub |
+| CUDA graph 函数族 | `dsa_show_hands*` | `qwen36_show_hands*` |
+| weight layout | DS/GLM shard 约定 | 复用 DS/GLM `_dev_{device_id}` 后缀约定 |
+
+### 12.5 当前限制
+
+- `libtilert_qwen36.so` 尚未构建，`qwen36_show_hands*` 会触发 `AttributeError` 并自动回退到 golden 路径。
+- MTP 模块 (`modules/mtp.py`) 仍为 stub，`with_mtp=True` 仅分配参数/缓存占位，不会真正执行 MTP 预测。
+- `_golden_forward_device()` 中的 sampling 目前为 greedy/top-k placeholder（`use_topp` 暂未实现真实 top-p）。
+
+### 12.6 建议验证项
+
+1. 在具备 `torch`/`transformers`/`safetensors` 的环境中执行 `init_random_weights()` + `forward(token_id)`，确认 golden 路径无 import/runtime 错误。
+2. 加载真实 TileRT weights（24.9 GB，9 shards）跑单步 `forward`，验证 logits 形状与数值有界。
+3. 实现 `libtilert_qwen36.so` 后，先跑 `qwen36_show_hands_prepare_money` 成功 capture，再切换 `forward()` 到 CUDA-graph 路径。

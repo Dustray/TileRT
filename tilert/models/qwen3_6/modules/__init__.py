@@ -16,3 +16,4 @@ from tilert.models.qwen3_6.modules.gated_attention import GatedAttention
 from tilert.models.qwen3_6.modules.mlp import QwenMlpBlock
 from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
 from tilert.models.qwen3_6.modules.mtp import QwenMTP
+from tilert.models.qwen3_6.modules.end2end import QwenShowHandsLayer
