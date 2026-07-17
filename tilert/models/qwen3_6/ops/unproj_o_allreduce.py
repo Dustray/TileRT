@@ -297,7 +297,7 @@ class UnProjOAllReduce(TileRTModule):
         self.arch_name = self.model_args.arch_name
         self.dim = self.model_args.dim
         self.n_heads = self.model_args.n_heads
-        self.head_dim = self.model_args.qk_head_dim
+        self.head_dim = self.model_args.v_head_dim
 
         if self.n_heads % self.num_devices == 0:
             self.num_local_heads = self.n_heads // self.num_devices

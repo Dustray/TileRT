@@ -2,7 +2,8 @@
 
 import torch
 
-from tilert.models.base import SerializableTileRTModule
+from tilert.models.base import TileRTModule
+from tilert.models.common import init_func
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.ops.expert_down_allreduce import (
     ExpertDownAllReduce,
@@ -15,7 +16,7 @@ from tilert.models.qwen3_6.ops.expert_sel_up_gate_silu import (
 from tilert.models.qwen3_6.ops.rmsnorm_expert_proj import RMSNormExpertProj
 
 
-class QwenMoe(SerializableTileRTModule):
+class QwenMoe:
     """Qwen3.6 MoE FFN operations.
 
     Follows the DSv3.2/GLM5 pattern but uses Qwen3.6 dimensions and keeps
@@ -23,6 +24,10 @@ class QwenMoe(SerializableTileRTModule):
       - RMSNormExpertProj: GENERAL
       - ExpertSelectUpGateSiLU: FP8MMA / FP16MMA
       - ExpertDownAllReduce: GENERAL
+
+    This is a plain composition container, not a ``TileRTModule`` sub-class,
+    because it only aggregates sub-ops that are themselves registered under
+    ``QwenMoeBlock``.
     """
 
     def __init__(
@@ -31,40 +36,37 @@ class QwenMoe(SerializableTileRTModule):
         device_id: int,
         num_devices: int,
     ):
-        super().__init__(model_args=model_args, device_id=device_id, num_devices=num_devices)
-
         self.rmsnorm_expert_proj = RMSNormExpertProj(
             model_args=model_args,
             device_id=device_id,
             num_devices=num_devices,
         )
-        self.register_op(self.rmsnorm_expert_proj)
-
         self.exp_sel_up_gate_silu = ExpertSelectUpGateSiLU(
             model_args=model_args,
             device_id=device_id,
             num_devices=num_devices,
             algorithm=ExpertSelectUpGateSiLUAlgorithm.FP8MMA,
         )
-        self.register_op(self.exp_sel_up_gate_silu)
-
         self.expert_down_allreduce = ExpertDownAllReduce(
             model_args=model_args,
             device_id=device_id,
             num_devices=num_devices,
             algorithm=ExpertDownAllReduceAlgorithm.GENERAL,
         )
-        self.register_op(self.expert_down_allreduce)
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        return super().get_weights_list()
+        return [
+            *self.rmsnorm_expert_proj.get_weights_list(),
+            *self.exp_sel_up_gate_silu.get_weights_list(),
+            *self.expert_down_allreduce.get_weights_list(),
+        ]
 
 
-class QwenMoeBlock(SerializableTileRTModule):
+class QwenMoeBlock(TileRTModule):
     """MoE block for Qwen3.6.
 
     Wraps the MoE FFN as a standalone block.  For Qwen3.6, the attention
-    path lives in the heterogeneous layer stack managed by ``QwenDsa``;
+    path lives in the heterogeneous layer stack managed by ``QwenTransformerStack``;
     this block only represents the FFN half so it can be cached/shared per
     layer (the same pattern DSv3.2 uses with ``cached_ffn_ops``).
     """
@@ -74,14 +76,13 @@ class QwenMoeBlock(SerializableTileRTModule):
         model_args: ModelArgsQwen36,
         device_id: int,
         num_devices: int,
-        remove_selected: bool = False,
         moe: QwenMoe | None = None,
     ):
         super().__init__(
+            self.__class__.__name__,
             model_args=model_args,
             device_id=device_id,
             num_devices=num_devices,
-            remove_selected=remove_selected,
         )
 
         self.moe = (
@@ -93,27 +94,30 @@ class QwenMoeBlock(SerializableTileRTModule):
                 num_devices=num_devices,
             )
         )
-        self.register_op(self.moe)
 
-    def golden_forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def init_random_weights(self, device: str | None = None) -> None:
+        """Lazy initialize random weights for sanity testing."""
+        if device is None:
+            device = f"cuda:{self.device_id}" if torch.cuda.is_available() else "cpu"
+        if isinstance(device, str) and device.startswith("cuda:"):
+            device_id = int(device.split(":")[-1])
+        else:
+            device_id = 0
+        self.moe.rmsnorm_expert_proj.init_random_weights(device=device)
+        self.moe.exp_sel_up_gate_silu.init_random_weights(device=device)
+        self.moe.expert_down_allreduce.init_random_weights(device_id=device_id)
+
+    def golden_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Reference forward: rmsnorm -> gate score -> up/gate/silu -> down."""
-        norm_x, scores = self.moe.rmsnorm_expert_proj.golden_forward(x, residual)
+        if not self.moe.rmsnorm_expert_proj.is_ref_weights_init:
+            self.init_random_weights(device=str(x.device))
+        norm_x, scores = self.moe.rmsnorm_expert_proj.golden_forward(x)
         up_gate_out, weights, indices = self.moe.exp_sel_up_gate_silu.golden_forward(
             norm_x, scores
         )
-        down_out = self.moe.expert_down_allreduce.golden_forward(up_gate_out, indices, weights)
-        if residual is not None:
-            down_out = down_out + residual
-        return down_out
+        return self.moe.expert_down_allreduce.golden_forward(up_gate_out, indices, weights)
 
-    def tilert_forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def tilert_forward(self, x: torch.Tensor) -> torch.Tensor:
         """TileRT forward: dispatches to registered ops."""
         norm_x, scores = self.moe.rmsnorm_expert_proj.tilert_forward(x)
         up_gate_out, weights, indices = self.moe.exp_sel_up_gate_silu.tilert_forward(

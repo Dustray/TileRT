@@ -154,7 +154,12 @@ class GQAAttention(TileRTModule):
         self.v_head_dim = model_args.v_head_dim
         self.rope_dim = model_args.rope_dim
         self.num_local_heads = self.n_heads // num_devices
-        self.num_local_kv_heads = max(1, self.n_kv_heads // num_devices)
+        # Qwen3.6 has only 2 KV heads.  When num_devices > n_kv_heads we
+        # replicate the KV heads across devices instead of slicing them, so the
+        # effective local KV head count stays the full 2 for every device.
+        self.num_local_kv_heads = (
+            self.n_kv_heads if self.n_kv_heads < num_devices else self.n_kv_heads // num_devices
+        )
 
         self.tilert_weights_alias = GQAAttentionTilertWeightsAlias()
         self.ref_weights_alias = GQAAttentionRefWeightsAlias()
@@ -202,19 +207,31 @@ class GQAAttention(TileRTModule):
         k_norm_w = weights_map[f"{prefix}.k_norm.weight"]
 
         q_per_dev = self.num_local_heads * self.head_dim
-        kv_per_dev = self.num_local_kv_heads * self.v_head_dim
+        # Qwen3.6 has only 2 KV heads; when sharding over 8 devices we cannot
+        # slice them evenly.  Replicate the KV heads across devices so each
+        # device sees the full KV set, while Q heads remain sharded.
+        if self.n_kv_heads < self.num_devices:
+            kv_per_dev = self.n_kv_heads * self.v_head_dim
+            kv_replicate = True
+        else:
+            kv_per_dev = self.num_local_kv_heads * self.v_head_dim
+            kv_replicate = False
         qkv_parts = [
             q_w[i * q_per_dev : (i + 1) * q_per_dev]
             for i in range(self.num_devices)
         ]
-        k_parts = [
-            k_w[i * kv_per_dev : (i + 1) * kv_per_dev]
-            for i in range(self.num_devices)
-        ]
-        v_parts = [
-            v_w[i * kv_per_dev : (i + 1) * kv_per_dev]
-            for i in range(self.num_devices)
-        ]
+        if kv_replicate:
+            k_parts = [k_w for _ in range(self.num_devices)]
+            v_parts = [v_w for _ in range(self.num_devices)]
+        else:
+            k_parts = [
+                k_w[i * kv_per_dev : (i + 1) * kv_per_dev]
+                for i in range(self.num_devices)
+            ]
+            v_parts = [
+                v_w[i * kv_per_dev : (i + 1) * kv_per_dev]
+                for i in range(self.num_devices)
+            ]
         # o_proj input dim equals the Q head count * value_head_dim.
         o_per_dev = self.num_local_heads * self.v_head_dim
         o_parts = [
@@ -233,10 +250,13 @@ class GQAAttention(TileRTModule):
             q_norm_w[i * self.num_local_heads * self.head_dim : (i + 1) * self.num_local_heads * self.head_dim]
             for i in range(self.num_devices)
         ]
-        k_norm_parts = [
-            k_norm_w[i * self.num_local_kv_heads * self.v_head_dim : (i + 1) * self.num_local_kv_heads * self.v_head_dim]
-            for i in range(self.num_devices)
-        ]
+        if kv_replicate:
+            k_norm_parts = [k_norm_w for _ in range(self.num_devices)]
+        else:
+            k_norm_parts = [
+                k_norm_w[i * self.num_local_kv_heads * self.v_head_dim : (i + 1) * self.num_local_kv_heads * self.v_head_dim]
+                for i in range(self.num_devices)
+            ]
 
         return {
             self.tilert_weights_alias.qkv_proj_weights: torch.stack(qkv_stacked, dim=0).contiguous(),
@@ -278,44 +298,46 @@ class GQAAttention(TileRTModule):
 
     def init_random_weights(self, device: str = "cuda") -> None:
         qkv_out = self.n_heads * self.head_dim + 2 * self.n_kv_heads * self.v_head_dim
+        # Scale by 1/sqrt(fan_in) for stable 40-layer reference numerics.
         qkv_w = torch.randn(
             qkv_out,
             self.dim,
             dtype=torch.bfloat16,
             device=device,
-        )
+        ) / (self.dim ** 0.5)
         o_w = torch.randn(
             self.dim,
             self.n_heads * self.v_head_dim,
             dtype=torch.bfloat16,
             device=device,
-        )
-        q_norm_w = torch.randn(
+        ) / ((self.n_heads * self.v_head_dim) ** 0.5)
+        q_norm_w = torch.ones(
             self.n_heads * self.head_dim,
             dtype=torch.float32,
             device=device,
         )
-        k_norm_w = torch.randn(
+        k_norm_w = torch.ones(
             self.n_kv_heads * self.v_head_dim,
             dtype=torch.float32,
             device=device,
         )
-        converter = GQAAttentionWeightsConverter(self.model_args, self.num_devices)
-        (
-            self.qkv_proj_weights,
-            self.o_proj_weights,
-            self.q_norm_weights,
-            self.k_norm_weights,
-        ) = converter.convert_to_general(
-            [
-                qkv_w,
-                torch.empty(0, dtype=torch.bfloat16, device=device),
-                torch.empty(0, dtype=torch.bfloat16, device=device),
-                o_w,
-                q_norm_w,
-                k_norm_w,
-            ]
-        )
+        # Build a synthetic checkpoint dict so we can reuse ``device_sharding``,
+        # which correctly handles any ``num_devices`` split.  This keeps the
+        # random-init reference path working for both single-device and
+        # multi-device sanity tests.
+        state_dict = {
+            f"{self.ref_weights_alias.key_prefix}.q_proj.weight": qkv_w[: self.n_heads * self.head_dim],
+            f"{self.ref_weights_alias.key_prefix}.k_proj.weight": qkv_w[
+                self.n_heads * self.head_dim : self.n_heads * self.head_dim + self.n_kv_heads * self.v_head_dim
+            ],
+            f"{self.ref_weights_alias.key_prefix}.v_proj.weight": qkv_w[
+                self.n_heads * self.head_dim + self.n_kv_heads * self.v_head_dim :
+            ],
+            f"{self.ref_weights_alias.key_prefix}.o_proj.weight": o_w,
+            f"{self.ref_weights_alias.key_prefix}.q_norm.weight": q_norm_w,
+            f"{self.ref_weights_alias.key_prefix}.k_norm.weight": k_norm_w,
+        }
+        self.init_reference_weights(state_dict)
 
     def golden_forward(
         self,
@@ -341,14 +363,14 @@ class GQAAttention(TileRTModule):
             qkv,
             [
                 self.num_local_heads * self.head_dim,
-                self.num_local_kv_heads * self.v_head_dim,
+                self.num_local_kv_heads * self.head_dim,
                 self.num_local_kv_heads * self.v_head_dim,
             ],
             dim=-1,
         )
 
         q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim).transpose(1, 2)
 
         # apply_rotary_emb expects (bsz, seq_len, n_heads, head_dim);

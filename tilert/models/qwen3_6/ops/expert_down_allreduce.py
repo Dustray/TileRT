@@ -135,6 +135,14 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
             exp_num = mat_in.shape[0]
             mat_in_s = mat_in.reshape(exp_num, num_sms, dim_per_sm, expert_dim)
 
+            # When the per-device expert dimension is smaller than the
+            # quantization block_size, the scale tensor still carries the
+            # original block-wise scale rows.  Collapse them to a single scale
+            # value for this device shard so the downstream SM layout works.
+            if scale_cols == 0:
+                scale_cols = 1
+                scale_in = scale_in.mean(dim=-1, keepdim=True)
+
             if arch_name == "qwen3_6":
                 assert dim_per_sm == 16, f"Qwen3.6 expects dim_per_sm=16, got {dim_per_sm}"
                 mat_in_0 = (
@@ -487,15 +495,22 @@ class ExpertDownAllReduce(TileRTModule):
         if device_id is None:
             device_id = 0
         dev = f"cuda:{device_id}"
-        shared_down = torch.randn(
-            self.dim, self.moe_inter_dim, dtype=torch.bfloat16, device=dev
+        # Scale by 1/sqrt(fan_in) for stable 40-layer reference numerics.
+        shared_down = (
+            torch.randn(
+                self.dim, self.moe_inter_dim, dtype=torch.bfloat16, device=dev
+            )
+            / (self.moe_inter_dim ** 0.5)
         ).to(torch.float8_e4m3fn)
-        routed_down = torch.randn(
-            self.n_routed_experts,
-            self.dim,
-            self.moe_inter_dim,
-            dtype=torch.bfloat16,
-            device=dev,
+        routed_down = (
+            torch.randn(
+                self.n_routed_experts,
+                self.dim,
+                self.moe_inter_dim,
+                dtype=torch.bfloat16,
+                device=dev,
+            )
+            / (self.moe_inter_dim ** 0.5)
         ).to(torch.float8_e4m3fn)
         dim_scale_dim = self.dim // self.block_size
         moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
@@ -517,6 +532,9 @@ class ExpertDownAllReduce(TileRTModule):
             )
         )
         self.init_reference_weights(state_dict, "mlp", device_id)
+        # Keep reference weights in bf16 to avoid a 4x memory spike from the
+        # fp32 dequantization fallback used during random-init sanity tests.
+        self.ref_down = self.ref_down.to(torch.bfloat16)
         sharded_list = self.device_sharding(state_dict, "mlp")
         # ``sharded_list`` has shape (n_experts, num_devices, ...); select all
         # experts for the requested device.

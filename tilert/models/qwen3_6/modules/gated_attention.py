@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tilert.models.base import SerializableTileRTModule, TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
+from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
 from tilert.models.qwen3_6.ops.gqa_attention import (
     GQAAttention as GQAAttentionOp,
     GQAAttentionAlgorithm,
@@ -210,6 +211,31 @@ class GatedAttention(SerializableTileRTModule):
         )
         self.register_op(self.unproj_o_allreduce)
 
+        self.ffn = QwenMoeBlock(
+            model_args=model_args,
+            device_id=device_id,
+            num_devices=num_devices,
+        )
+        self.register_op(self.ffn)
+
+        self.input_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
+        self.post_attention_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
+
+    def _ensure_weights(self, x: torch.Tensor) -> None:
+        """Lazy initialize weights for sanity testing without a checkpoint."""
+        if self.attn.qkv_proj_weights is None:
+            self.attn.init_random_weights(device=str(x.device))
+        if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
+            self.ffn.init_random_weights(device=str(x.device))
+        if self.input_layernorm.weight is None or self.input_layernorm.weight.numel() == 0:
+            self.input_layernorm.weight.data = torch.ones(
+                self.model_args.dim, dtype=torch.float32, device=x.device
+            )
+        if self.post_attention_layernorm.weight is None or self.post_attention_layernorm.weight.numel() == 0:
+            self.post_attention_layernorm.weight.data = torch.ones(
+                self.model_args.dim, dtype=torch.float32, device=x.device
+            )
+
     def golden_forward(
         self,
         x: torch.Tensor,
@@ -219,16 +245,21 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reference GQA forward.
+        """Reference GQA forward with residuals, norms, and MoE FFN."""
+        self._ensure_weights(x)
 
-        Weights are lazily initialized with random values on first call so the
-        module can be sanity-tested without a checkpoint.
-        """
-        if self.attn.qkv_proj_weights is None:
-            self.attn.init_random_weights(device=str(x.device))
-        out, k_cache, v_cache = self.attn.golden_forward(
-            x, start_pos, freqs_cis, k_cache, v_cache, mask
+        # Pre-attention norm + GQA (o_proj applied internally) + residual.
+        norm_x = self.input_layernorm(x)
+        attn_out, k_cache, v_cache = self.attn.golden_forward(
+            norm_x, start_pos, freqs_cis, k_cache, v_cache, mask
         )
+        h = x + attn_out
+
+        # Post-attention norm + MoE FFN + residual.
+        norm_h = self.post_attention_layernorm(h)
+        ffn_out = self.ffn.golden_forward(norm_h)
+        out = h + ffn_out
+
         return out, k_cache, v_cache
 
     def tilert_forward(
@@ -240,16 +271,12 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Optimized forward using ``GQAAttentionOp`` + ``UnProjOAllReduce``.
-
-        Currently ``GQAAttentionOp.tilert_forward`` is itself a placeholder that
-        calls into ``torch.ops.tilert.gqa_attention_op``; it will become
-        functional once the CUDA kernel is registered.
-        """
+        """Optimized forward using ``GQAAttentionOp`` + ``UnProjOAllReduce`` + ``QwenMoeBlock``."""
         attn_out, k_cache, v_cache = self.attn.forward(
             x, start_pos, freqs_cis, k_cache, v_cache, mask
         )
         out = self.unproj_o_allreduce.forward(attn_out)
+        out = self.ffn.forward(out)
         return out, k_cache, v_cache
 
     def forward(

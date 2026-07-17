@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from tilert.models.base import SerializableTileRTModule, TileRTModule
-from tilert.models.common import RMSNorm, linear
+from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.ops.delta_net import (
     DeltaNetOp,
@@ -109,18 +109,13 @@ class QwenDeltaNetRef(TileRTModule):
 class DeltaNet(SerializableTileRTModule):
     """DeltaNet linear attention layer for Qwen3.6.
 
-    DeltaNet is a linear attention mechanism used in the DeltaNet layers
-    (3 per block × 10 blocks = 30 layers).
-
-    For now the Python wrapper exposes:
-      - RMSNormUpGateSiLU for the FFN half (reuse the dense-MLP path because
-        DeltaNet layers have an MLP-like up/gate/down projection after the
-        linear attention).
-      - A reference weight holder for the Q/K/V/O projections.
+    Implements a full Transformer layer:
+      input_layernorm  -> DeltaNet attention -> residual ->
+      post_attention_layernorm -> MoE FFN -> residual
 
     The actual DeltaNet recurrence / chunk-wise kernel will live in a dedicated
     CUDA kernel; this module wires the Python-side plumbing so the layer can
-    be instantiated inside ``QwenDsa``.
+    be instantiated inside ``QwenTransformerStack``.
     """
 
     def __init__(
@@ -162,26 +157,46 @@ class DeltaNet(SerializableTileRTModule):
         )
         self.register_op(self.ffn)
 
+        self.input_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
+        self.post_attention_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
+
+    def _ensure_weights(self, x: torch.Tensor) -> None:
+        """Lazy initialize weights for sanity testing without a checkpoint."""
+        if self.attn.in_proj_qkv_weights is None:
+            self.attn.init_random_weights(device=str(x.device))
+        if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
+            self.ffn.init_random_weights(device=str(x.device))
+        if self.input_layernorm.weight is None or self.input_layernorm.weight.numel() == 0:
+            self.input_layernorm.weight.data = torch.ones(
+                self.model_args.dim, dtype=torch.float32, device=x.device
+            )
+        if self.post_attention_layernorm.weight is None or self.post_attention_layernorm.weight.numel() == 0:
+            self.post_attention_layernorm.weight.data = torch.ones(
+                self.model_args.dim, dtype=torch.float32, device=x.device
+            )
+
     def golden_forward(
         self,
         x: torch.Tensor,
         start_pos: int,
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Reference forward: DeltaNet linear attention + FFN.
-
-        Weights are lazily initialized with random values on first call so the
-        module can be sanity-tested without a checkpoint.
-        """
-        if self.attn.in_proj_qkv_weights is None:
-            self.attn.init_random_weights(device=str(x.device))
-        if self.ffn.moe.rmsnorm_expert_proj.ref_rmsnorm is None:
-            self.ffn.init_random_weights()
+        """Reference forward: full DeltaNet layer with residuals and layer norms."""
+        self._ensure_weights(x)
         prev_state = state.get("delta_state") if state is not None else None
-        attn_out, new_state = self.attn.golden_forward(x, start_pos, prev_state)
-        ffn_out = self.ffn.golden_forward(attn_out)
+
+        # Pre-attention norm + attention + residual.
+        norm_x = self.input_layernorm(x)
+        attn_out, new_state = self.attn.golden_forward(norm_x, start_pos, prev_state)
+        h = x + attn_out
+
+        # Post-attention norm + MoE FFN + residual.
+        norm_h = self.post_attention_layernorm(h)
+        ffn_out = self.ffn.golden_forward(norm_h)
+        out = h + ffn_out
+
         next_state = {"delta_state": new_state} if state is not None else None
-        return ffn_out, next_state
+        return out, next_state
 
     def tilert_forward(
         self,

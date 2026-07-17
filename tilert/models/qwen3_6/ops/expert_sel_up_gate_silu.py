@@ -232,7 +232,13 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             exp_num = weights_w1.shape[0]
             moe_rows = weights_w1.shape[1]
             n_row_groups = moe_rows // 16
-            scale_m_dim = moe_rows // args.block_size
+            # Use the actual number of scale rows instead of
+            # ``moe_rows // block_size``.  When the per-device intermediate dim
+            # is smaller than ``block_size`` (e.g. Qwen3.6 with 8 devices:
+            # 512//8 = 64 < 128) the latter becomes zero, and the scale rows
+            # are already provided by ``process_gate_up_weights`` based on the
+            # original unsharded intermediate dimension.
+            scale_m_dim = scales_w1.shape[1]
             weights_w1 = weights_w1.reshape(exp_num, n_row_groups, 16, pages, 1024).transpose(2, 3)
             weights_w3 = weights_w3.reshape(exp_num, n_row_groups, 16, pages, 1024).transpose(2, 3)
             if algorithm == "fp8mma":
@@ -475,8 +481,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             )
             # The fused scale covers 2 * inter_dim rows; split it into gate
             # and up halves so each matches the per-expert intermediate dim.
-            gate_proj_scale = gate_up_scale[:, : gate_up_scale.shape[1] // 2, :]
-            up_proj_scale = gate_up_scale[:, gate_up_scale.shape[1] // 2 :, :]
+            half_scale_rows = gate_up_scale.shape[1] // 2
+            gate_proj_scale = gate_up_scale[:, :half_scale_rows, :]
+            up_proj_scale = gate_up_scale[:, half_scale_rows:, :]
         else:
             gate_proj_weight_key = f"{key_prefix}.gate_proj.weight"
             gate_proj_scale_key = f"{key_prefix}.gate_proj.weight_scale_inv"
@@ -662,14 +669,24 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         up_scales = sharded[tilert_alias.exp_up_scales][:, did]
 
         self.ref_bias = bias
-        ref_gate_list = [
-            weight_dequant(gate_weights[i], gate_scales[i]) for i in range(gate_weights.shape[0])
-        ]
-        ref_up_list = [
-            weight_dequant(up_weights[i], up_scales[i]) for i in range(up_weights.shape[0])
-        ]
-        self.ref_gate = torch.stack([t.to(torch.bfloat16) for t in ref_gate_list], dim=0)
-        self.ref_up = torch.stack([t.to(torch.bfloat16) for t in ref_up_list], dim=0)
+        # Dequantize directly to bf16 and avoid keeping the fp32
+        # temporaries in memory.  The full stacked expert weights already
+        # consume ~1 GB per device in bf16; holding both dtypes at once was
+        # causing OOM during the 40-layer model init.
+        self.ref_gate = torch.stack(
+            [
+                weight_dequant(gate_weights[i], gate_scales[i]).to(torch.bfloat16)
+                for i in range(gate_weights.shape[0])
+            ],
+            dim=0,
+        )
+        self.ref_up = torch.stack(
+            [
+                weight_dequant(up_weights[i], up_scales[i]).to(torch.bfloat16)
+                for i in range(up_weights.shape[0])
+            ],
+            dim=0,
+        )
 
     def get_tilert_weights_alias(self) -> list[str]:
         """Return the alias list keyed into ``state_dict`` for this op."""
@@ -728,36 +745,41 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         elif isinstance(device, int):
             device = f"cuda:{device}"
 
-        bias = torch.randn(self.n_routed_experts, dtype=torch.float32, device=device)
-        # Shared expert first.
-        shared_gate = torch.randn(
-            self.moe_inter_dim, self.dim, dtype=torch.bfloat16, device=device
+        bias = torch.randn(self.n_routed_experts, dtype=torch.float32, device=device) * 0.01
+        # Shared expert first.  Scale by 1/sqrt(fan_in) for stable layer outputs.
+        shared_gate = (
+            torch.randn(
+                self.model_args.inter_dim, self.dim, dtype=torch.bfloat16, device=device
+            )
+            / (self.dim ** 0.5)
         ).to(torch.float8_e4m3fn)
-        shared_up = torch.randn(
-            self.moe_inter_dim, self.dim, dtype=torch.bfloat16, device=device
+        shared_up = (
+            torch.randn(
+                self.model_args.inter_dim, self.dim, dtype=torch.bfloat16, device=device
+            )
+            / (self.dim ** 0.5)
         ).to(torch.float8_e4m3fn)
-        routed_gate_up = torch.randn(
-            self.n_routed_experts,
-            2 * self.moe_inter_dim,
-            self.dim,
-            dtype=torch.bfloat16,
-            device=device,
+        routed_gate_up = (
+            torch.randn(
+                self.n_routed_experts,
+                2 * self.model_args.inter_dim,
+                self.dim,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            / (self.dim ** 0.5)
         ).to(torch.float8_e4m3fn)
-        # The scale layout must be compatible with ``process_gate_up_weights``,
-        # which reshapes scales to (num_devices, in_scale_dim_per_device, scale_dim).
-        # For Qwen3.6 the routed scale is stacked with the fused gate_up_proj scale
-        # of shape (n_routed_experts, 2 * inter_dim // block_size, dim // block_size),
-        # while the shared scale is (inter_dim // block_size, dim // block_size).
-        # When init_random_weights is used for single-device testing we force the
-        # scale rows to be divisible by num_devices so the sharding produces uniform
-        # per-device scales and can be concatenated with the routed scales.
-        moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
-        routed_moe_inter_dim_scale_dim = 2 * self.moe_inter_dim // self.block_size
+        # The scale layout must be compatible with ``process_gate_up_weights``.
+        # For Qwen3.6 the routed scale is the fused gate_up_proj scale of shape
+        # (n_routed_experts, 2 * inter_dim // block_size, dim // block_size), while
+        # the shared scale is (inter_dim // block_size, dim // block_size).
+        # Use ``model_args.inter_dim`` (not ``self.moe_inter_dim``) because the
+        # MoE FFN intermediate size is defined by ``inter_dim``.
+        inter_dim = self.model_args.inter_dim
+        moe_inter_dim_scale_dim = inter_dim // self.block_size
+        routed_moe_inter_dim_scale_dim = 2 * inter_dim // self.block_size
         dim_scale_dim = self.dim // self.block_size
         scale_dtype = torch.float32 if self.arch_name in ("glm_5", "qwen3_6") else torch.bfloat16
-        # Shared scales match the shared expert intermediate dim. The routed
-        # fused scale covers 2 * inter_dim rows and is split into gate/up halves
-        # inside ``process_gate_up_weights``.
         shared_gate_scale = torch.randn(
             moe_inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=device
         )

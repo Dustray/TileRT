@@ -1,7 +1,7 @@
 """Qwen3.6-35B-A3B high-level Python modules."""
 
 __all__ = [
-    "dsa",
+    "transformer_stack",
     "end2end",
     "moe",
     "mlp",
@@ -10,7 +10,7 @@ __all__ = [
     "gated_attention",
 ]
 
-from tilert.models.qwen3_6.modules.dsa import QwenDsa
+from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack
 from tilert.models.qwen3_6.modules.delta_net import DeltaNet
 from tilert.models.qwen3_6.modules.gated_attention import GatedAttention
 from tilert.models.qwen3_6.modules.mlp import QwenMlpBlock

@@ -1,4 +1,9 @@
-"""Qwen3.6-35B-A3B DSA (Deep Show Attention) module."""
+"""Qwen3.6-35B-A3B Transformer layer stack module.
+
+This module is not related to DeepSeek's DSA (DeepSeek Sparse Attention).
+Qwen3.6 uses GQA + DeltaNet; this file simply stacks the 40 heterogeneous
+Transformer layers and provides the golden / TileRT forward dispatchers.
+"""
 
 from typing import Any
 
@@ -10,11 +15,11 @@ from tilert.models.qwen3_6.modules.gated_attention import GatedAttention
 from tilert.models.qwen3_6.modules.delta_net import DeltaNet
 from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
 
-__all__ = ["QwenDsa"]
+__all__ = ["QwenTransformerStack"]
 
 
-class QwenDsa(SerializableTileRTModule):
-    """DSA module for Qwen3.6.
+class QwenTransformerStack(SerializableTileRTModule):
+    """Transformer layer stack for Qwen3.6.
 
     Qwen3.6 has a heterogeneous layer structure:
     - 30 DeltaNet layers (3 per block × 10 blocks)
@@ -24,6 +29,11 @@ class QwenDsa(SerializableTileRTModule):
     ``forward`` dispatcher.  The optimized TileRT path will be implemented once
     the dedicated kernels are available; until then the golden path serves as a
     reference and sanity check.
+
+    ``cached_ffn_ops`` is an optional layer-level FFN/MoE cache shared across
+    layers (similar to the mechanism in DSv3.2's DSA).  It is used here purely
+    to reduce memory during random-init reference sanity tests, not because
+    Qwen3.6 itself uses DeepSeek Sparse Attention.
     """
 
     def __init__(
@@ -51,10 +61,14 @@ class QwenDsa(SerializableTileRTModule):
             )
 
         # Layer type mapping: 0 = DeltaNet, 1 = Gated Attention
-        # Pattern: [DeltaNet, DeltaNet, DeltaNet, GatedAttention] × 10
+        # Pattern: [DeltaNet, DeltaNet, DeltaNet, GatedAttention] × n_blocks.
+        # If the caller overrides ``n_layers`` for a smaller sanity test,
+        # truncate the pattern so the actual number of executed layers matches
+        # ``model_args.n_layers``.
         self.layer_types: list[int] = []
         for _ in range(model_args.n_blocks):
             self.layer_types.extend([0, 0, 0, 1])
+        self.layer_types = self.layer_types[: model_args.n_layers]
 
         for layer_idx, layer_type in enumerate(self.layer_types):
             ffn_op = cached_ffn_ops[layer_idx] if cached_ffn_ops else None
@@ -80,7 +94,11 @@ class QwenDsa(SerializableTileRTModule):
         start_pos: int,
         layer_cache: dict[str, Any],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Route one layer through the correct forward signature."""
+        """Route one layer through the correct forward signature.
+
+        Each block is a full Transformer layer and already applies its own
+        internal residual connections and layer norms.
+        """
         if isinstance(block, DeltaNet):
             out, layer_cache["delta_state"] = block.forward(
                 x, start_pos, layer_cache.get("delta_state")
@@ -107,6 +125,13 @@ class QwenDsa(SerializableTileRTModule):
             caches = self._init_layer_caches(freqs_cis)
 
         h = x
+        # Random-init weights cause each block output to have roughly the same
+        # std as its input, so naive residual addition doubles the variance each
+        # layer.  Scale the residual branch by 1/n_layers to keep the random-init
+        # golden path numerically bounded for sanity testing.  This does not
+        # affect the real model semantics (use pretrained weights for real
+        # reference numerics).
+        residual_scale = 1.0 / max(len(self.exec_seq), 1)
         shared_k_cache = caches["k_cache"]
         shared_v_cache = caches["v_cache"]
         for layer_idx, block in enumerate(self.exec_seq):
@@ -116,7 +141,8 @@ class QwenDsa(SerializableTileRTModule):
                 "freqs_cis": freqs_cis,
                 "delta_state": caches.get("delta_state", {}).get(layer_idx),
             }
-            h, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
+            out, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
+            h = h + out * residual_scale
             shared_k_cache = layer_cache["k_cache"]
             shared_v_cache = layer_cache["v_cache"]
             if "delta_state" in layer_cache:
@@ -134,8 +160,8 @@ class QwenDsa(SerializableTileRTModule):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Optimized forward placeholder.
 
-        Falls back to ``golden_forward`` until the show-hands / CUDA-graph
-        wrappers for Qwen3.6 are implemented.
+        Falls back to ``golden_forward`` until the dedicated Qwen3.6 CUDA-graph
+        wrappers are implemented.
         """
         return self.golden_forward(x, start_pos, freqs_cis, caches)
 
@@ -184,7 +210,7 @@ class QwenDsa(SerializableTileRTModule):
 
     def from_pretrained(self, model_path: str) -> None:
         """Load pretrained weights."""
-        raise NotImplementedError("QwenDsa weight loading not yet implemented.")
+        raise NotImplementedError("QwenTransformerStack weight loading not yet implemented.")
 
     def cleanup(self) -> None:
         """Cleanup resources."""
