@@ -58,6 +58,12 @@ class QwenDeltaNetRef(TileRTModule):
     def get_weights_list(self) -> list[torch.Tensor]:
         return []
 
+    def get_tilert_weights_alias(self) -> list[str]:
+        return []
+
+    def get_ref_weights_alias(self) -> list[str]:
+        return []
+
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         del weights_map
         return {}
@@ -166,14 +172,33 @@ class DeltaNet(SerializableTileRTModule):
             self.attn.init_random_weights(device=str(x.device))
         if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
             self.ffn.init_random_weights(device=str(x.device))
-        if self.input_layernorm.weight is None or self.input_layernorm.weight.numel() == 0:
-            self.input_layernorm.weight.data = torch.ones(
-                self.model_args.dim, dtype=torch.float32, device=x.device
-            )
-        if self.post_attention_layernorm.weight is None or self.post_attention_layernorm.weight.numel() == 0:
-            self.post_attention_layernorm.weight.data = torch.ones(
-                self.model_args.dim, dtype=torch.float32, device=x.device
-            )
+        if self.input_layernorm.weight.device != x.device:
+            self.input_layernorm.to(x.device)
+        if self.post_attention_layernorm.weight.device != x.device:
+            self.post_attention_layernorm.to(x.device)
+
+    def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Load weights and also set the RMSNorm module weights from the checkpoint."""
+        super().init_tilert_weights(state_dict)
+        self._load_layernorm_weights(state_dict)
+
+    def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Load reference weights and also set the RMSNorm module weights."""
+        super().init_reference_weights(state_dict)
+        self._load_layernorm_weights(state_dict)
+
+    def _load_layernorm_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Copy checkpoint layernorm weights into the RMSNorm modules.
+
+        The checkpoint stores ``input_layernorm.weight`` and
+        ``post_attention_layernorm.weight`` for each layer.  These must be loaded
+        into the ``RMSNorm`` modules so the golden/reference path uses the real
+        values instead of random initialization.
+        """
+        if "input_layernorm.weight" in state_dict:
+            self.input_layernorm.weight.data.copy_(state_dict["input_layernorm.weight"])
+        if "post_attention_layernorm.weight" in state_dict:
+            self.post_attention_layernorm.weight.data.copy_(state_dict["post_attention_layernorm.weight"])
 
     def golden_forward(
         self,

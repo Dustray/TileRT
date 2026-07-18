@@ -6,7 +6,7 @@ from enum import Enum
 import torch
 
 from tilert.models.base import TileRTModule
-from tilert.models.common import weight_dequant
+from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.ops.expert_down_allreduce import (
     ExpertDownAllReduceWeightsConverter,
@@ -229,7 +229,7 @@ class DownAllReduce(TileRTModule):
         down_scales = sharded_list[1][device_id]
 
         down_list = [
-            weight_dequant(down_weight, down_scale)
+            _safe_weight_dequant(down_weight, down_scale)
             for down_weight, down_scale in zip(down_weights, down_scales)
         ]
         self.ref_down = torch.stack(down_list, dim=0)

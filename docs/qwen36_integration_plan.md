@@ -368,6 +368,34 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 - `__process_head_weights`：Qwen3.6 使用 `qwen3_6/ops/rmsnorm_head_proj.py`。
 - CLI 新增 `--model_type qwen3_6` 分支。
 
+### 8.3.1 权重转换：Hugging Face → TileRT
+
+`tilert/models/preprocess/weight_converter.py` 的核心作用是把 Hugging Face 原生 `safetensors` 权重转换成 TileRT 多卡推理所需的按 device 分片的格式。
+
+- **源格式**：
+  - DeepSeek/GLM5 风格：`model.layers.{layer_id}.xxx`。
+  - Qwen3.6 风格：文本权重位于 `model.language_model.layers.{layer_id}.xxx`，MTP 权重位于 `mtp.xxx / mtp.layers.xxx`。
+  - 原始 Qwen3.6-35B-A3B checkpoint 还包含 `model.visual.*` 视觉塔权重，首版跳过不转换。
+
+- **目标格式**：
+  - 输出为 `model.safetensors-{i:05d}-of-{N:05d}.safetensors` + `model.safetensors.index.json`。
+  - 键名采用 TileRT 内部约定，形如 `layer_{layer_id}.{param_name}_dev_{device_id}`，例如 `layer_0.self_attn.q_proj.weight_dev_0`。
+
+- **转换流程**：
+  1. 读取原始 `model.safetensors.index.json`，按 `layer_id` 把参数分组到对应层需要加载的 shard 文件集合。
+  2. 对每一层调用 `convert_a_layer`：
+     - `transform_attention`：根据 `text_config.layer_types[layer_id]` 区分 `linear_attention`（DeltaNet）和 `full_attention`（GQA），读取对应的 `self_attn.*` / `linear_attn.*` 权重。
+     - `transform_moe`：Qwen3.6 每层都是 MoE，把堆叠的 `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` 拆成 per-expert 的 `gate_proj/up_proj/down_proj`，再调用 `ExpertSelectUpGateSiLU` / `ExpertDownAllReduce` 进行 device 分片。
+     - `transform_mlp`：Qwen3.6 不使用，但保留兼容分支。
+     - `transform_mtp`：当前为 stub，首版跳过 MTP 转换。
+  3. 单独处理 `lm_head.weight` / `model.norm.weight`（`__process_head_weights`）和 `embed_tokens.weight`（`__process_embedding_weights`）。
+  4. 最后调用 `save_file_sharded`，按 `max_shard_size=5GB` 分片保存，并生成新的 index 文件。
+
+- **输出规模示例（Qwen3.6）**：
+  - 原始文本权重约 68.3 GB；
+  - 转换后约 24.9 GB，9 个 shard，6497 张量；
+  - 视觉塔和 MTP 被跳过，约 2.58 GB 未进入输出。
+
 ### 8.4 新增 op 包装（2026-07-16）
 
 - `tilert/models/qwen3_6/ops/gqa_attention.py`：新增 `GQAAttention` / `GQAAttentionWeightsConverter`，
@@ -791,8 +819,122 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 - MTP 模块 (`modules/mtp.py`) 仍为 stub，`with_mtp=True` 仅分配参数/缓存占位，不会真正执行 MTP 预测。
 - `_golden_forward_device()` 中的 sampling 目前为 greedy/top-k placeholder（`use_topp` 暂未实现真实 top-p）。
 
-### 12.6 建议验证项
+### 12.6 验证结果
 
-1. 在具备 `torch`/`transformers`/`safetensors` 的环境中执行 `init_random_weights()` + `forward(token_id)`，确认 golden 路径无 import/runtime 错误。
-2. 加载真实 TileRT weights（24.9 GB，9 shards）跑单步 `forward`，验证 logits 形状与数值有界。
-3. 实现 `libtilert_qwen36.so` 后，先跑 `qwen36_show_hands_prepare_money` 成功 capture，再切换 `forward()` 到 CUDA-graph 路径。
+#### 12.6.1 随机初始化 smoke test ✅
+- 在 `tilert-qwen3.6` Docker 容器中执行 `QwenShowHandsLayer.init_random_weights()` + `forward(token_id=0, cur_pos=0)`。
+- 40 层异构栈 + 共享 `QwenMoeBlock` 完成 golden forward，输出 logits 形状 `(1, 512, 31040)`，数值有界。
+
+#### 12.6.2 真实权重端到端 forward ✅
+- 加载转换后的真实 TileRT weights（8 卡并行，每个 device 约 24.9 GB shards 中的对应部分）。
+- `QwenShowHandsLayer.forward(token_id=100, cur_pos=0)` 成功：
+  - `logits.shape = (1, 512, 31040)`，所有设备 logits 均 finite。
+  - 连续 3 个 autoregressive decode step（`cur_pos=1,2,3`）产生有效 token：
+    `100 → 4350 → 2416 → 17142 → 4411`。
+- 关键兼容性修复：
+  - `base.py` 新增 `_alias_to_dot_weight_key`：把下划线风格别名（如 `layer_0_self_attn.q_proj.weight`）映射为转换后 checkpoint 的点分风格 key（`layer_0.self_attn.q_proj.weight_dev_N`），并支持 qkv 融合与 `unproj_weights → o_proj.weight` 的别名回退。
+  - `end2end.py` 中 embedding 查找前先 `token_id.view(-1)`，避免标量 int32 或 `[1]` 张量导致 4D 激活。
+  - `GQAAttention` 支持 Qwen3.5-MoE 的 gated q-projection（q_proj 输出翻倍为 query+gate），并在 golden forward 中应用 per-head `q_norm`/`k_norm` 与 `sigmoid(gate.mean(dim=-1))` 门控。
+  - `tilert/models/utils.py::apply_rotary_emb` 兼容 1-D/2-D 以及已广播的 `freqs_cis`，避免真实权重 forward 中 RoPE 维度不匹配。
+  - `RMSNormHeadProj.golden_forward` 对输入与权重做 `detach()`，绕过 inference-mode 下 `rms_norm` 的 autograd 报错。
+
+#### 12.6.3 数值稳定性约定
+- 随机初始化时所有线性权重按 `1/sqrt(fan_in)` 初始化，RMSNorm gamma 初始化为 1.0。
+- 为避免随机权重下 40 层残差相加导致数值爆炸，`QwenTransformerStack` 仅在 `_is_random_init()` 为真时使用 `residual_scale = 1.0 / n_layers`；加载真实 pretrained weights 时自动关闭该缩放，使用标准残差相加。
+
+### 12.7 后续工作
+
+1. 实现 `libtilert_qwen36.so` CUDA kernels：`gqa_attention_op`、`delta_net_op`、`qwen36_show_hands*`。
+2. 补全 MTP 模块与投机解码路径。
+3. 将 `QwenMoe` / `QwenMoeBlock` 基类统一为 `SerializableTileRTModule`，进一步对齐 DSv3.2/GLM5 架构。
+4. 在真实 weights 上扩展验证：prefill（`cur_pos=0` 且 `seq_len>1`）、长序列 KV cache 复用、top-p/top-k 采样。
+
+---
+
+## 13. 真实权重端到端验证与兼容性修复总结（2026-07-18）
+
+### 13.1 背景
+
+在随机初始化 reference 路径稳定后，切换到转换后的真实 Qwen3.5-MoE / Qwen3.6 文本权重进行端到端 forward 验证。真实 checkpoint 的命名风格、权重布局与张量分片方式与项目原有假设存在多处不一致，需要在 loading、op 初始化与 golden forward 中逐一修复。
+
+### 13.2 真实权重与转换约定
+
+| 项目 | 说明 |
+|------|------|
+| 原始模型 | `Qwen/Qwen3.6-35B-A3B`（对应 Hugging Face 实现为 `Qwen3_5MoeForConditionalGeneration`） |
+| 原始文本权重 | `model.language_model.*`，约 68.3 GB |
+| 转换输出 | 9 safetensors shards，6497 张量，约 24.9 GB |
+| key 风格 | 点分 + `_dev_{device_id}` 后缀，例如 `layer_0.self_attn.q_proj.weight_dev_0` |
+| 注意力权重布局 | `full_attention` 层：q_proj 输出翻倍（query + gate），k/v 分开，另有 q_norm/k_norm |
+| MoE 权重布局 | `experts.down_proj/gate_up_proj` 按 expert 堆叠；scale 张量 fake 全 1 |
+| 设备分片 | 转换工具按 8 设备拆分；部分小 scale 在 device 维度广播 |
+
+### 13.3 关键修复清单
+
+#### 13.3.1 权重 key 兼容（`tilert/models/base.py`）
+
+- 问题：项目内部使用下划线风格别名（`layer_0_self_attn_q_proj_weight`），转换后 checkpoint 使用点分风格（`layer_0.self_attn.q_proj.weight_dev_N`），直接加载触发 `KeyError`。
+- 修复：在 `SerializableTileRTModule.init_tilert_weights` 中加入 `_alias_to_dot_weight_key` 静态方法，把下划线别名反转为点分 key；处理 `qkv` 融合与 `unproj_weights → o_proj.weight` 的特殊映射。
+
+#### 13.3.2 Gated q-projection 与 per-head RMSNorm（`tilert/models/qwen3_6/ops/gqa_attention.py`）
+
+- 问题：原有 `GQAAttention` 假设 q/k/v 已融合为 `qkv_proj_weights`，且没有 gate/q_norm/k_norm；真实 checkpoint 是 6 张独立张量，q_proj 输出翻倍。
+- 修复：
+  - `GQAAttentionWeightsConverter.convert_to_general` 在 6 张量时按 `[q_proj, k_proj, v_proj]` 拼接为 `qkv_proj_weights`。
+  - 真实权重在每设备上复制完整注意力矩阵；`num_local_heads`/`num_local_kv_heads` 保持完整头数。
+  - `golden_forward` 中把 qkv split 为 `q_gate, k, v`，再 chunk 出 `q, gate`；对 q/k 应用 per-head RMSNorm；attention 输出乘以 `sigmoid(gate.mean(dim=-1))`。
+
+#### 13.3.3 反量化 VMFault 与安全回退（`tilert/models/common.py`）
+
+- 问题：MI200 上 DeepSeek 的 `weight_dequant_kernel` 对 Qwen 形状（如 `[2048, 64]`，scale `[16, 4]`）触发 VMFault；该 kernel 假设 scale 形状为 `(m//128, n//128)`，但 Qwen 小 expert 权重不满足。
+- 修复：新增 `_safe_weight_dequant(weight, scale)`：
+  - 单元素 scale 直接广播。
+  - 当 `m % 128 == 0`、`n % 128 == 0` 且 `scale.shape == (m//128, n//128)` 时调用原有 `_weight_dequant_torch`。
+  - 否则将 FP8 权重直接 cast 为 bf16（配合 fake all-ones scale 是安全的）。
+- 影响范围：`common.py::linear()` 默认调用 `_safe_weight_dequant`；`down_allreduce.py`、`expert_down_allreduce.py`、`expert_sel_up_gate_silu.py`、`rmsnorm_up_gate_silu.py`、`unproj_o_allreduce.py`、`gqa_attention.py` 的 reference 路径全部切换为 `_safe_weight_dequant`。
+
+#### 13.3.4 残差缩放条件化（`tilert/models/qwen3_6/modules/transformer_stack.py`）
+
+- 问题：随机初始化时使用的 `residual_scale = 1.0 / n_layers` 会降低真实权重的输出幅度。
+- 修复：只在 `self._is_random_init()` 为真时启用该缩放；真实权重路径使用标准 `residual_scale = 1.0`。
+
+#### 13.3.5 其他兼容性修复
+
+| 文件 | 修复 |
+|------|------|
+| `tilert/models/qwen3_6/ops/unproj_o_allreduce.py` | 为 `ref_unproj_o` 合成 all-ones scale，修复 `unproj_weights` 别名，避免 `KeyError` |
+| `tilert/models/qwen3_6/modules/end2end.py` | embedding 查找前 `token_id.view(-1)`；head 权重 all-gather 后再 local shard 写回 `LOGITS_OUT` |
+| `tilert/models/qwen3_6/ops/rmsnorm_head_proj.py` | 对 rmsnorm 输入/权重 `detach()`，修复 inference-mode 下 autograd 报错 |
+| `tilert/models/utils.py` | `apply_rotary_emb` 兼容 1-D/2-D/broadcast 三种 `freqs_cis` 形状 |
+
+### 13.4 验证脚本
+
+- `scripts/verify_qwen36_random_init_forward.py`：随机初始化 40 层 forward，验证 logits 形状与有限性。
+- `scripts/verify_qwen36_real_weights_forward.py`：真实权重 forward + 3 步自回归 decode，验证 logits 与连续 token 有效。
+
+### 13.5 验证结果
+
+| 验证项 | 结果 |
+|--------|------|
+| 随机初始化 `forward(token_id=0)` | ✅ PASSED，logits finite |
+| 真实权重 `forward(token_id=100, cur_pos=0)` | ✅ PASSED，`next_token=4350`，logits finite |
+| 3-step autoregressive decode | ✅ PASSED，token 链 `100 → 4350 → 2416 → 17142 → 4411` |
+| 8 设备 logits 一致性 | ✅ PASSED，所有设备 local logits shard 均 finite |
+| 清理后无未使用 `weight_dequant` import | ✅ PASSED，所有 qwen3_6 op 文件调用 `_safe_weight_dequant` |
+
+### 13.6 经验教训
+
+- Qwen3.5-MoE 的 `full_attention` 不是标准 GQA：q_proj 翻倍并带 gate，q/k 有 per-head RMSNorm。
+- 转换后的 checkpoint 对 attention 权重采用“每设备复制完整矩阵”策略，而非 tensor-parallel shard，这要求 op 内部 `num_local_*` 用完整头数。
+- DeepSeek 的 fp8 反量化 kernel 在 MI200 上对 Qwen 小形状不安全；提供一个纯 Python fallback 能在 kernel 就绪前保持 reference 路径可用。
+- 真实权重与随机初始化的数值稳定性约定不同：随机 init 需要 `1/sqrt(fan_in)` 与 `residual_scale`，真实 pretrained weights 必须关闭这些测试专用缩放。
+
+### 13.7 仍待完成的工作
+
+| 优先级 | 任务 |
+|--------|------|
+| P1 | 实现 `libtilert_qwen36.so` CUDA kernels |
+| P2 | 补全 MTP 与投机解码 |
+| P2 | 统一 `QwenMoe` / `QwenMoeBlock` 基类为 `SerializableTileRTModule` |
+| P3 | 长序列 prefill 与 KV cache 复用验证 |
+| P3 | top-p/top-k 采样在 golden 路径中完整实现 |

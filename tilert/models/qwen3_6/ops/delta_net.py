@@ -250,6 +250,7 @@ class DeltaNetOp(TileRTModule):
         aliases = self.ref_weights_alias.ref_tensor_alias
         out_slices = self._get_local_out_slices()
 
+        args = self.model_args
         sharded: dict[str, list[torch.Tensor]] = {alias: [] for alias in self.tilert_weights_alias()}
         for dev in range(self.num_devices):
             slc = out_slices[dev]
@@ -257,10 +258,15 @@ class DeltaNetOp(TileRTModule):
             z = weights_map[aliases[1]][slc[1]]
             a = weights_map[aliases[2]][slc[2]]
             b = weights_map[aliases[3]][slc[3]]
-            conv1d = weights_map[aliases[4]][:, :, slc[0]]
+            # conv1d weight layout is (out_channels, 1, kernel_size); the
+            # out-channel dimension matches ``in_proj_qkv`` so slice dim 0.
+            conv1d = weights_map[aliases[4]][slc[0], :, :]
             A_log = weights_map[aliases[5]][slc[2]]
             dt_bias = weights_map[aliases[6]][slc[3]]
-            norm = weights_map[aliases[7]][slc[1]]
+            # ``norm.weight`` has shape (delta_value_head_dim,).  It is not
+            # the same size as z/gate dim, so split it evenly across devices.
+            norm_slc = slc[4]
+            norm = weights_map[aliases[7]][norm_slc]
             out_proj = weights_map[aliases[8]][:, slc[1]]
             sharded[self.tilert_weights_alias.in_proj_qkv_weights].append(qkv)
             sharded[self.tilert_weights_alias.in_proj_z_weights].append(z)
@@ -284,10 +290,12 @@ class DeltaNetOp(TileRTModule):
         z_out = args.delta_gate_dim    # n_kv_heads * value_head_dim
         a_out = args.delta_a_dim       # n_kv_heads * a_dim
         b_out = args.delta_b_dim       # n_kv_heads * b_dim
+        norm_out = args.delta_value_head_dim  # per-device split for norm.weight
         qkv_per_dev = qkv_out // self.num_devices
         z_per_dev = z_out // self.num_devices
         a_per_dev = a_out // self.num_devices
         b_per_dev = b_out // self.num_devices
+        norm_per_dev = norm_out // self.num_devices
         slices = []
         for dev in range(self.num_devices):
             slices.append([
@@ -295,6 +303,7 @@ class DeltaNetOp(TileRTModule):
                 slice(dev * z_per_dev, (dev + 1) * z_per_dev),
                 slice(dev * a_per_dev, (dev + 1) * a_per_dev),
                 slice(dev * b_per_dev, (dev + 1) * b_per_dev),
+                slice(dev * norm_per_dev, (dev + 1) * norm_per_dev),
             ])
         return slices
 

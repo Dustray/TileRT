@@ -6,7 +6,7 @@ from enum import Enum
 import torch
 
 from tilert.models.base import TileRTModule, TilertWeightsConverter
-from tilert.models.common import weight_dequant
+from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
 
@@ -268,6 +268,32 @@ class ExpertDownAllReduceTilertWeightsAlias:
         return self.tilert_tensor_alias
 
 
+@dataclass
+class ExpertDownAllReduceRefWeightsAlias:
+    """Reference weights alias for ExpertDownAllReduce.
+
+    The checkpoint stores shared and routed down-projection weights (and their
+    optional scales) under dot-weight keys.  We expose the canonical list here
+    so that callers such as ``QwenMoeBlock.get_ref_weights_alias`` can discover
+    these keys consistently with the rest of the Qwen3.6 ops.
+    """
+
+    key_prefix: str = "mlp"
+
+    @property
+    def ref_tensor_alias(self) -> list[str]:
+        prefix = self.key_prefix
+        return [
+            f"{prefix}.shared_expert.down_proj.weight",
+            f"{prefix}.experts.down_proj",
+            f"{prefix}.shared_expert.down_proj.weight_scale_inv",
+            f"{prefix}.experts.down_proj.weight_scale_inv",
+        ]
+
+    def __call__(self) -> list[str]:
+        return self.ref_tensor_alias
+
+
 class ExpertDownAllReduce(TileRTModule):
     """ExpertDownAllReduce module."""
 
@@ -314,17 +340,20 @@ class ExpertDownAllReduce(TileRTModule):
         self.model_arch = self.arch_name
 
         self.tilert_weights_alias = ExpertDownAllReduceTilertWeightsAlias()
-        self.tensor_alias = ["exp_down_weights", "exp_down_scales"]
-        self.ref_tensor_alias = (
-            ["mlp.shared_expert.down_proj.weight"]
-            + ["mlp.experts.down_proj"]
-            + ["mlp.shared_expert.down_proj.weight_scale_inv"]
-            + ["mlp.experts.down_proj.weight_scale_inv"]
-        )
+        self.ref_weights_alias = ExpertDownAllReduceRefWeightsAlias()
+        # ``tensor_alias`` is kept for internal tilert init bookkeeping.
+        self._tensor_alias = ["exp_down_weights", "exp_down_scales"]
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
         return self.tilert_weights_alias.tilert_tensor_alias
+
+    @property
+    def tensor_alias(self) -> list[str]:
+        return self._tensor_alias
+
+    def get_ref_weights_alias(self) -> list[str]:
+        return list(self.ref_weights_alias())
 
     def get_weights_list(self) -> list[torch.Tensor]:
         return [self.tilert_weights, self.tilert_scales]
@@ -429,8 +458,10 @@ class ExpertDownAllReduce(TileRTModule):
     def device_sharding(
         self,
         weights_dict: dict[str, torch.Tensor],
-        key_prefix: str,
+        key_prefix: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if key_prefix is None:
+            key_prefix = self.ref_weights_alias.key_prefix
         assert self.n_shared_experts == 1, "Only one shared expert is supported"
         down_weights_list = []
         down_scales_list = []
@@ -455,9 +486,11 @@ class ExpertDownAllReduce(TileRTModule):
     def init_reference_weights(
         self,
         state_dict: dict[str, torch.Tensor],
-        key_prefix: str,
+        key_prefix: str | None = None,
         device_id: int = 0,
     ) -> None:
+        if key_prefix is None:
+            key_prefix = self.ref_weights_alias.key_prefix
         sharded_list = self.device_sharding(state_dict, key_prefix)
         # ``device_sharding`` returns (n_experts, num_devices, ...); select the
         # requested device across all experts.
@@ -465,7 +498,7 @@ class ExpertDownAllReduce(TileRTModule):
         down_scales = sharded_list[1][:, device_id]
 
         down_list = [
-            weight_dequant(down_weight, down_scale)
+            _safe_weight_dequant(down_weight, down_scale)
             for down_weight, down_scale in zip(down_weights, down_scales)
         ]
         self.ref_down = torch.stack(down_list, dim=0)
@@ -476,9 +509,14 @@ class ExpertDownAllReduce(TileRTModule):
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         assert self.algorithm is not None, "Algorithm is not set"
+        weights_list = [state_dict[alias] for alias in self.tensor_alias]
+        # Real Qwen3.6 converted checkpoints store down weights in bf16.
+        # The GENERAL swizzler expects float8_e4m3fn; cast if needed.
+        if weights_list[0].dtype != torch.float8_e4m3fn:
+            weights_list[0] = weights_list[0].to(torch.float8_e4m3fn)
         self.tilert_weights, self.tilert_scales = ExpertDownAllReduceWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tensor_alias])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
         self.hidden_out = torch.zeros(
@@ -527,7 +565,7 @@ class ExpertDownAllReduce(TileRTModule):
         )
         state_dict = dict(
             zip(
-                self.ref_tensor_alias,
+                self.ref_weights_alias(),
                 [shared_down, routed_down, shared_scale, routed_scale],
             )
         )

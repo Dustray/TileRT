@@ -333,6 +333,37 @@ class SerializableTileRTModule(TileRTModule):
                     op_state_dict[op_key] = state_dict[original_key]
                     if self.remove_selected:
                         keys_to_remove.add(original_key)
+                    continue
+                # Special case: the GQA attention op fuses q/k/v into a single
+                # ``qkv_proj_weights`` tensor, but the converted checkpoint
+                # stores them as separate ``q_proj``, ``k_proj`` and ``v_proj``
+                # weights.  Build the fused tensor on the fly if the pieces
+                # are present, taking precedence over the single-key fallback.
+                if op_key == "qkv_proj_weights":
+                    pieces = []
+                    piece_keys = []
+                    for piece in ("q_proj", "k_proj", "v_proj"):
+                        piece_key = f"{prefix}{piece}.weight{suffix}"
+                        if piece_key in state_dict:
+                            pieces.append(state_dict[piece_key])
+                            piece_keys.append(piece_key)
+                        else:
+                            break
+                    if len(pieces) == 3:
+                        op_state_dict[op_key] = torch.cat(pieces, dim=0)
+                        if self.remove_selected:
+                            keys_to_remove.update(piece_keys)
+                        continue
+                # Fallback: some Qwen3.6 converted checkpoints use dot-weight
+                # aliases (e.g. ``linear_attn.in_proj_qkv.weight``) while the
+                # op's tilert alias is underscore-style (``in_proj_qkv_weights``).
+                # Try the dot-weight form derived from the underscore alias.
+                dot_weight_key = self._alias_to_dot_weight_key(prefix, op_key, suffix, state_dict)
+                if dot_weight_key in state_dict:
+                    op_state_dict[op_key] = state_dict[dot_weight_key]
+                    if self.remove_selected:
+                        keys_to_remove.add(dot_weight_key)
+                    continue
 
             op.init_tilert_weights(op_state_dict)
 
@@ -340,13 +371,76 @@ class SerializableTileRTModule(TileRTModule):
                 for k in keys_to_remove:
                     del state_dict[k]
 
+    @staticmethod
+    def _alias_to_dot_weight_key(
+        prefix: str, op_key: str, suffix: str, state_dict: dict[str, torch.Tensor] | None = None
+    ) -> str:
+        """Map an underscore-style tilert alias to a dot-weight checkpoint key.
+
+        The converted Qwen3.6 checkpoint uses a flat naming convention that drops the
+        ``linear_attn`` / ``self_attn`` module prefixes from the original PyTorch
+        state dict.  This helper translates op aliases into those flat keys.
+
+        Examples:
+            - ``layer_0_in_proj_qkv_weights_dev_0`` ->
+              ``layer_0_in_proj_qkv.weight_dev_0``
+            - ``layer_3_qkv_proj_weights_dev_0`` ->
+              ``layer_3_q_proj.weight_dev_0``
+        """
+        full = f"{prefix}{op_key}{suffix}"
+        # Only rewrite aliases that end with ``_weights`` or ``_weight``.
+        for trailing in ("_weights", "_weight"):
+            if op_key.endswith(trailing):
+                stem = op_key[: -len(trailing)]
+                # DeltaNet weights are stored with a flat dot-weight name.
+                if stem in {
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_a",
+                    "in_proj_b",
+                    "conv1d",
+                    "norm",
+                    "out_proj",
+                }:
+                    return f"{prefix}{stem}.weight{suffix}"
+                # Per-device tensors that already contain a dot in the alias.
+                if stem == "A_log":
+                    return f"{prefix}A_log{suffix}"
+                if stem == "dt_bias":
+                    return f"{prefix}dt_bias{suffix}"
+                # GQA weights: the converter shards q/k/v/o separately but the
+                # op currently expects a fused ``qkv_proj``.  Use the q_proj.
+                if stem == "qkv_proj":
+                    return f"{prefix}q_proj.weight{suffix}"
+                if stem == "o_proj":
+                    return f"{prefix}o_proj.weight{suffix}"
+                if stem == "q_norm":
+                    return f"{prefix}q_norm.weight{suffix}"
+                if stem == "k_norm":
+                    return f"{prefix}k_norm.weight{suffix}"
+                # Qwen3.6 GatedAttention stores the attention output projection as
+                # ``o_proj.weight`` but exposes it through the UnProjOAllReduce op
+                # under the ``unproj_weights`` alias.  Map it here without breaking
+                # DeepSeek/GLM checkpoints that use a real ``unproj.weight`` key.
+                if stem == "unproj":
+                    o_proj_key = f"{prefix}o_proj.weight{suffix}"
+                    if o_proj_key in state_dict:
+                        return o_proj_key
+                    return full
+                break
+        return full
+
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         for op in self.exec_seq:
             op.init_reference_weights(state_dict)
 
     def init_random_weights(self) -> None:
+        self._random_init_marker = True
         for op in self.exec_seq:
             op.init_random_weights()
+
+    def _is_random_init(self) -> bool:
+        return getattr(self, "_random_init_marker", False)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
         for op in self.exec_seq:

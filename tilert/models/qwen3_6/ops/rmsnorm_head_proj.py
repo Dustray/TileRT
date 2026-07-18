@@ -272,10 +272,19 @@ class RMSNormHeadProj(TileRTModule):
         assert self.ref_head_proj is not None
         bsz = hidden_in.shape[0]
         assert bsz == 1
+        hidden_in_float = hidden_in.float().detach()
+        gamma = self.ref_rmsnorm_gamma.float().detach()
         hidden_rmsnorm = torch.nn.functional.rms_norm(
-            hidden_in.float(), [hidden_in.size(-1)], self.ref_rmsnorm_gamma, self.eps
+            hidden_in_float, [hidden_in_float.size(-1)], gamma, self.eps
         )
-        return hidden_rmsnorm.float() @ self.ref_head_proj.T.float()
+        # Handle both full 2-D head projection and the per-device sharded layout
+        # produced by device_sharding for the reference path.
+        head_proj = self.ref_head_proj
+        if head_proj.dim() == 3:
+            # TileRT-sharded layout: (logits_shard, 16, 1024) blocks.
+            # Reconstruct (logits_shard * 16, dim) for matmul.
+            head_proj = head_proj.transpose(1, 2).reshape(-1, self.dim)
+        return hidden_rmsnorm.float() @ head_proj.T.float()
 
     def tilert_forward(
         self,

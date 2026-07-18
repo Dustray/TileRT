@@ -7,7 +7,7 @@ from enum import Enum
 import torch
 
 from tilert.models.base import TileRTModule, TilertWeightsConverter
-from tilert.models.common import weight_dequant
+from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
 
@@ -340,7 +340,20 @@ class UnProjOAllReduce(TileRTModule):
             Map from tilert weight alias to (num_devices, ...) tensors.
         """
         unproj_o_weight = weights_map[self.ref_weights_alias.o_proj_weight]
-        unproj_o_scale = weights_map[self.ref_weights_alias.o_proj_scale_inv]
+        # Real Qwen3.6 checkpoints do not include FP8 scales for o_proj.
+        # Synthesize an all-ones scale so the existing dequant/converter paths
+        # can be reused without changing the checkpoint format.
+        if self.ref_weights_alias.o_proj_scale_inv in weights_map:
+            unproj_o_scale = weights_map[self.ref_weights_alias.o_proj_scale_inv]
+        else:
+            head_scale_dim = self.head_dim // self.block_size
+            dim_scale_dim = self.dim // self.block_size
+            unproj_o_scale = torch.ones(
+                dim_scale_dim,
+                self.n_heads * head_scale_dim,
+                dtype=torch.float32,
+                device=unproj_o_weight.device,
+            )
 
         if self.n_heads % self.num_devices == 0:
             unproj_o_weight = unproj_o_weight.reshape(self.dim, self.num_devices, -1)
@@ -411,7 +424,7 @@ class UnProjOAllReduce(TileRTModule):
         sharded = self.device_sharding(state_dict)
         weights = sharded[self.tilert_weights_alias.unproj_weights][did]
         scales = sharded[self.tilert_weights_alias.unproj_scales][did]
-        self.ref_unproj_o = weight_dequant(weights, scales)
+        self.ref_unproj_o = _safe_weight_dequant(weights, scales)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         """
@@ -421,11 +434,53 @@ class UnProjOAllReduce(TileRTModule):
             state_dict: State dictionary keyed by tilert weight alias (per-device).
         """
         assert self.algorithm is not None, "Algorithm is not set"
+        tilert_alias = list(self.tilert_weights_alias())
+        ref_alias = self.ref_weights_alias
+
+        # Map either the fused tilert alias or the dot-weight checkpoint keys.
+        if tilert_alias[0] in state_dict:
+            weight = state_dict[tilert_alias[0]]
+        elif ref_alias.o_proj_weight in state_dict:
+            weight = state_dict[ref_alias.o_proj_weight]
+        else:
+            # Qwen3.6 converted checkpoints store the attention output projection
+            # as ``layer_N_o_proj.weight_dev_M`` rather than an ``unproj`` alias.
+            # Search the per-device state dict for the matching o_proj key.
+            o_proj_keys = [
+                k for k in state_dict if "o_proj.weight" in k or k.endswith("o_proj.weight")
+            ]
+            if o_proj_keys:
+                weight = state_dict[o_proj_keys[0]]
+            else:
+                raise KeyError(
+                    f"Neither {tilert_alias[0]} nor {ref_alias.o_proj_weight} found in state_dict"
+                )
+
+        if tilert_alias[1] in state_dict:
+            scale = state_dict[tilert_alias[1]]
+        elif ref_alias.o_proj_scale_inv in state_dict:
+            scale = state_dict[ref_alias.o_proj_scale_inv]
+        else:
+            # Real Qwen3.6 checkpoints are bf16-only; synthesize an all-ones scale.
+            head_scale_dim = self.head_dim // self.block_size
+            dim_scale_dim = self.dim // self.block_size
+            scale = torch.ones(
+                dim_scale_dim,
+                self.n_heads * head_scale_dim,
+                dtype=torch.float32,
+                device=weight.device,
+            )
+
+        weights_list = [weight, scale]
+        # The FP16 MMA converter expects float8_e4m3fn weights; cast bf16
+        # checkpoints if needed.
+        if weights_list[0].dtype != torch.float8_e4m3fn:
+            weights_list[0] = weights_list[0].to(torch.float8_e4m3fn)
         self.tilert_weights, self.tilert_scales = UnProjOAllReduceWeightsConverter(
             self.model_args, self.num_devices
         ).dispatch(
             self.algorithm,
-            [state_dict[alias] for alias in self.tilert_weights_alias()],
+            weights_list,
         )
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:

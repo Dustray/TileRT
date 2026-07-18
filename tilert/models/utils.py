@@ -142,7 +142,13 @@ def apply_rotary_emb(
     if not interleaved:
         x_in = x_in.view(*shape[:-1], 2, -1).transpose(-1, -2).contiguous()
     x_in = torch.view_as_complex(x_in.float().view(*shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x_in.size(1), 1, x_in.size(-1))
+    # ``freqs_cis`` may be 1-D (length rope_dim), 2-D (seq_len, rope_dim), or
+    # already broadcastable (1, seq_len, 1, rope_dim).  Normalize to the
+    # broadcastable shape expected by the multiplication.
+    if freqs_cis.dim() == 1:
+        freqs_cis = freqs_cis.view(1, 1, 1, -1)
+    elif freqs_cis.dim() == 2:
+        freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
     y_out = torch.view_as_real(x_in * freqs_cis).flatten(3)
     if not interleaved:
         y_out = torch.cat([y_out[..., 0::2], y_out[..., 1::2]], dim=-1)

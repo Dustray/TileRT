@@ -189,7 +189,7 @@ class QwenShowHandsLayer:
         assert self.model_args.arch_name == "qwen3_6"
 
         self.num_devices = 8
-        self.forward_max_seq_len = 4
+        self.forward_max_seq_len = model_args.max_seq_len
 
         self.model_path = model_path
         self.with_weight_conversion = with_weight_conversion
@@ -205,6 +205,8 @@ class QwenShowHandsLayer:
 
     def _gen_freqs_cis(self) -> torch.Tensor:
         freqs_cis = precompute_freqs_cis(self.model_args)
+        # Return real layout (max_seq_len, rope_dim) so it can be sliced by cur_pos
+        # and converted back to complex inside the transformer stack.
         return torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], -1)
 
     def load_device_weights(
@@ -488,6 +490,9 @@ class QwenShowHandsLayer:
                     stack.init_tilert_weights(state_dicts)
                 else:
                     stack.init_random_weights()
+                    # Mark the top-level stack as random-init so the residual
+                    # scaling heuristic is applied only for smoke tests.
+                    stack._random_init_marker = True
                 self._stack_objects[device_id] = stack
 
                 params.extend(stack.get_weights_list())
@@ -504,6 +509,16 @@ class QwenShowHandsLayer:
                         for alias in head_proj.tilert_weights_alias()
                         if alias in state_dicts
                     }
+                    # Fallback: the converted checkpoint stores head/norm with
+                    # a ``layer_{n_layers}_`` prefix; if the bare alias is missing,
+                    # try the prefixed form.
+                    prefixed_aliases = {
+                        alias: f"layer_{self.model_args.n_layers}_{alias}_dev_{device_id}"
+                        for alias in head_proj.tilert_weights_alias()
+                    }
+                    for alias, prefixed in prefixed_aliases.items():
+                        if alias not in head_state and prefixed in state_dicts:
+                            head_state[alias] = state_dicts[prefixed]
                     head_proj.init_tilert_weights(head_state)
                 else:
                     head_proj.init_random_weights(device_id=device_id)
@@ -610,26 +625,29 @@ class QwenShowHandsLayer:
 
         # Note: no V2 P2P setup for Qwen3.6 (no DSA/MLA).
 
-        for device_id in range(self.num_devices):
-            with torch.cuda.device(device_id):
-                intermediates, caches, params, profile_logs = self._get_device_result(device_id)
-                qwen36_show_hands_prepare_money(
-                    params,
-                    intermediates,
-                    caches,
-                    profile_logs,
-                    self.forward_max_seq_len,
-                    self.with_mtp,
-                )
-                if self.with_mtp:
+        # Qwen3.6 backend library does not exist yet, so skip the CUDA-graph
+        # prepare step.  Golden forward is always used until kernels are ready.
+        if os.environ.get("TILERT_QWEN36_ENABLE_BACKEND_PREPARE", "0") == "1":
+            for device_id in range(self.num_devices):
+                with torch.cuda.device(device_id):
+                    intermediates, caches, params, profile_logs = self._get_device_result(device_id)
                     qwen36_show_hands_prepare_money(
-                        params[: self._base_params_count],
+                        params,
                         intermediates,
-                        caches[: self._base_caches_count],
+                        caches,
                         profile_logs,
                         self.forward_max_seq_len,
-                        False,
+                        self.with_mtp,
                     )
+                    if self.with_mtp:
+                        qwen36_show_hands_prepare_money(
+                            params[: self._base_params_count],
+                            intermediates,
+                            caches[: self._base_caches_count],
+                            profile_logs,
+                            self.forward_max_seq_len,
+                            False,
+                        )
 
     def from_pretrained(self, model_path: str) -> None:
         """Load the model weights from the given path."""
@@ -679,27 +697,45 @@ class QwenShowHandsLayer:
         embed_weight = params[stack_weight_count + head_weight_count]
         freqs_cis_param = params[stack_weight_count + head_weight_count + 1]
 
-        # 1. Embedding lookup.
-        x = embed_weight[token_id].unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
+        # 1. Embedding lookup.  ``token_id`` may be a scalar int32 or a [1]
+        # tensor, so flatten it to a single index before indexing.
+        x = embed_weight[token_id.view(-1)].unsqueeze(0).to(torch.bfloat16)
         intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id
         intermediates[Idx.CUR_POS][0] = cur_pos
 
         # 2. Transformer stack (DeltaNet + Gated Attention layers).
-        freqs_cis_real = freqs_cis_param[cur_pos : cur_pos + 1]
-        h, caches = stack.golden_forward(x, cur_pos, freqs_cis_real)
+        # freqs_cis_param has shape (max_seq_len, rope_dim) in real layout.
+        # Pass the full tensor to golden_forward; GQA attention will slice it
+        # by start_pos internally, and DeltaNet ignores it.
+        h, caches = stack.golden_forward(x, cur_pos, freqs_cis_param)
 
         # 3. Final RMSNorm + head projection.
+        # Params are TileRT-sharded; head projection weight is split across
+        # devices as (logits_dim/num_devices, dim).  The reference path needs
+        # the full matrix on every device, so all-gather it here.
+        local_head = params[stack_weight_count + 1]
+        if local_head.dim() == 2 and local_head.size(0) * self.num_devices == self.model_args.vocab_size:
+            head_list = [torch.empty_like(local_head) for _ in range(self.num_devices)]
+            torch.distributed.all_gather(head_list, local_head)
+            full_head = torch.cat(head_list, dim=0)
+        else:
+            full_head = local_head
+
         head_proj = RMSNormHeadProj(
             model_args=self.model_args,
             device_id=device_id,
             num_devices=self.num_devices,
         )
-        # Head weights are already part of params; load them into the op for the
-        # reference path without re-allocating.
         head_proj.ref_rmsnorm_gamma = params[stack_weight_count]
-        head_proj.ref_head_proj = params[stack_weight_count + 1]
+        head_proj.ref_head_proj = full_head
         logits = head_proj.golden_forward(h)
-        intermediates[Idx.LOGITS_OUT][0, 0, :].copy_(logits[0, 0])
+        # All-gather produces logits_dim on each device; slice local shard.
+        local_logits_dim = self.model_args.vocab_size // self.num_devices
+        local_logits_start = device_id * local_logits_dim
+        local_logits_end = local_logits_start + local_logits_dim
+        intermediates[Idx.LOGITS_OUT][0, 0, local_logits_start:local_logits_end].copy_(
+            logits[0, 0, local_logits_start:local_logits_end]
+        )
 
         # 4. Sampling (greedy / top-k / top-p placeholder).
         token_out = self._sample(logits[0, 0])

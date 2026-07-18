@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 from tilert.models.base import TileRTModule, TilertWeightsConverter
-from tilert.models.common import weight_dequant
+from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
 
@@ -121,8 +121,16 @@ class GQAAttentionWeightsConverter(TilertWeightsConverter):
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_proj_w, k_proj_w, v_proj_w, o_proj_w, q_norm_w, k_norm_w = weights_list
-        qkv_proj_weights = torch.cat([q_proj_w, k_proj_w, v_proj_w], dim=0)
+        # The real converted checkpoint stores q/k/v/o_proj and q_norm/k_norm
+        # as six separate tensors.  Qwen3.5-MoE full attention doubles the
+        # q-projection output (query + gate), so ``q_proj.weight`` already
+        # has shape ``[2 * n_heads * head_dim, dim]``.  Concatenate q, k, and v
+        # along the output dimension to form the fused ``qkv_proj_weights``.
+        if len(weights_list) == 6:
+            q_proj_w, k_proj_w, v_proj_w, o_proj_w, q_norm_w, k_norm_w = weights_list
+            qkv_proj_weights = torch.cat([q_proj_w, k_proj_w, v_proj_w], dim=0)
+        else:
+            qkv_proj_weights, o_proj_w, q_norm_w, k_norm_w = weights_list
         return qkv_proj_weights, o_proj_w, q_norm_w, k_norm_w
 
 
@@ -153,13 +161,12 @@ class GQAAttention(TileRTModule):
         self.head_dim = model_args.qk_head_dim
         self.v_head_dim = model_args.v_head_dim
         self.rope_dim = model_args.rope_dim
-        self.num_local_heads = self.n_heads // num_devices
-        # Qwen3.6 has only 2 KV heads.  When num_devices > n_kv_heads we
-        # replicate the KV heads across devices instead of slicing them, so the
-        # effective local KV head count stays the full 2 for every device.
-        self.num_local_kv_heads = (
-            self.n_kv_heads if self.n_kv_heads < num_devices else self.n_kv_heads // num_devices
-        )
+        # The converted Qwen3.6 checkpoint stores full attention weights on
+        # every device (replicated), not sharded by tensor-parallel rank.  Use
+        # the full head counts here; the per-device ``_dev_N`` suffix selects
+        # the replicated copy rather than a shard.
+        self.num_local_heads = self.n_heads
+        self.num_local_kv_heads = self.n_kv_heads
 
         self.tilert_weights_alias = GQAAttentionTilertWeightsAlias()
         self.ref_weights_alias = GQAAttentionRefWeightsAlias()
@@ -206,60 +213,25 @@ class GQAAttention(TileRTModule):
         q_norm_w = weights_map[f"{prefix}.q_norm.weight"]
         k_norm_w = weights_map[f"{prefix}.k_norm.weight"]
 
-        q_per_dev = self.num_local_heads * self.head_dim
-        # Qwen3.6 has only 2 KV heads; when sharding over 8 devices we cannot
-        # slice them evenly.  Replicate the KV heads across devices so each
-        # device sees the full KV set, while Q heads remain sharded.
-        if self.n_kv_heads < self.num_devices:
-            kv_per_dev = self.n_kv_heads * self.v_head_dim
-            kv_replicate = True
-        else:
-            kv_per_dev = self.num_local_kv_heads * self.v_head_dim
-            kv_replicate = False
+        # The q-projection output is split into query and gate, so it is twice
+        # the size of a normal Q projection.  With replicated full weights each
+        # device gets the full matrices, not a TP shard.
+        q_per_dev = self.n_heads * self.head_dim * 2
+        kv_per_dev = self.n_kv_heads * self.v_head_dim
         qkv_parts = [
-            q_w[i * q_per_dev : (i + 1) * q_per_dev]
-            for i in range(self.num_devices)
+            torch.cat([q_w, k_w, v_w], dim=0)
+            for _ in range(self.num_devices)
         ]
-        if kv_replicate:
-            k_parts = [k_w for _ in range(self.num_devices)]
-            v_parts = [v_w for _ in range(self.num_devices)]
-        else:
-            k_parts = [
-                k_w[i * kv_per_dev : (i + 1) * kv_per_dev]
-                for i in range(self.num_devices)
-            ]
-            v_parts = [
-                v_w[i * kv_per_dev : (i + 1) * kv_per_dev]
-                for i in range(self.num_devices)
-            ]
-        # o_proj input dim equals the Q head count * value_head_dim.
-        o_per_dev = self.num_local_heads * self.v_head_dim
-        o_parts = [
-            o_w[:, i * o_per_dev : (i + 1) * o_per_dev]
-            for i in range(self.num_devices)
-        ]
+        # o_proj is also replicated across devices.
+        o_parts = [o_w for _ in range(self.num_devices)]
 
-        qkv_stacked = []
-        for i in range(self.num_devices):
-            qkv_stacked.append(
-                torch.cat([qkv_parts[i], k_parts[i], v_parts[i]], dim=0)
-            )
-
-        # q_norm/k_norm are per-head weights; split accordingly.
-        q_norm_parts = [
-            q_norm_w[i * self.num_local_heads * self.head_dim : (i + 1) * self.num_local_heads * self.head_dim]
-            for i in range(self.num_devices)
-        ]
-        if kv_replicate:
-            k_norm_parts = [k_norm_w for _ in range(self.num_devices)]
-        else:
-            k_norm_parts = [
-                k_norm_w[i * self.num_local_kv_heads * self.v_head_dim : (i + 1) * self.num_local_kv_heads * self.v_head_dim]
-                for i in range(self.num_devices)
-            ]
+        # q_norm/k_norm are per-head weights; with replicated full weights
+        # every device receives the full norm vectors.
+        q_norm_parts = [q_norm_w for _ in range(self.num_devices)]
+        k_norm_parts = [k_norm_w for _ in range(self.num_devices)]
 
         return {
-            self.tilert_weights_alias.qkv_proj_weights: torch.stack(qkv_stacked, dim=0).contiguous(),
+            self.tilert_weights_alias.qkv_proj_weights: torch.stack(qkv_parts, dim=0).contiguous(),
             self.tilert_weights_alias.o_proj_weights: torch.stack(o_parts, dim=0).contiguous(),
             self.tilert_weights_alias.q_norm_weights: torch.stack(q_norm_parts, dim=0).contiguous(),
             self.tilert_weights_alias.k_norm_weights: torch.stack(k_norm_parts, dim=0).contiguous(),
@@ -274,7 +246,12 @@ class GQAAttention(TileRTModule):
         self.k_norm_weights = sharded[self.tilert_weights_alias.k_norm_weights][did]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
+        # Prefer the six-tensor dot-weight checkpoint layout when present.
+        ref_alias = self.ref_weights_alias()
+        if all(alias in state_dict for alias in ref_alias):
+            weights_list = [state_dict[alias] for alias in ref_alias]
+        else:
+            weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
         converter = GQAAttentionWeightsConverter(self.model_args, self.num_devices)
         (
             self.qkv_proj_weights,
@@ -297,7 +274,12 @@ class GQAAttention(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
-        qkv_out = self.n_heads * self.head_dim + 2 * self.n_kv_heads * self.v_head_dim
+        # Qwen3.5-MoE full attention doubles the q-projection for the gate.
+        qkv_out = (
+            self.n_heads * self.head_dim * 2
+            + self.n_kv_heads * self.head_dim
+            + self.n_kv_heads * self.v_head_dim
+        )
         # Scale by 1/sqrt(fan_in) for stable 40-layer reference numerics.
         qkv_w = torch.randn(
             qkv_out,
@@ -311,13 +293,16 @@ class GQAAttention(TileRTModule):
             dtype=torch.bfloat16,
             device=device,
         ) / ((self.n_heads * self.v_head_dim) ** 0.5)
+        # q_norm/k_norm are per-head scalars; the checkpoint stores one value
+        # per head (head_dim entries per head).
+        # q_norm/k_norm are per-head scalars applied to each head individually.
         q_norm_w = torch.ones(
-            self.n_heads * self.head_dim,
+            self.head_dim,
             dtype=torch.float32,
             device=device,
         )
         k_norm_w = torch.ones(
-            self.n_kv_heads * self.v_head_dim,
+            self.v_head_dim,
             dtype=torch.float32,
             device=device,
         )
@@ -325,13 +310,14 @@ class GQAAttention(TileRTModule):
         # which correctly handles any ``num_devices`` split.  This keeps the
         # random-init reference path working for both single-device and
         # multi-device sanity tests.
+        q_split = self.n_heads * self.head_dim * 2
         state_dict = {
-            f"{self.ref_weights_alias.key_prefix}.q_proj.weight": qkv_w[: self.n_heads * self.head_dim],
+            f"{self.ref_weights_alias.key_prefix}.q_proj.weight": qkv_w[:q_split],
             f"{self.ref_weights_alias.key_prefix}.k_proj.weight": qkv_w[
-                self.n_heads * self.head_dim : self.n_heads * self.head_dim + self.n_kv_heads * self.v_head_dim
+                q_split : q_split + self.n_kv_heads * self.head_dim
             ],
             f"{self.ref_weights_alias.key_prefix}.v_proj.weight": qkv_w[
-                self.n_heads * self.head_dim + self.n_kv_heads * self.v_head_dim :
+                q_split + self.n_kv_heads * self.head_dim :
             ],
             f"{self.ref_weights_alias.key_prefix}.o_proj.weight": o_w,
             f"{self.ref_weights_alias.key_prefix}.q_norm.weight": q_norm_w,
@@ -359,41 +345,57 @@ class GQAAttention(TileRTModule):
         bsz, seq_len, _ = x.shape
 
         qkv = x @ self.qkv_proj_weights.T
-        q, k, v = torch.split(
+        # Qwen3.5-MoE full attention: q-projection is doubled; the second half is
+        # the per-head gating signal.
+        q_gate, k, v = torch.split(
             qkv,
             [
-                self.num_local_heads * self.head_dim,
+                self.num_local_heads * self.head_dim * 2,
                 self.num_local_kv_heads * self.head_dim,
                 self.num_local_kv_heads * self.v_head_dim,
             ],
             dim=-1,
         )
+        q, gate = torch.chunk(q_gate, 2, dim=-1)
 
-        q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim).transpose(1, 2)
+        # Keep (bsz, seq_len, n_heads, head_dim) for apply_rotary_emb.
+        q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim)
+        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim)
 
-        # apply_rotary_emb expects (bsz, seq_len, n_heads, head_dim);
-        # transpose so dim 1 is the sequence dimension, then restore.
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        # Apply per-head RMSNorm on q/k.  q_norm/k_norm weights have shape
+        # (head_dim,) and are broadcast across all heads.
+        q_norm_w = self.q_norm_weights.view(1, 1, 1, self.head_dim)
+        k_norm_w = self.k_norm_weights.view(1, 1, 1, self.v_head_dim)
+        q = q / (q.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * q_norm_w
+        k = k / (k.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * k_norm_w
 
         rope_dim = self.rope_dim
         no_pe_dim = self.head_dim - rope_dim
         q_pe, q_no_pe = torch.split(q, [rope_dim, no_pe_dim], dim=-1)
         k_pe, k_no_pe = torch.split(k, [rope_dim, no_pe_dim], dim=-1)
 
-        from tilert.models.utils import apply_rotary_emb
+        from tilert.models.utils import apply_rotary_emb, precompute_freqs_cis
 
         local_freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
+        if not torch.is_complex(local_freqs_cis):
+            # Convert real (seq_len, rope_dim) layout to complex cis.
+            local_freqs_cis = precompute_freqs_cis(
+                self.model_args,
+                theta_override=self.model_args.rope_theta,
+                factor_override=self.model_args.rope_factor,
+            )[: local_freqs_cis.size(0)].to(device=local_freqs_cis.device)
         q_pe = apply_rotary_emb(q_pe, local_freqs_cis, interleaved=False)
         k_pe = apply_rotary_emb(k_pe, local_freqs_cis, interleaved=False)
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
 
+        # Permute to (bsz, n_heads, seq_len, head_dim) for attention math.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
+        # Cache layout is (batch, seq_len, n_kv_heads, head_dim).
         k_cache[:bsz, start_pos : start_pos + seq_len] = k.transpose(1, 2)
         v_cache[:bsz, start_pos : start_pos + seq_len] = v.transpose(1, 2)
 
@@ -405,13 +407,20 @@ class GQAAttention(TileRTModule):
             k_full = k_full.repeat_interleave(reps, dim=1)
             v_full = v_full.repeat_interleave(reps, dim=1)
 
-        scores = torch.matmul(q, k_full.transpose(-2, -1)) / (self.head_dim**0.5)
+        scores = torch.matmul(q.float(), k_full.transpose(-2, -1).float()) / (self.head_dim**0.5)
         if mask is not None:
             scores = scores + mask
         attn = F.softmax(scores, dim=-1)
-        o = torch.matmul(attn, v_full)
-        o = o.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        out = o @ self.o_proj_weights.T
+        o = torch.matmul(attn, v_full.float())
+        o = o.transpose(1, 2).contiguous()
+        # Apply the per-head gate to the projected output.  The gate has the
+        # same shape as the query (bsz, seq_len, n_heads, head_dim); reduce it
+        # to one scalar per head and broadcast across the head dim.
+        gate = gate.view(bsz, seq_len, self.num_local_heads, self.head_dim)
+        gate = gate.mean(dim=-1).view(bsz, seq_len, self.num_local_heads, 1)
+        out = o * torch.sigmoid(gate)
+        out = out.view(bsz, seq_len, -1).to(x.dtype)
+        out = out @ self.o_proj_weights.T
         return out, k_cache, v_cache
 
     def tilert_forward(

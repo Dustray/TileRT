@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from tilert.models.base import TileRTModule, TilertWeightsConverter
-from tilert.models.common import weight_dequant
+from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
 
@@ -675,14 +675,14 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         # causing OOM during the 40-layer model init.
         self.ref_gate = torch.stack(
             [
-                weight_dequant(gate_weights[i], gate_scales[i]).to(torch.bfloat16)
+                _safe_weight_dequant(gate_weights[i], gate_scales[i]).to(torch.bfloat16)
                 for i in range(gate_weights.shape[0])
             ],
             dim=0,
         )
         self.ref_up = torch.stack(
             [
-                weight_dequant(up_weights[i], up_scales[i]).to(torch.bfloat16)
+                _safe_weight_dequant(up_weights[i], up_scales[i]).to(torch.bfloat16)
                 for i in range(up_weights.shape[0])
             ],
             dim=0,
@@ -696,6 +696,12 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         """Initialize the tilert weights."""
         assert self.algorithm is not None, "Algorithm is not set"
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
+        # Real Qwen3.6 converted checkpoints store gate/up weights in bf16.
+        # The FP8MMA swizzler requires float8_e4m3fn, so cast them before conversion.
+        if self.algorithm == ExpertSelectUpGateSiLUAlgorithm.FP8MMA:
+            for i in (1, 3):  # exp_gate_weights, exp_up_weights
+                if weights_list[i].dtype != torch.float8_e4m3fn:
+                    weights_list[i] = weights_list[i].to(torch.float8_e4m3fn)
         converter = ExpertSelectUpGateSiLUWeightsConverter(self.model_args, self.num_devices)
         self.tilert_bias, self.tilert_weights = converter.dispatch(self.algorithm, weights_list)
 

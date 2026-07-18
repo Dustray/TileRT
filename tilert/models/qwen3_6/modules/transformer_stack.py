@@ -124,14 +124,18 @@ class QwenTransformerStack(SerializableTileRTModule):
         if caches is None:
             caches = self._init_layer_caches(freqs_cis)
 
+        # Convert real-form freqs_cis back to complex for the reference path.
+        # Real layout produced by some callers is [seq_len, rope_dim].
+        if not torch.is_complex(freqs_cis):
+            freqs_cis = torch.view_as_complex(freqs_cis.view(freqs_cis.size(0), -1, 2))
+
         h = x
-        # Random-init weights cause each block output to have roughly the same
-        # std as its input, so naive residual addition doubles the variance each
-        # layer.  Scale the residual branch by 1/n_layers to keep the random-init
-        # golden path numerically bounded for sanity testing.  This does not
-        # affect the real model semantics (use pretrained weights for real
-        # reference numerics).
-        residual_scale = 1.0 / max(len(self.exec_seq), 1)
+        # Use full residual addition for real pretrained weights; only scale
+        # the residual branch when randomly initialized weights are detected
+        # (by checking whether any child module was created with the
+        # ``is_random_init`` marker).  This keeps random-init sanity tests
+        # numerically bounded without changing real-model semantics.
+        residual_scale = 1.0 / max(len(self.exec_seq), 1) if self._is_random_init() else 1.0
         shared_k_cache = caches["k_cache"]
         shared_v_cache = caches["v_cache"]
         for layer_idx, block in enumerate(self.exec_seq):

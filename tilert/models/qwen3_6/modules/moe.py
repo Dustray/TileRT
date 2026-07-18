@@ -117,6 +117,17 @@ class QwenMoeBlock(TileRTModule):
         )
         return self.moe.expert_down_allreduce.golden_forward(up_gate_out, indices, weights)
 
+    def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        self.moe.rmsnorm_expert_proj.init_tilert_weights(state_dict)
+        self.moe.exp_sel_up_gate_silu.init_tilert_weights(state_dict)
+        self.moe.expert_down_allreduce.init_tilert_weights(state_dict)
+        self.is_tilert_weights_init = True
+
+    def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        self.moe.rmsnorm_expert_proj.init_reference_weights(state_dict)
+        self.moe.exp_sel_up_gate_silu.init_reference_weights(state_dict)
+        self.moe.expert_down_allreduce.init_reference_weights(state_dict)
+
     def tilert_forward(self, x: torch.Tensor) -> torch.Tensor:
         """TileRT forward: dispatches to registered ops."""
         norm_x, scores = self.moe.rmsnorm_expert_proj.tilert_forward(x)
@@ -129,3 +140,23 @@ class QwenMoeBlock(TileRTModule):
         if self.flag_enable_tilert:
             return self.tilert_forward(x)
         return self.golden_forward(x)
+
+    def get_weights_list(self) -> list[torch.Tensor]:
+        return self.moe.get_weights_list()
+
+    def get_ref_weights_alias(self) -> list[str]:
+        return self.moe.rmsnorm_expert_proj.get_ref_weights_alias() + \
+               self.moe.exp_sel_up_gate_silu.get_ref_weights_alias() + \
+               self.moe.expert_down_allreduce.get_ref_weights_alias()
+
+    def get_tilert_weights_alias(self) -> list[str]:
+        return self.moe.rmsnorm_expert_proj.get_tilert_weights_alias() + \
+               self.moe.exp_sel_up_gate_silu.get_tilert_weights_alias() + \
+               self.moe.expert_down_allreduce.get_tilert_weights_alias()
+
+    def device_sharding(self, raw_weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        sharded = {}
+        sharded.update(self.moe.rmsnorm_expert_proj.device_sharding(raw_weights_map))
+        sharded.update(self.moe.exp_sel_up_gate_silu.device_sharding(raw_weights_map))
+        sharded.update(self.moe.expert_down_allreduce.device_sharding(raw_weights_map, key_prefix="mlp"))
+        return sharded

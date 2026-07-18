@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from tilert.models.base import TileRTModule
-from tilert.models.common import weight_dequant
+from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.ops.expert_sel_up_gate_silu import (
     ExpertSelectUpGateSiLU,
@@ -232,11 +232,11 @@ class RMSNormUpGateSiLU(TileRTModule):
         up_scales = sharded_list[4][device_id]
         self.ref_norm_gamma = gamma
         ref_gate_list = [
-            weight_dequant(gate_weights, gate_scales)
+            _safe_weight_dequant(gate_weights, gate_scales)
             for gate_weights, gate_scales in zip(gate_weights, gate_scales)
         ]
         ref_up_list = [
-            weight_dequant(up_weights, up_scales)
+            _safe_weight_dequant(up_weights, up_scales)
             for up_weights, up_scales in zip(up_weights, up_scales)
         ]
         self.ref_gate = torch.stack(ref_gate_list, dim=0)
