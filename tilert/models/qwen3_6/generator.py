@@ -54,6 +54,7 @@ class Qwen36Generator:
         top_k: int = 256,
         sampling_seed: int = 42,
         enable_thinking: bool = False,
+        tokenizer_dir: str | None = None,
     ):
         """Initialize the Qwen36Generator.
 
@@ -68,9 +69,13 @@ class Qwen36Generator:
             top_k: Number of top-k candidates for sampling.
             sampling_seed: Sampling seed for reproducibility.
             enable_thinking: Whether to enable thinking mode.
+            tokenizer_dir: Optional tokenizer directory. If provided, the tokenizer
+                is loaded from here instead of ``model_weights_dir``. This is useful
+                when the converted checkpoint does not include tokenizer files.
         """
         torch.set_num_threads(64)
         self.model_weights_dir = model_weights_dir
+        self.tokenizer_dir = tokenizer_dir if tokenizer_dir is not None else model_weights_dir
 
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
@@ -83,7 +88,7 @@ class Qwen36Generator:
 
         self.config = model_args
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_weights_dir, trust_remote_code=True
+            self.tokenizer_dir, trust_remote_code=True
         )
         self.eos_id = self.tokenizer.eos_token_id
         self.batch_size = 1

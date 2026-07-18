@@ -30,7 +30,7 @@ class ModelArgsQwen36:
     max_seq_len: int = 262144  # 256K native, up to 1M with YaRN
 
     # Data type
-    dtype: Literal["bf16", "fp8"] = "fp8"
+    dtype: Literal["bf16", "fp8"] = "bf16"
     scale_fmt: str | None = None
 
     # Model dimensions

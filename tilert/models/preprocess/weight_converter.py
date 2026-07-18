@@ -1,6 +1,7 @@
 import json
 import os
 import pprint
+import shutil
 from collections import OrderedDict
 from typing import Any, TypedDict, cast
 
@@ -631,6 +632,37 @@ class WeightConverter:
                     new_key = f"layer_{layer_idx}_{param_name}_{dev}"
                     self.converted_weights_dict[dev][new_key] = tensor
 
+    def __copy_tokenizer_files(self) -> None:
+        """Copy tokenizer-related files from model_dir to save_dir.
+
+        The converted checkpoint should be self-contained so that downstream
+        generator/tokenizer code can load directly from ``save_dir`` without
+        falling back to the original Hugging Face model directory.
+        """
+        tokenizer_files = [
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "vocab.json",
+            "merges.txt",
+            "chat_template.jinja",
+            "preprocessor_config.json",
+        ]
+        for fname in tokenizer_files:
+            src = os.path.join(self.model_dir, fname)
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(self.save_dir, fname)
+            if os.path.exists(dst):
+                logger.info(f"Tokenizer file already exists: {dst}")
+                continue
+            try:
+                import shutil
+
+                shutil.copy2(src, dst)
+                logger.info(f"Copied tokenizer file: {fname}")
+            except Exception as exc:
+                logger.warning(f"Failed to copy {fname}: {exc}")
+
     def to_tilert_weights(self) -> None:
         torch.set_default_device(self.default_device)
 
@@ -645,6 +677,7 @@ class WeightConverter:
 
         self.__process_head_weights()
         self.__process_embedding_weights()
+        self.__copy_tokenizer_files()
 
         def _get_layer_num(file_name: str) -> tuple[int, int]:
             """Extract layer number from filename like 'layer_XX.xxx'."""

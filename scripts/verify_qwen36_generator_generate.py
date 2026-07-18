@@ -22,11 +22,14 @@ import torch
 def main():
     torch.set_num_threads(64)
 
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
-    # Verify tokenizer files are present; if not, generator construction would fail.
+    # The converted TileRT checkpoint currently does not include tokenizer files.
+    # Fall back to the original HF model directory for tokenizer only.
+    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
+    tokenizer_dir = weights_dir#"/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    # Verify tokenizer files are present in the original model directory.
     for tok_file in ("tokenizer_config.json", "tokenizer.json", "vocab.json"):
-        if os.path.isfile(os.path.join(weights_dir, tok_file)):
-            print(f"  Found {tok_file}")
+        if os.path.isfile(os.path.join(tokenizer_dir, tok_file)):
+            print(f"  Found {tok_file} in original model dir")
             break
     else:
         print("  Warning: no tokenizer json files found; generator init will likely fail.")
@@ -51,6 +54,7 @@ def main():
         top_p=0.9,
         top_k=256,
         sampling_seed=42,
+        tokenizer_dir=tokenizer_dir,
     )
     generator.init_random_weights()
     print("[2/3] Generator initialized OK")

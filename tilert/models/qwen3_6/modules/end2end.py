@@ -698,8 +698,12 @@ class QwenShowHandsLayer:
         freqs_cis_param = params[stack_weight_count + head_weight_count + 1]
 
         # 1. Embedding lookup.  ``token_id`` may be a scalar int32 or a [1]
-        # tensor, so flatten it to a single index before indexing.
-        x = embed_weight[token_id.view(-1)].unsqueeze(0).to(torch.bfloat16)
+        # tensor, so flatten it to a single index before indexing.  Also make sure
+        # the index tensor lives on the same device as the embedding table to
+        # avoid ``indices should be on the same device as the indexed tensor``
+        # errors during multi-device generation.
+        idx = token_id.view(-1).to(embed_weight.device)
+        x = embed_weight[idx].unsqueeze(0).to(torch.bfloat16)
         intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id
         intermediates[Idx.CUR_POS][0] = cur_pos
 
