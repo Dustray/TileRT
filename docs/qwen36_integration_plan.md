@@ -1,5 +1,7 @@
 # Qwen3.6-35B-A3B 接入 TileRT 技术方案
 
+> 最近更新：2026-07-18 — 已根据官方 `modeling_qwen3_5_moe.py` 将 Qwen3.6 RoPE 统一为 M-RoPE；`weight_converter.py` 已适配 Qwen3.6 权重结构并修复类型注解回归。
+
 ## 0. 背景术语说明
 
 ### 0.1 常用缩写
@@ -10,7 +12,7 @@
 | **MLP** | Multi-Layer Perceptron | 稠密前馈网络（Dense FFN）。在 DeepSeek-V3.2/GLM-5 中，前若干层是 dense MLP，后面才是 MoE。 |
 | **MoE** | Mixture of Experts | 专家混合模型。每次只激活 top-k 个 expert，Qwen3.6 是每层都是 MoE，256 专家里激活 8+1。 |
 | **GQA** | Grouped Query Attention | Qwen3.6 使用的注意力。Query 头数多（16），KV 头数少（2），通过分组减少 KV cache。 |
-| **MTP** | Multi-Token Prediction | DeepSeek-V3.2 的额外模块，一次预测多个 token。Qwen3.6 没有 MTP。 |
+| **MTP** | Multi-Token Prediction | DeepSeek-V3.2 的额外模块，一次预测多个 token。Qwen3.5/3.6 支持 MTP 但首版暂不启用。 |
 
 ### 0.2 DeepSeek-V3.2 / GLM-5 / Qwen3.6-35B-A3B 结构对比
 
@@ -19,11 +21,12 @@
 | 总层数 | 61 | 78 | 40 |
 | 层类型 | 前 3 层 dense MLP + 后 58 层 MoE | 前 3 层 dense MLP + 后 75 层 MoE | **每层都是 MoE**，无 dense MLP |
 | 注意力 | **MLA** | **MLA**（从 DSv3.2 修改） | **GQA + DeltaNet**（异构） |
+| RoPE | 标准 1D RoPE (`qk_rope_head_dim=64`) | 标准 1D RoPE (`qk_rope_head_dim=64`) | **M-RoPE** (`partial_rotary_factor=0.25`, `mrope_section=[11,11,10]`, `mrope_interleaved=true`) |
 | 隐藏维度 | 7168 | 6144 | 2048 |
 | MoE inter_dim | 2048 | 2048 | **512** |
 | 专家数 | 256 | 256 | 256 |
 | 激活专家 | 8 + 1 shared | 8 | 8 + 1 shared |
-| MTP | **有**（layer 61） | 无 | 1 层（可跳过） |
+| MTP | **有**（layer 61） | 无 | 支持，默认禁用（`num_mtp_layers=0`） |
 | 层模式 | 同构（除前 3 层 MLP） | 同构 | **异构**：10 × [3 linear_attention + 1 full_attention] |
 | TileRT 移植难度 | 基准 | 小（改 dim/scale dtype） | 大（需新 op + 异构调度 + 真实权重格式与假设不符） |
 
@@ -56,7 +59,7 @@
 | MoE inter_dim | 2048 | **512** | 需适配堆叠 expert 权重格式 |
 | 专家数 | 256 | 256 | 可复用路由逻辑 |
 | 激活专家 | 8+1 | 8+1 | 可复用 |
-| MTP | 有 | **1 层** (`mtp_num_hidden_layers=1`) | 首版可跳过 |
+| MTP | 有 | 支持（`mtp_num_hidden_layers=1`） | 首版默认禁用 |
 | 多模态 | 否 | 是 (`model.visual.*`) | 首版跳过 |
 
 ## 2. Qwen3.6 隐藏层结构
@@ -83,7 +86,10 @@ n_layers: int = 40           # 总层数
 n_heads: int = 16             # Query 头数
 n_kv_heads: int = 2           # KV 头数 (GQA)
 qk_head_dim: int = 256        # Q/K 头维度 (self_attn q/k/v/o 的 out dim = 4096, 即 n_heads * head_dim)
-rope_dim: int = 64            # partial_rotary_factor * head_dim
+rope_dim: int = 64            # M-RoPE 旋转维度 = partial_rotary_factor * qk_head_dim
+partial_rotary_factor: float = 0.25   # M-RoPE 旋转比例
+mrope_section: list[int] = [11, 11, 10]  # M-RoPE T/H/W 分段 (T+H+W = rope_dim//2 = 32)
+use_mrope: bool = True        # Qwen3.6 使用与 Qwen3.5-MoE 相同的多模态 RoPE
 
 # linear_attention (DeltaNet)
 linear_num_key_heads: int = 16
@@ -364,9 +370,15 @@ for layer_idx, layer_type in enumerate(self.layer_types):
   - `mlp.shared_expert_gate.weight`: `(1, 2048)`
   - 需要先把堆叠张量拆成 per-expert 的 `gate_proj / up_proj / down_proj`，再喂给现有 `ExpertSelectUpGateSiLU` / `ExpertDownAllReduce` 进行 device sharding。
 - `transform_mlp`：Qwen3.6 不使用，但若被调用则切换为 Qwen3.6 的 `RMSNormUpGateSiLU` / `DownAllReduce`。
-- `transform_mtp`：当前返回空字典。但 checkpoint 实际包含 `mtp.*` 和 `mtp.layers.*`（1 层），`text_config.mtp_num_hidden_layers=1`。若后续需要 MTP 投机解码，需补充转换。
+- `transform_mtp`：当前返回空字典。Qwen3.5/3.6 checkpoint 实际包含 `mtp.*` / `mtp.layers.*`（1 层），`text_config.mtp_num_hidden_layers=1`，但首版默认禁用 MTP（`num_mtp_layers=0`）。后续启用投机解码时再补充完整转换。
 - `__process_head_weights`：Qwen3.6 使用 `qwen3_6/ops/rmsnorm_head_proj.py`。
 - CLI 新增 `--model_type qwen3_6` 分支。
+- **weight_converter 审计与修复（2026-07-18）**：
+  - `mlp.gate.weight`：移除冗余 reshape，改为直接按 `(n_routed_experts, dim)` 形状断言后传入路由 op；避免 gate 矩阵被错误展平。
+  - `ModelArgsQwen36.mrope_section`：默认值从空列表修正为官方 `[11, 11, 10]`（对应 `partial_rotary_factor=0.25`、`rope_dim=64` 的 M-RoPE）。
+  - 类型注解：为 `__init__` / `transform_attention` / `transform_moe` / `transform_mlp` / `transform_mtp` / `__process_head_weights` 中的 Qwen36/DeepSeek 分支添加 `cast(ModelArgsQwen36)` / `cast(ModelArgs)`，消除 union 类型误报；`layer_types` 改为非空 `list[str]` 默认值，避免 `None` 下标警告。
+  - 缺失导入：补全 `ExpertSelectUpGateSiLU` 与 `ExpertDownAllReduce` 的 DeepSeek 版本导入。
+  - MTP 注释：明确 Qwen3.5/3.6 支持 MTP 但首版暂不启用。
 
 ### 8.3.1 权重转换：Hugging Face → TileRT
 
@@ -407,6 +419,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 ### 8.5 模块接入新 op
 
 - `modules/gated_attention.py`：移除 `QKVRoPE` + `Rotate` 占位，改用 `GQAAttentionOp`；
+  `QwenAttentionRef.golden_forward` 使用 M-RoPE (`apply_mrope_embed`)。
   tilert forward 路径为 `GQAAttentionOp -> UnProjOAllReduce`。
 - `modules/delta_net.py`：接入 `DeltaNetOp`；golden/tilert forward 均走 `DeltaNetOp -> QwenMoeBlock`，后者内部串联 `RMSNormExpertProj -> ExpertSelectUpGateSiLU -> ExpertDownAllReduce`。
 - `modules/transformer_stack.py`：统一 KV cache 共享给所有 GatedAttention 层，DeltaNet  recurrent state
@@ -498,7 +511,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 | 文件 | 修复内容 | 状态 |
 |------|----------|------|
-| `ops/gqa_attention.py` | 实现 `device_sharding`（按 `n_heads/n_kv_heads` 拆分 Q/KV/O，按 `rope_dim` 拆分 rope 缓存）和 `init_reference_weights`（加载本地 shard 并反量化） | ✅ 完成 |
+| `ops/gqa_attention.py` | 实现 `device_sharding`（按 `n_heads/n_kv_heads` 拆分 Q/KV/O）和 `init_reference_weights`（加载本地 shard 并反量化）；`golden_forward` 已切到 M-RoPE (`apply_mrope_embed`) | ✅ 完成 |
 | `ops/delta_net.py` | 实现 `device_sharding`（按 `qkv/z/a/b` 输出维度拆分）和 `init_reference_weights`；新增 `_get_local_out_slices` 辅助 | ✅ 完成 |
 | `ops/rotate.py` | `init_tilert_vars` 增加 `device` 参数，output buffer 与 profile log tensor 显式分配到指定设备 | ✅ 完成 |
 | `ops/qkv_rope.py` | `init_tilert_vars` 增加 `device` 参数，profile log tensor 显式分配 | ✅ 完成 |
@@ -835,7 +848,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
   - `base.py` 新增 `_alias_to_dot_weight_key`：把下划线风格别名（如 `layer_0_self_attn.q_proj.weight`）映射为转换后 checkpoint 的点分风格 key（`layer_0.self_attn.q_proj.weight_dev_N`），并支持 qkv 融合与 `unproj_weights → o_proj.weight` 的别名回退。
   - `end2end.py` 中 embedding 查找前先 `token_id.view(-1)`，避免标量 int32 或 `[1]` 张量导致 4D 激活。
   - `GQAAttention` 支持 Qwen3.5-MoE 的 gated q-projection（q_proj 输出翻倍为 query+gate），并在 golden forward 中应用 per-head `q_norm`/`k_norm` 与 `sigmoid(gate.mean(dim=-1))` 门控。
-  - `tilert/models/utils.py::apply_rotary_emb` 兼容 1-D/2-D 以及已广播的 `freqs_cis`，避免真实权重 forward 中 RoPE 维度不匹配。
+- `tilert/models/utils.py` 新增 `precompute_mrope_embed` / `apply_mrope_embed`，为 Qwen3.6 生成并应用与官方 `modeling_qwen3_5_moe.py` 一致的 M-RoPE。
   - `RMSNormHeadProj.golden_forward` 对输入与权重做 `detach()`，绕过 inference-mode 下 `rms_norm` 的 autograd 报错。
 
 #### 12.6.3 数值稳定性约定
@@ -905,7 +918,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | `tilert/models/qwen3_6/ops/unproj_o_allreduce.py` | 为 `ref_unproj_o` 合成 all-ones scale，修复 `unproj_weights` 别名，避免 `KeyError` |
 | `tilert/models/qwen3_6/modules/end2end.py` | embedding 查找前 `token_id.view(-1)`；head 权重 all-gather 后再 local shard 写回 `LOGITS_OUT` |
 | `tilert/models/qwen3_6/ops/rmsnorm_head_proj.py` | 对 rmsnorm 输入/权重 `detach()`，修复 inference-mode 下 autograd 报错 |
-| `tilert/models/utils.py` | `apply_rotary_emb` 兼容 1-D/2-D/broadcast 三种 `freqs_cis` 形状 |
+| `tilert/models/utils.py` | 新增 `precompute_mrope_embed` / `apply_mrope_embed`，兼容 Qwen M-RoPE；保留 `apply_rotary_emb` 用于 DS/GLM |
 
 ### 13.4 验证脚本
 
