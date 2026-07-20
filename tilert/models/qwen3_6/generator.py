@@ -222,11 +222,18 @@ class Qwen36Generator:
     ) -> tuple[str, list[float], int]:
         """Standard generation without MTP."""
         if prompt_tokens is None:
-            prompt_tokens = self.tokenizer.apply_chat_template(
+            chat_output = self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 thinking=self.enable_thinking,
             )
+            # Qwen3.6 tokenizer returns a BatchEncoding / dict with
+            # 'input_ids' and 'attention_mask'; older tokenizers return a plain
+            # list. Normalize to a list of token ids.
+            if hasattr(chat_output, "input_ids"):
+                prompt_tokens = list(chat_output["input_ids"])
+            else:
+                prompt_tokens = list(chat_output)
 
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
