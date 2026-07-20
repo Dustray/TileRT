@@ -1,7 +1,6 @@
 import json
 import os
 import pprint
-import shutil
 from collections import OrderedDict
 from typing import Any, TypedDict, cast
 
@@ -14,12 +13,12 @@ from tilert.models.deepseek_v3_2.model_args import ModelArgs as ModelArgsDsav32
 from tilert.models.deepseek_v3_2.modules.mla_v2 import PureMlaV2, SparseSelectMlaV2
 from tilert.models.deepseek_v3_2.ops.down_allreduce import DownAllReduce
 from tilert.models.deepseek_v3_2.ops.eh_proj_allreduce import EHProjAllReduce
+from tilert.models.deepseek_v3_2.ops.expert_down_allreduce import ExpertDownAllReduce
+from tilert.models.deepseek_v3_2.ops.expert_sel_up_gate_silu import ExpertSelectUpGateSiLU
 from tilert.models.deepseek_v3_2.ops.rmsnorm_head_proj import RMSNormHeadProj
 from tilert.models.deepseek_v3_2.ops.rmsnorm_up_gate_silu import RMSNormUpGateSiLU
 from tilert.models.glm_5.model_args import ModelArgsGLM5
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
-from tilert.models.qwen3_6.ops.expert_down_allreduce import ExpertDownAllReduce as ExpertDownAllReduceQwen36
-from tilert.models.qwen3_6.ops.expert_sel_up_gate_silu import ExpertSelectUpGateSiLU as ExpertSelectUpGateSiLUQwen36
 
 __all__ = [
     "WeightConverter",
@@ -52,13 +51,8 @@ class WeightConverter:
         self.test_mode = test_mode
 
         if self.is_qwen36:
-            # layer_types takes precedence; fall back to counts if absent.
-            if model_args.layer_types is not None:
-                self.num_dense_layers = sum(1 for t in model_args.layer_types if t == "linear_attention")
-                self.num_moe_layers = sum(1 for t in model_args.layer_types if t == "full_attention")
-            else:
-                self.num_dense_layers = model_args.n_delta_layers
-                self.num_moe_layers = model_args.n_gated_layers
+            self.num_dense_layers = model_args.n_delta_layers
+            self.num_moe_layers = model_args.n_gated_layers
             self.num_mtp_layers = 0
         else:
             self.num_dense_layers = model_args.n_dense_layers
@@ -281,44 +275,29 @@ class WeightConverter:
     ) -> dict[str, dict[str, torch.Tensor]]:
         """Shard attention/MLA weights across devices."""
         if self.is_qwen36:
-            layer_type = self.model_args.layer_types[layer_id]
-            scope = f"{self.layer_prefix}.{layer_id}"
-            input_ln = weights_hf[f"{scope}.input_layernorm.weight"]
-            post_attn_ln = weights_hf[f"{scope}.post_attention_layernorm.weight"]
-
-            if layer_type == "linear_attention":
-                # DeltaNet / GatedDeltaNet weights under ``linear_attn.*``.
-                keys = [
-                    "linear_attn.in_proj_qkv.weight",
-                    "linear_attn.in_proj_z.weight",
-                    "linear_attn.in_proj_a.weight",
-                    "linear_attn.in_proj_b.weight",
-                    "linear_attn.conv1d.weight",
-                    "linear_attn.A_log",
-                    "linear_attn.dt_bias",
-                    "linear_attn.norm.weight",
-                    "linear_attn.out_proj.weight",
-                ]
-                tensors = {k.split(".", 1)[1]: weights_hf[f"{scope}.{k}"] for k in keys}
-            elif layer_type == "full_attention":
-                # GQA attention weights under ``self_attn.*`` plus head norms.
-                keys = [
-                    "self_attn.q_proj.weight",
-                    "self_attn.k_proj.weight",
-                    "self_attn.v_proj.weight",
-                    "self_attn.o_proj.weight",
-                    "self_attn.q_norm.weight",
-                    "self_attn.k_norm.weight",
-                ]
-                tensors = {k.split(".", 1)[1]: weights_hf[f"{scope}.{k}"] for k in keys}
-            else:
-                raise ValueError(
-                    f"Qwen3.6 layer {layer_id} has unsupported layer_type: {layer_type}"
-                )
-
-            tensors["input_layernorm.weight"] = input_ln
-            tensors["post_attention_layernorm.weight"] = post_attn_ln
-            return {f"dev_{dev_id}": tensors for dev_id in range(self.num_devices)}
+            # Qwen3.6 has no MLA LoRA weights; attention weights are handled per-layer.
+            # The transformer self_attn weights (q/k/v/o_proj) and the two
+            # layer norms live in the per-device modules, so they are extracted
+            # here with their original HF keys and written into the shard dict
+            # under stable aliases that ``QwenAttentionRef`` / ``QwenDeltaNetRef``
+            # can consume directly.
+            q_proj = weights_hf[f"{self.layer_prefix}.{layer_id}.self_attn.q_proj.weight"]
+            k_proj = weights_hf[f"{self.layer_prefix}.{layer_id}.self_attn.k_proj.weight"]
+            v_proj = weights_hf[f"{self.layer_prefix}.{layer_id}.self_attn.v_proj.weight"]
+            o_proj = weights_hf[f"{self.layer_prefix}.{layer_id}.self_attn.o_proj.weight"]
+            input_ln = weights_hf[f"{self.layer_prefix}.{layer_id}.input_layernorm.weight"]
+            post_attn_ln = weights_hf[f"{self.layer_prefix}.{layer_id}.post_attention_layernorm.weight"]
+            return {
+                f"dev_{dev_id}": {
+                    "q_proj.weight": q_proj,
+                    "k_proj.weight": k_proj,
+                    "v_proj.weight": v_proj,
+                    "o_proj.weight": o_proj,
+                    "input_layernorm.weight": input_ln,
+                    "post_attention_layernorm.weight": post_attn_ln,
+                }
+                for dev_id in range(self.num_devices)
+            }
 
         mla_weights: dict[str, dict[str, torch.Tensor]] = {
             f"dev_{dev_id}": {} for dev_id in range(self.num_devices)
@@ -352,42 +331,23 @@ class WeightConverter:
         weights_hf: dict[str, torch.Tensor],
         layer_id: int,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        scope = f"{self.layer_prefix}.{layer_id}"
-        post_attn_norm_weight = weights_hf[f"{scope}.post_attention_layernorm.weight"].float()
-        mlp_gate_weight = weights_hf[f"{scope}.mlp.gate.weight"]
+        post_attn_norm_weight = f"model.layers.{layer_id}.post_attention_layernorm.weight"
+        mlp_gate_weight = f"model.layers.{layer_id}.mlp.gate.weight"
+        post_attn_norm_weight = weights_hf[post_attn_norm_weight].float()
+        mlp_gate_weight = weights_hf[mlp_gate_weight]
 
+        # Qwen3.6 gate weight has shape (n_routed_experts, dim).
         if self.is_qwen36:
-            # Qwen3.6 uses a single shared expert gate weight (1, dim).
             mlp_gate_weight = mlp_gate_weight.reshape(
                 self.model_args.n_routed_experts, self.model_args.dim
             )
 
         moe_weights: dict[str, dict[str, torch.Tensor]] = {}
-        if self.is_qwen36:
-            exp_sel_up_gate_silu = ExpertSelectUpGateSiLUQwen36(self.model_args, self.num_devices)
-            exp_down_allreduce = ExpertDownAllReduceQwen36(
-                self.model_args, device_id=0, num_devices=self.num_devices
-            )
-        else:
-            exp_sel_up_gate_silu = ExpertSelectUpGateSiLU(self.model_args, self.num_devices)
-            exp_down_allreduce = ExpertDownAllReduce(
-                self.model_args, device_id=0, num_devices=self.num_devices
-            )
+        exp_sel_up_gate_silu = ExpertSelectUpGateSiLU(self.model_args, self.num_devices)
         ref_scope = f"{self.layer_prefix}.{layer_id}."
-        exp_weights_map = {}
-        for k in exp_sel_up_gate_silu.ref_weights_alias():
-            full_k = ref_scope + k
-            if full_k in weights_hf:
-                exp_weights_map[k] = weights_hf[full_k]
-            elif "weight_scale_inv" in k:
-                # bf16-only checkpoints omit FP8 scales; the op will synthesize
-                # all-ones scales from the matching weight tensor.
-                continue
-            elif "e_score_correction_bias" in k:
-                # Some checkpoints omit the router bias; the op defaults to 0.
-                continue
-            else:
-                raise KeyError(f"Missing required weight {full_k}")
+        exp_weights_map = {
+            k: weights_hf[ref_scope + k] for k in exp_sel_up_gate_silu.ref_weights_alias()
+        }
         exp_sharded = exp_sel_up_gate_silu.device_sharding(exp_weights_map)
         tilert_alias = exp_sel_up_gate_silu.tilert_weights_alias
         exp_bias = exp_sharded[tilert_alias.exp_bias]
@@ -395,30 +355,29 @@ class WeightConverter:
         exp_gate_scales = exp_sharded[tilert_alias.exp_gate_scales]
         exp_up_weights = exp_sharded[tilert_alias.exp_up_weights]
         exp_up_scales = exp_sharded[tilert_alias.exp_up_scales]
+        exp_down_allreduce = ExpertDownAllReduce(
+            self.model_args, device_id=0, num_devices=self.num_devices
+        )
         exp_down_weights, exp_down_scales = exp_down_allreduce.device_sharding(
             weights_hf, f"{self.layer_prefix}.{layer_id}.mlp"
         )
-
-        if self.is_qwen36:
-            shared_expert_gate = weights_hf[f"{scope}.mlp.shared_expert_gate.weight"]
-        else:
-            shared_expert_gate = torch.empty(0)
-
         for dev_id in range(self.num_devices):
             key = f"dev_{dev_id}"
-            moe_weights[key] = {
-                "unproj_o_gamma": post_attn_norm_weight,
-                "exp_proj_weights": mlp_gate_weight,
-                "exp_bias": exp_bias[dev_id],
-                "exp_gate_weights": exp_gate_weights[dev_id],
-                "exp_gate_scales": exp_gate_scales[dev_id],
-                "exp_up_weights": exp_up_weights[dev_id],
-                "exp_up_scales": exp_up_scales[dev_id],
-                "exp_down_weights": exp_down_weights[dev_id],
-                "exp_down_scales": exp_down_scales[dev_id],
-            }
-            if self.is_qwen36:
-                moe_weights[key]["shared_expert_gate"] = shared_expert_gate
+            moe_weights.update(
+                {
+                    key: {
+                        "unproj_o_gamma": post_attn_norm_weight,
+                        "exp_proj_weights": mlp_gate_weight,
+                        "exp_bias": exp_bias[dev_id],
+                        "exp_gate_weights": exp_gate_weights[dev_id],
+                        "exp_gate_scales": exp_gate_scales[dev_id],
+                        "exp_up_weights": exp_up_weights[dev_id],
+                        "exp_up_scales": exp_up_scales[dev_id],
+                        "exp_down_weights": exp_down_weights[dev_id],
+                        "exp_down_scales": exp_down_scales[dev_id],
+                    }
+                }
+            )
         return moe_weights
 
     def transform_mlp(
@@ -502,20 +461,9 @@ class WeightConverter:
         weights_hf: dict[str, torch.Tensor],
         layer_id: int,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        """Transform MTP weights.
-
-        Qwen3.6 stores the MTP module under the ``mtp.*`` prefix and contains a
-        single MTP layer that mirrors the language model layer structure.  For
-        now we collect the bare MTP tensors into per-device dicts so conversion
-        can proceed; the dedicated MTP op wrappers will consume them later.
-        """
+        """Transform MTP weights. Qwen3.6 has no MTP layer."""
         if self.is_qwen36:
-            mtp_tensors: dict[str, torch.Tensor] = {}
-            for key in weights_hf:
-                if key.startswith("mtp."):
-                    short = key[len("mtp.") :]
-                    mtp_tensors[short] = weights_hf[key]
-            return {f"dev_{dev_id}": mtp_tensors for dev_id in range(self.num_devices)}
+            return {f"dev_{dev_id}": {} for dev_id in range(self.num_devices)}
 
         enorm_weight_key = f"{self.layer_prefix}.{layer_id}.enorm.weight"
         hnorm_weight_key = f"{self.layer_prefix}.{layer_id}.hnorm.weight"
@@ -566,7 +514,7 @@ class WeightConverter:
         mtp_weights: dict[str, dict[str, torch.Tensor]] = {
             f"dev_{dev_id}": {} for dev_id in range(self.num_devices)
         }
-        if layer_idx >= self.num_dense_layers + self.num_moe_layers:
+        if not self.is_qwen36 and layer_idx >= self.num_dense_layers + self.num_moe_layers:
             mtp_weights = self.transform_mtp(weights_dict, layer_idx)
 
         return attention_weights, mlp_weights, mtp_weights
@@ -632,37 +580,6 @@ class WeightConverter:
                     new_key = f"layer_{layer_idx}_{param_name}_{dev}"
                     self.converted_weights_dict[dev][new_key] = tensor
 
-    def __copy_tokenizer_files(self) -> None:
-        """Copy tokenizer-related files from model_dir to save_dir.
-
-        The converted checkpoint should be self-contained so that downstream
-        generator/tokenizer code can load directly from ``save_dir`` without
-        falling back to the original Hugging Face model directory.
-        """
-        tokenizer_files = [
-            "tokenizer_config.json",
-            "tokenizer.json",
-            "vocab.json",
-            "merges.txt",
-            "chat_template.jinja",
-            "preprocessor_config.json",
-        ]
-        for fname in tokenizer_files:
-            src = os.path.join(self.model_dir, fname)
-            if not os.path.isfile(src):
-                continue
-            dst = os.path.join(self.save_dir, fname)
-            if os.path.exists(dst):
-                logger.info(f"Tokenizer file already exists: {dst}")
-                continue
-            try:
-                import shutil
-
-                shutil.copy2(src, dst)
-                logger.info(f"Copied tokenizer file: {fname}")
-            except Exception as exc:
-                logger.warning(f"Failed to copy {fname}: {exc}")
-
     def to_tilert_weights(self) -> None:
         torch.set_default_device(self.default_device)
 
@@ -677,7 +594,6 @@ class WeightConverter:
 
         self.__process_head_weights()
         self.__process_embedding_weights()
-        self.__copy_tokenizer_files()
 
         def _get_layer_num(file_name: str) -> tuple[int, int]:
             """Extract layer number from filename like 'layer_XX.xxx'."""
@@ -846,11 +762,7 @@ if __name__ == "__main__":
     elif model_type == "glm-5":
         model_args = ModelArgsGLM5()
     elif model_type == "qwen3_6":
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(args.model_dir)
-        layer_types = list(cfg.text_config.layer_types)
-        model_args = ModelArgsQwen36(layer_types=layer_types, dtype="bf16")
+        model_args = ModelArgsQwen36()
     else:
         raise ValueError(f"Invalid model type: {model_type}")
 

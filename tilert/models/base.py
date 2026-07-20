@@ -328,6 +328,10 @@ class SerializableTileRTModule(TileRTModule):
             keys_to_remove = set()
             op_state_dict = {}
             for op_key in op.get_tilert_weights_alias():
+                # First try the op's alias as-is under the serializable prefix.
+                # Most op aliases are underscore-style (``in_proj_qkv_weights``);
+                # the converted checkpoint stores them as
+                # ``layer_{idx}_in_proj_qkv_weights_dev_{dev}``.
                 original_key = f"{prefix}{op_key}{suffix}"
                 if original_key in state_dict:
                     op_state_dict[op_key] = state_dict[original_key]
@@ -358,12 +362,36 @@ class SerializableTileRTModule(TileRTModule):
                 # aliases (e.g. ``linear_attn.in_proj_qkv.weight``) while the
                 # op's tilert alias is underscore-style (``in_proj_qkv_weights``).
                 # Try the dot-weight form derived from the underscore alias.
-                dot_weight_key = self._alias_to_dot_weight_key(prefix, op_key, suffix, state_dict)
-                if dot_weight_key in state_dict:
-                    op_state_dict[op_key] = state_dict[dot_weight_key]
-                    if self.remove_selected:
-                        keys_to_remove.add(dot_weight_key)
+                # Fallback: some Qwen3.6 converted checkpoints use dot-weight
+                # aliases (e.g. ``linear_attn.in_proj_qkv.weight``) while the
+                # op's tilert alias is underscore-style (``in_proj_qkv_weights``).
+                # Try the dot-weight form derived from the underscore alias.
+                # Fallback: some Qwen3.6 converted checkpoints use dot-weight
+                # aliases (e.g. ``linear_attn.in_proj_qkv.weight``) while the
+                # op's tilert alias is underscore-style (``in_proj_qkv_weights``).
+                # Try the dot-weight form derived from the underscore alias.
+                for fallback_fn in (self._alias_to_dot_weight_key, self._alias_to_dotted_weight_key):
+                    candidate = fallback_fn(prefix, op_key, suffix, state_dict)
+                    if candidate in state_dict:
+                        op_state_dict[op_key] = state_dict[candidate]
+                        if self.remove_selected:
+                            keys_to_remove.add(candidate)
+                        break
+                if op_key in op_state_dict:
                     continue
+
+                # Last-resort: the op alias is itself a dotted checkpoint key
+                # (e.g. ``linear_attn.in_proj_qkv.weight``) and the previous
+                # fallback accidentally doubled the prefix.  Try the alias
+                # literally if it already contains a dot and a per-device
+                # suffix (or without suffix for buffers).
+                if "." in op_key:
+                    candidate = f"{prefix}{op_key}{suffix}"
+                    if candidate in state_dict:
+                        op_state_dict[op_key] = state_dict[candidate]
+                        if self.remove_selected:
+                            keys_to_remove.add(candidate)
+                        continue
 
             op.init_tilert_weights(op_state_dict)
 
@@ -425,6 +453,78 @@ class SerializableTileRTModule(TileRTModule):
                 if stem == "unproj":
                     o_proj_key = f"{prefix}o_proj.weight{suffix}"
                     if o_proj_key in state_dict:
+                        return o_proj_key
+                    return full
+                break
+        return full
+
+    @staticmethod
+    def _alias_to_dotted_weight_key(
+        prefix: str, op_key: str, suffix: str, state_dict: dict[str, torch.Tensor] | None = None
+    ) -> str:
+        """Map an underscore-style alias to a dotted-module checkpoint key.
+
+        For the new DeepSeek/GLM5-style Qwen3.6 checkpoint, submodule prefixes
+        such as ``linear_attn`` and ``self_attn`` are preserved.  This helper
+        tries those dotted forms when the flat fallback above fails.
+
+        Examples:
+            - ``in_proj_qkv_weights`` -> ``linear_attn.in_proj_qkv.weight``
+            - ``o_proj_weights`` -> ``self_attn.o_proj.weight``
+            - ``unproj_weights`` -> ``self_attn.o_proj.weight``
+            - ``A_log`` -> ``linear_attn.A_log``
+            - ``dt_bias`` -> ``linear_attn.dt_bias``
+            - ``unproj_o_gamma`` -> ``mlp.post_attention_layernorm.weight``
+            - ``exp_proj_weights`` -> ``mlp.gate.weight``
+            - ``exp_bias`` -> ``mlp.experts.exp_bias``
+            - ``exp_gate_weights`` -> ``mlp.experts.exp_gate_weights``
+        """
+        full = f"{prefix}{op_key}{suffix}"
+        # Non-weight per-device buffers keep their dotted submodule path.
+        if op_key == "A_log":
+            return f"{prefix}linear_attn.A_log{suffix}"
+        if op_key == "dt_bias":
+            return f"{prefix}linear_attn.dt_bias{suffix}"
+        # RMSNormExpertProj aliases mapped to the dotted MoE submodule path.
+        if op_key == "unproj_o_gamma":
+            return f"{prefix}mlp.post_attention_layernorm.weight{suffix}"
+        if op_key == "exp_proj_weights":
+            return f"{prefix}mlp.gate.weight{suffix}"
+        # ExpertSelectUpGateSiLU / ExpertDownAllReduce aliases.  These do not
+        # end in ``_weights``/``_weight`` but still live under ``mlp.experts``.
+        if op_key in {
+            "exp_bias",
+            "exp_gate_weights",
+            "exp_gate_scales",
+            "exp_up_weights",
+            "exp_up_scales",
+            "exp_down_weights",
+            "exp_down_scales",
+        }:
+            return f"{prefix}mlp.experts.{op_key}{suffix}"
+        for trailing in ("_weights", "_weight"):
+            if op_key.endswith(trailing):
+                stem = op_key[: -len(trailing)]
+                # DeltaNet weights with their module prefix.
+                if stem in {
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_a",
+                    "in_proj_b",
+                    "conv1d",
+                    "norm",
+                    "out_proj",
+                }:
+                    return f"{prefix}linear_attn.{stem}.weight{suffix}"
+                # GQA weights with their module prefix.
+                if stem in {"qkv_proj", "o_proj", "q_norm", "k_norm"}:
+                    if stem == "qkv_proj":
+                        return f"{prefix}self_attn.q_proj.weight{suffix}"
+                    return f"{prefix}self_attn.{stem}.weight{suffix}"
+                # Attention output projection consumed by UnProjOAllReduce.
+                if stem == "unproj":
+                    o_proj_key = f"{prefix}self_attn.o_proj.weight{suffix}"
+                    if state_dict is not None and o_proj_key in state_dict:
                         return o_proj_key
                     return full
                 break

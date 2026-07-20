@@ -30,7 +30,7 @@ class ModelArgsQwen36:
     max_seq_len: int = 262144  # 256K native, up to 1M with YaRN
 
     # Data type
-    dtype: Literal["bf16", "fp8"] = "bf16"
+    dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: str | None = None
 
     # Model dimensions
@@ -39,10 +39,6 @@ class ModelArgsQwen36:
 
     # RoPE
     rope_theta: float = 10000000.0  # 10M for YaRN
-    rope_factor: float | None = None  # No YaRN scaling by default
-    beta_fast: int = 32
-    beta_slow: int = 1
-    original_seq_len: int = 262144
 
     # MLP / MoE
     inter_dim: int = 512       # Much smaller than DeepSeek's 2048
@@ -53,7 +49,7 @@ class ModelArgsQwen36:
     n_activated_experts: int = 8
     n_shared_experts: int = 1
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
-    route_scale: float = 1.0
+    route_scale: float = 2.5
 
     # Layer structure: exact heterogeneous pattern from text_config.layer_types
     layer_types: list[str] | None = None  # e.g. ["linear_attention", ...]
@@ -69,23 +65,16 @@ class ModelArgsQwen36:
 
     # Full attention (Gated Attention / GQA)
     qk_head_dim: int = 256
-    v_head_dim: int = 256
     rope_dim: int = 64         # partial_rotary_factor * head_dim
-    n_heads: int = 16          # num_attention_heads
-    n_kv_heads: int = 2        # num_key_value_heads
+    n_heads: int = 16
+    n_kv_heads: int = 2
 
     # DeltaNet specific
-    delta_q_heads: int = 16    # Q heads for linear attention (matches linear_num_key_heads)
-    delta_k_heads: int = 16    # K heads for linear attention (matches linear_num_key_heads)
-    delta_v_heads: int = 32    # V heads for linear attention (matches linear_num_value_heads)
+    delta_q_heads: int = 16
+    delta_kv_heads: int = 32   # V=32, QK=16
     delta_key_head_dim: int = 128
     delta_value_head_dim: int = 128
     delta_conv_kernel_dim: int = 4
-    delta_conv_dim: int = 8192  # q_heads*key_dim + k_heads*key_dim + v_heads*value_dim
-    delta_v_dim: int = 4096  # v_heads * value_head_dim
-    delta_gate_dim: int = 4096  # value_dim (z projection)
-    delta_a_dim: int = 32  # num_v_heads decay gate projection a
-    delta_b_dim: int = 32  # num_v_heads decay gate projection b
 
     # MTP
     n_mtp_layers: int = 1
