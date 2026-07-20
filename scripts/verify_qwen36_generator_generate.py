@@ -13,10 +13,18 @@
     cd /public/home/dinggy/yiny/projects/TileRT
     PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_generate.py
 """
+import logging
 import os
 import sys
 
 import torch
+
+from tilert import logger
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
+)
 
 
 def main():
@@ -29,16 +37,16 @@ def main():
     # Verify tokenizer files are present in the original model directory.
     for tok_file in ("tokenizer_config.json", "tokenizer.json", "vocab.json"):
         if os.path.isfile(os.path.join(tokenizer_dir, tok_file)):
-            print(f"  Found {tok_file} in original model dir")
+            logger.info("  Found %s in original model dir", tok_file)
             break
     else:
-        print("  Warning: no tokenizer json files found; generator init will likely fail.")
-    print("[1/3] Importing Qwen36Generator...")
+        logger.warning("  Warning: no tokenizer json files found; generator init will likely fail.")
+    logger.info("[1/3] Importing Qwen36Generator...")
     from tilert.models.qwen3_6.model_args import ModelArgsQwen36
     from tilert.models.qwen3_6.generator import Qwen36Generator
-    print("[1/3] Import OK")
+    logger.info("[1/3] Import OK")
 
-    print("[2/3] Initializing generator with random weights...")
+    logger.info("[2/3] Initializing generator with random weights...")
     model_args = ModelArgsQwen36()
     model_args.max_seq_len = 512
     model_args.max_batch_size = 1
@@ -57,9 +65,9 @@ def main():
         tokenizer_dir=tokenizer_dir,
     )
     generator.init_random_weights()
-    print("[2/3] Generator initialized OK")
+    logger.info("[2/3] Generator initialized OK")
 
-    print("[3/3] Running generate() with prompt_tokens=[1, 2, 3]...")
+    logger.info("[3/3] Running generate() with prompt_tokens=[1, 2, 3]...")
     prompt_tokens = [1, 2, 3]
     result, time_list, accepted_counts, prompt_len = generator.generate(
         prompt="",
@@ -67,10 +75,15 @@ def main():
         with_mtp=False,
         prompt_tokens=prompt_tokens,
     )
-    print(f"[3/3] prompt_len={prompt_len}, generated_tokens={len(time_list)}, result={result!r}")
+    logger.info(
+        "[3/3] prompt_len=%d, generated_tokens=%d, result=%r",
+        prompt_len,
+        len(time_list),
+        result,
+    )
 
     assert len(time_list) > 0, "No tokens generated"
-    print("\n=== Generator random-init generate smoke test PASSED ===")
+    logger.info("\n=== Generator random-init generate smoke test PASSED ===")
     return 0
 
 
@@ -78,5 +91,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        print(f"\n=== FAILED: {exc} ===", file=sys.stderr)
+        logger.exception("\n=== FAILED: %s ===", exc)
         raise

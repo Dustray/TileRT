@@ -9,8 +9,16 @@
     PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_ast_syntax.py
 """
 import ast
+import logging
 import os
 import sys
+
+from tilert import logger
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
+)
 
 
 def main():
@@ -29,18 +37,18 @@ def main():
             except SyntaxError as exc:
                 failed.append((path, exc))
 
-    print(f"Passed: {len(passed)}, Failed: {len(failed)}")
+    logger.info("Passed: %d, Failed: %d", len(passed), len(failed))
     for path in passed[:5]:
-        print(f"  OK  {path}")
+        logger.info("  OK  %s", path)
     if len(passed) > 5:
-        print(f"  ... and {len(passed) - 5} more")
+        logger.info("  ... and %d more", len(passed) - 5)
     for path, exc in failed:
-        print(f"  FAIL {path}: {exc}")
+        logger.error("  FAIL %s: %s", path, exc)
 
     if failed:
-        print("\n=== AST syntax check FAILED ===", file=sys.stderr)
+        logger.error("\n=== AST syntax check FAILED ===")
         return 1
-    print("\n=== AST syntax check PASSED ===")
+    logger.info("\n=== AST syntax check PASSED ===")
     return 0
 
 

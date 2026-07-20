@@ -1,6 +1,14 @@
 """Smoke test QwenShowHandsLayer init_random_weights + forward in container."""
+import logging
+
 import torch
 
+from tilert import logger
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
+)
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.end2end import QwenShowHandsLayer
 
@@ -22,23 +30,27 @@ def main():
         use_topp=False,
     )
 
-    print("Initializing random weights on 8 devices...")
+    logger.info("Initializing random weights on 8 devices...")
     layer.init_random_weights()
-    print("Random weights initialized.")
+    logger.info("Random weights initialized.")
 
     token_id = torch.tensor(100, dtype=torch.int32)
-    print(f"Running forward(token_id={token_id.item()}) on golden path...")
+    logger.info("Running forward(token_id=%d) on golden path...", token_id.item())
     results = layer.forward(token_id, with_mtp=False, cur_pos=0)
-    print(f"Forward returned {len(results)} device results.")
+    logger.info("Forward returned %d device results.", len(results))
 
     next_token = layer.get_next_token(device_id=0)
-    print(f"Sampled next token: {next_token}")
+    logger.info("Sampled next token: %d", next_token)
 
     logits = layer.get_logits(device_id=0)
-    print(f"Logits shape: {logits.shape}, finite={logits.isfinite().all().item()}")
+    logger.info(
+        "Logits shape: %s, finite=%s",
+        logits.shape,
+        logits.isfinite().all().item(),
+    )
 
     layer.cleanup()
-    print("Smoke test passed.")
+    logger.info("Smoke test passed.")
 
 
 if __name__ == "__main__":

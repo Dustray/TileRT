@@ -9,22 +9,30 @@
     cd /public/home/dinggy/yiny/projects/TileRT
     PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_transformer_stack_forward.py
 """
+import logging
 import sys
 
 import torch
+
+from tilert import logger
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
+)
 
 
 def main():
     torch.set_num_threads(64)
 
-    print("[1/3] Importing modules...")
+    logger.info("[1/3] Importing modules...")
     from tilert.models.qwen3_6.model_args import ModelArgsQwen36
     from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack
     from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
     from tilert.models.utils import precompute_freqs_cis
-    print("[1/3] Import OK")
+    logger.info("[1/3] Import OK")
 
-    print("[2/3] Building QwenTransformerStack with shared cached_ffn_ops...")
+    logger.info("[2/3] Building QwenTransformerStack with shared cached_ffn_ops...")
     model_args = ModelArgsQwen36()
     model_args.max_seq_len = 512
     model_args.max_batch_size = 1
@@ -44,9 +52,9 @@ def main():
         cached_ffn_ops=cached_ffn_ops,
     )
     stack.init_random_weights()
-    print("[2/3] Stack initialized OK")
+    logger.info("[2/3] Stack initialized OK")
 
-    print("[3/3] Running golden_forward for seq_len=1 and seq_len=2...")
+    logger.info("[3/3] Running golden_forward for seq_len=1 and seq_len=2...")
     freqs_cis_real = torch.view_as_real(precompute_freqs_cis(model_args))
     # precompute_freqs_cis returns complex [max_seq_len, rope_dim/2];
     # view_as_real yields [max_seq_len, rope_dim/2, 2]. Collapse to [max_seq_len, rope_dim].
@@ -57,9 +65,14 @@ def main():
         out, caches = stack.golden_forward(x, start_pos=0, freqs_cis=freqs_cis)
         assert out.shape == (1, seq_len, model_args.dim), f"seq_len={seq_len}: unexpected shape {out.shape}"
         assert out.isfinite().all(), f"seq_len={seq_len}: output contains NaN/Inf"
-        print(f"[3/3] seq_len={seq_len}: output.shape={tuple(out.shape)}, finite={out.isfinite().all().item()}")
+        logger.info(
+            "[3/3] seq_len=%d: output.shape=%s, finite=%s",
+            seq_len,
+            tuple(out.shape),
+            out.isfinite().all().item(),
+        )
 
-    print("\n=== Transformer stack golden forward smoke test PASSED ===")
+    logger.info("\n=== Transformer stack golden forward smoke test PASSED ===")
     return 0
 
 
@@ -67,5 +80,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        print(f"\n=== FAILED: {exc} ===", file=sys.stderr)
+        logger.exception("\n=== FAILED: %s ===", exc)
         raise

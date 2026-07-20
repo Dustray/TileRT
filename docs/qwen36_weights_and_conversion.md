@@ -155,7 +155,7 @@ mtp.
 
 - Hugging Face 格式 checkpoint
 - 源文件：`model.safetensors.index.json` + 多个 `model-*.safetensors`
-- Qwen3.6 文本权重约 **68.3 GB**（692 个张量）
+- Qwen3.6 全部权重约 **71.9 GB**（1045 个张量），其中文本部分约 **69.3 GB**（不含 `model.visual.*` 与 `mtp.*`）
 
 ### 4.2 输出
 
@@ -269,12 +269,12 @@ if is_qwen36:
 
 | 模块 | 原始大小 | 转换后处理 |
 |------|----------|------------|
-| `model.language_model.*` | ~68.3 GB | 完整转换，输出 ~24.9 GB |
+| `model.language_model.*` | ~69.3 GB | 完整转换，输出 ~24.9 GB |
 | `model.visual.*` | ~0.89 GB | 跳过 |
 | `mtp.*` / `mtp.layers.*` | ~1.69 GB | 跳过 |
 | `lm_head.weight` 等顶层 | ~1.02 GB | 已包含在 head 输出中 |
 
-输出从 68.3 GB 降到 24.9 GB 的主要原因：
+输出从 69.3 GB 降到 24.9 GB 的主要原因：
 1. 视觉塔与 MTP 未进入输出（约 2.58 GB）
 2. 按 device 拆分后 scale 张量大量广播
 3. 每个 expert 增加 fake float32 `weight_scale_inv`

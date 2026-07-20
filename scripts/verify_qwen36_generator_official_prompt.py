@@ -14,10 +14,18 @@
     cd /public/home/dinggy/yiny/projects/TileRT
     PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_official_prompt.py
 """
+import logging
 import os
 import sys
 
 import torch
+
+from tilert import logger
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
+)
 
 
 def main():
@@ -30,16 +38,16 @@ def main():
     required_tok_files = ("tokenizer_config.json", "tokenizer.json", "vocab.json")
     found = [f for f in required_tok_files if os.path.isfile(os.path.join(weights_dir, f))]
     if found:
-        print(f"  Found tokenizer files: {found}")
+        logger.info("  Found tokenizer files: %s", found)
     else:
-        print("  Warning: no tokenizer json files found; generator init will likely fail.")
+        logger.warning("  Warning: no tokenizer json files found; generator init will likely fail.")
 
-    print("[1/3] Importing Qwen36Generator...")
+    logger.info("[1/3] Importing Qwen36Generator...")
     from tilert.models.qwen3_6.model_args import ModelArgsQwen36
     from tilert.models.qwen3_6.generator import Qwen36Generator
-    print("[1/3] Import OK")
+    logger.info("[1/3] Import OK")
 
-    print("[2/3] Initializing generator...")
+    logger.info("[2/3] Initializing generator...")
     model_args = ModelArgsQwen36()
     model_args.max_seq_len = 512
     model_args.max_batch_size = 1
@@ -58,10 +66,10 @@ def main():
 
     if use_random_weights:
         generator.init_random_weights()
-        print("[2/3] Generator initialized with random weights OK")
+        logger.info("[2/3] Generator initialized with random weights OK")
     else:
         generator.from_pretrained()
-        print("[2/3] Generator initialized from pretrained weights OK")
+        logger.info("[2/3] Generator initialized from pretrained weights OK")
 
     prompt = (
         "Tell me three jokes:\n\n"
@@ -72,15 +80,15 @@ def main():
         "Keep each joke under 15 words."
     )
 
-    print("[3/3] Running generate() with official README prompt...")
-    print("Prompt:", prompt)
-    print("Completion:")
+    logger.info("[3/3] Running generate() with official README prompt...")
+    logger.info("Prompt: %s", prompt)
+    logger.info("Completion:")
     result = generator.generate(prompt, print_log=True)
     # Qwen36Generator.generate returns a tuple: (completion_text, time_list, [], prompt_len)
     completion = result[0] if isinstance(result, tuple) else result
 
     assert completion and len(completion.strip()) > 0, "Empty completion"
-    print("\n=== Generator official-prompt smoke test PASSED ===")
+    logger.info("\n=== Generator official-prompt smoke test PASSED ===")
     return 0
 
 
@@ -88,5 +96,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        print(f"\n=== FAILED: {exc} ===", file=sys.stderr)
+        logger.exception("\n=== FAILED: %s ===", exc)
         raise

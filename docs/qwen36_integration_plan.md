@@ -79,7 +79,7 @@
 ```python
 vocab_size: int = 248320
 dim: int = 2048              # 隐藏层维度
-inter_dim: int = 512         # MoE / shared expert 中间层
+inter_dim: int = 512         # MoE / shared expert 中间层（两者均为 512）
 n_layers: int = 40           # 总层数
 
 # full_attention (GQA)
@@ -106,7 +106,7 @@ n_shared_experts: int = 1
 # 层结构 (由 text_config.layer_types 显式给出)
 n_delta_layers: int = 30      # linear_attention 层数
 n_gated_layers: int = 10      # full_attention 层数
-n_mtp_layers: int = 1        # checkpoint 含 1 层 MTP
+n_mtp_layers: int = 1        # checkpoint 中 text_config.mtp_num_hidden_layers=1；TileRT 首版推理时默认不启用
 
 # 上下文
 max_seq_len: int = 262144

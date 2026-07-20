@@ -1,5 +1,14 @@
+import logging
+
 from safetensors.torch import load_file
-import sys
+
+from tilert import logger
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
+)
+
 path = '/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model-00002-of-00026.safetensors'
 weights = load_file(path, device='cpu')
 keys = [
@@ -13,6 +22,6 @@ keys = [
 ]
 for k in keys:
     if k in weights:
-        print(k, tuple(weights[k].shape), weights[k].dtype, file=sys.stderr)
+        logger.info("%s %s %s", k, tuple(weights[k].shape), weights[k].dtype)
     else:
-        print(k, 'MISSING', file=sys.stderr)
+        logger.warning("%s MISSING", k)
