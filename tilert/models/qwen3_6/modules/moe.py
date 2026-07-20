@@ -115,7 +115,11 @@ class QwenMoeBlock(TileRTModule):
         up_gate_out, weights, indices = self.moe.exp_sel_up_gate_silu.golden_forward(
             norm_x, scores
         )
-        return self.moe.expert_down_allreduce.golden_forward(up_gate_out, indices, weights)
+        # Pass the post-norm hidden states so the shared-expert gate can be
+        # applied inside the down projection, matching HF's MoE MLP.
+        return self.moe.expert_down_allreduce.golden_forward(
+            up_gate_out, indices, weights, x_in=norm_x
+        )
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         self.moe.rmsnorm_expert_proj.init_tilert_weights(state_dict)

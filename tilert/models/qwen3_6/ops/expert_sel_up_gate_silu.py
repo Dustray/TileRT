@@ -829,15 +829,20 @@ class ExpertSelectUpGateSiLU(TileRTModule):
     def _ref_expert_select_qwen36(
         self, scores: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference routing for Qwen3.6 (softmax + top-k + route_scale)."""
+        """Reference routing for Qwen3.6 (matches HF Qwen3_5MoeTopKRouter).
+
+        HuggingFace applies float32 softmax over all experts, selects top-k
+        from the probability distribution, then normalizes the selected
+        weights by their sum.  No ``route_scale`` multiplication is applied.
+        """
         original_scores = scores
         if self.ref_bias is not None:
             scores = scores + self.ref_bias
-        scores = F.softmax(scores, dim=-1)
+        scores = F.softmax(scores, dim=-1, dtype=torch.float32)
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
         indices = indices.view(*original_scores.shape[:-1], self.n_activated_experts)
         weights = scores.gather(-1, indices)
-        weights *= self.route_scale
+        weights = weights / weights.sum(dim=-1, keepdim=True)
         return weights, indices
 
     def golden_forward(

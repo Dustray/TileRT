@@ -53,7 +53,7 @@ class ModelArgsQwen36:
     n_activated_experts: int = 8
     n_shared_experts: int = 1
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
-    route_scale: float = 2.5
+    route_scale: float = 1.0
 
     # Layer structure: exact heterogeneous pattern from text_config.layer_types
     layer_types: list[str] | None = None  # e.g. ["linear_attention", ...]

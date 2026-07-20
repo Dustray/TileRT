@@ -777,10 +777,35 @@ class QwenShowHandsLayer:
             qwen36_show_hands(token_id.cpu(), active_mtp)
         except (AttributeError, RuntimeError):
             # Backend kernels not available; use golden path.
-            return [
-                self._golden_forward_device(device_id, token_id, cur_pos)
-                for device_id in range(self.num_devices)
-            ]
+            # Run each device's golden forward in its own thread so that all
+            # devices are active concurrently, matching the performance baseline.
+            results: list[DeviceResult | None] = [None] * self.num_devices
+            exceptions: list[Exception | None] = [None] * self.num_devices
+            threads: list[threading.Thread] = []
+
+            def _runner(dev_id: int) -> None:
+                try:
+                    with torch.cuda.device(dev_id):
+                        results[dev_id] = self._golden_forward_device(
+                            dev_id, token_id, cur_pos
+                        )
+                except Exception as exc:  # pragma: no cover - surfaced after join
+                    exceptions[dev_id] = exc
+
+            for device_id in range(self.num_devices):
+                thread = threading.Thread(target=_runner, args=(device_id,))
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            for device_id, exc in enumerate(exceptions):
+                if exc is not None:
+                    raise RuntimeError(
+                        f"Golden forward failed on device {device_id}: {exc}"
+                    ) from exc
+
+            return results  # type: ignore[return-type]
 
         return [self._get_device_result(device_id) for device_id in range(self.num_devices)]
 

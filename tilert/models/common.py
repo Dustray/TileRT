@@ -129,10 +129,11 @@ class RMSNorm(nn.Module):
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, weight: torch.Tensor | None = None):
+    def __init__(self, dim: int, eps: float = 1e-6, weight: torch.Tensor | None = None, additive_weight: bool = True):
         super().__init__()
         self.dim = dim
         self.eps = eps
+        self.additive_weight = additive_weight
 
         if weight is None:
             self.weight = nn.Parameter(init_func(torch.empty(dim, dtype=torch.float32)))
@@ -151,14 +152,16 @@ class RMSNorm(nn.Module):
         Returns:
             torch.Tensor: Normalized tensor with the same shape as input.
         """
-        dtype = torch.bfloat16
+        dtype = x.dtype
         if residual is None:
             x = x.float()
             var_s = x.pow(2).mean(-1, keepdim=True)
             x = x * torch.rsqrt(var_s + self.eps)
-            return (self.weight * x).to(dtype)
+            norm_weight = (1.0 + self.weight.float()) if self.additive_weight else self.weight.float()
+            return (norm_weight * x).to(dtype)
 
         x = residual = x.float() + residual.float()
         var_s = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var_s + self.eps)
-        return (self.weight * x).to(dtype), residual.to(dtype)
+        norm_weight = (1.0 + self.weight.float()) if self.additive_weight else self.weight.float()
+        return (norm_weight * x).to(dtype), residual.to(dtype)

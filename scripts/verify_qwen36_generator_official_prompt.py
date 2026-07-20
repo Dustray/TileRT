@@ -23,7 +23,7 @@ import torch
 def main():
     torch.set_num_threads(64)
 
-    use_random_weights = True
+    use_random_weights = False
     weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
 
     # Sanity check for tokenizer files (copied by weight_converter now).

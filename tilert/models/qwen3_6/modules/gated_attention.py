@@ -9,6 +9,7 @@ from tilert.models.base import SerializableTileRTModule, TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
+from tilert.models.utils import apply_rotary_emb
 from tilert.models.qwen3_6.ops.gqa_attention import (
     GQAAttention as GQAAttentionOp,
     GQAAttentionAlgorithm,
@@ -94,7 +95,7 @@ class QwenAttentionRef(TileRTModule):
 
     @staticmethod
     def _rmsnorm_heads(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        """Apply RMSNorm along the head dimension.
+        """Apply RMSNorm along the head dimension (HF Qwen3.5-MoE style).
 
         Args:
             x: Tensor of shape (bsz, n_heads, seq_len, head_dim).
@@ -104,8 +105,8 @@ class QwenAttentionRef(TileRTModule):
         Returns:
             Normalized tensor with the same shape as ``x``.
         """
-        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
-        return x * weight / rms
+        rms = torch.sqrt(torch.mean(x.float() * x.float(), dim=-1, keepdim=True) + eps)
+        return ((1.0 + weight.float()) * x.float() / rms).to(x.dtype)
 
     def golden_forward(
         self,
@@ -125,26 +126,38 @@ class QwenAttentionRef(TileRTModule):
         assert self.v_proj_weight is not None
         assert self.o_proj_weight is not None
         bsz, seq_len, _ = x.shape
-        h = linear(x, self.q_proj_weight)
+
+        # Qwen3.5-MoE full attention doubles the q-projection output: the
+        # first half is the query, the second half is the per-head gate that
+        # modulates the attention output before o_proj.  Each head therefore
+        # has 2 * head_dim entries; the gate half is reduced to one scalar per
+        # head, mirroring HF's ``gate.reshape(..., num_heads)``.
+        q_gate = linear(x, self.q_proj_weight)
+        q, gate = torch.chunk(
+            q_gate.view(bsz, seq_len, self.n_heads, self.head_dim * 2), 2, dim=-1
+        )
+        gate = gate.mean(dim=-1).view(bsz, seq_len, self.n_heads)
+
         k = linear(x, self.k_proj_weight)
         v = linear(x, self.v_proj_weight)
 
-        q = h.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
+        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
 
         # Apply per-head RMSNorm to Q/K query/key projections when present.
         if self.q_norm_weight is not None:
-            q = self._rmsnorm_heads(q, self.q_norm_weight)
+            q = self._rmsnorm_heads(q.transpose(1, 2), self.q_norm_weight).transpose(1, 2)
         if self.k_norm_weight is not None:
-            k = self._rmsnorm_heads(k, self.k_norm_weight)
+            k = self._rmsnorm_heads(k.transpose(1, 2), self.k_norm_weight).transpose(1, 2)
 
         q_pe, q_no_pe = torch.split(q, [self.rope_dim, self.no_pe_dim], dim=-1)
         k_pe, k_no_pe = torch.split(k, [self.rope_dim, self.no_pe_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=False)
         k_pe = apply_rotary_emb(k_pe, freqs_cis, interleaved=False)
-        q = torch.cat([q_pe, q_no_pe], dim=-1)
-        k = torch.cat([k_pe, k_no_pe], dim=-1)
+        q = torch.cat([q_pe, q_no_pe], dim=-1).transpose(1, 2)
+        k = torch.cat([k_pe, k_no_pe], dim=-1).transpose(1, 2)
+        v = v.transpose(1, 2)
 
         k_cache[:bsz, start_pos : start_pos + seq_len] = k.transpose(1, 2)
         v_cache[:bsz, start_pos : start_pos + seq_len] = v.transpose(1, 2)
@@ -163,7 +176,12 @@ class QwenAttentionRef(TileRTModule):
             scores = scores + mask
         attn = F.softmax(scores, dim=-1)
         o = torch.matmul(attn, v_full)
-        o = o.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        o = o.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_heads, self.head_dim)
+
+        # Apply the per-head gate to the attention output.
+        o = o * torch.sigmoid(gate).unsqueeze(-1)
+        o = o.view(bsz, seq_len, -1)
+
         out = linear(o, self.o_proj_weight)
         return out, k_cache, v_cache
 

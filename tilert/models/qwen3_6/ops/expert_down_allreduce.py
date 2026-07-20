@@ -276,6 +276,9 @@ class ExpertDownAllReduceRefWeightsAlias:
     optional scales) under dot-weight keys.  We expose the canonical list here
     so that callers such as ``QwenMoeBlock.get_ref_weights_alias`` can discover
     these keys consistently with the rest of the Qwen3.6 ops.
+
+    The shared-expert gate weight is required so that ``golden_forward`` can
+    apply the same ``sigmoid(x @ gate.T)`` scaling as HuggingFace's MoE MLP.
     """
 
     key_prefix: str = "mlp"
@@ -286,6 +289,7 @@ class ExpertDownAllReduceRefWeightsAlias:
         return [
             f"{prefix}.shared_expert.down_proj.weight",
             f"{prefix}.experts.down_proj",
+            f"{prefix}.shared_expert_gate.weight",
             f"{prefix}.shared_expert.down_proj.weight_scale_inv",
             f"{prefix}.experts.down_proj.weight_scale_inv",
         ]
@@ -326,6 +330,7 @@ class ExpertDownAllReduce(TileRTModule):
         self.algorithm = algorithm
 
         self.ref_down: torch.Tensor | None = None
+        self.ref_shared_gate_weight: torch.Tensor | None = None
         self.tilert_weights: torch.Tensor | None = None
         self.tilert_scales: torch.Tensor | None = None
         self.hidden_out: torch.Tensor | None = None
@@ -491,6 +496,13 @@ class ExpertDownAllReduce(TileRTModule):
     ) -> None:
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
+        # Store the shared-expert gate weight for golden-forward scaling.  It is
+        # a small 1xdim tensor, so keep it on the target device directly.
+        shared_gate_key = f"{key_prefix}.shared_expert_gate.weight"
+        self.ref_shared_gate_weight = state_dict[shared_gate_key].to(
+            f"cuda:{device_id}"
+        ).to(torch.bfloat16)
+
         sharded_list = self.device_sharding(state_dict, key_prefix)
         # ``device_sharding`` returns (n_experts, num_devices, ...); select the
         # requested device across all experts.
@@ -550,6 +562,9 @@ class ExpertDownAllReduce(TileRTModule):
             )
             / (self.moe_inter_dim ** 0.5)
         ).to(torch.float8_e4m3fn)
+        shared_gate_weight = torch.randn(
+            1, self.dim, dtype=torch.bfloat16, device=dev
+        ) / (self.dim ** 0.5)
         dim_scale_dim = self.dim // self.block_size
         moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
         scale_dtype = torch.float32
@@ -566,7 +581,7 @@ class ExpertDownAllReduce(TileRTModule):
         state_dict = dict(
             zip(
                 self.ref_weights_alias(),
-                [shared_down, routed_down, shared_scale, routed_scale],
+                [shared_down, routed_down, shared_gate_weight, shared_scale, routed_scale],
             )
         )
         self.init_reference_weights(state_dict, "mlp", device_id)
@@ -586,6 +601,7 @@ class ExpertDownAllReduce(TileRTModule):
         vec_in: torch.Tensor,
         indices: torch.Tensor,
         scores: torch.Tensor,
+        x_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.ref_down is not None
         assert vec_in.dim() == 4 and vec_in.size(0) == 1
@@ -598,17 +614,27 @@ class ExpertDownAllReduce(TileRTModule):
         seq_len = vec_in.shape[1]
         hidden_out_list = []
         for s in range(seq_len):
-            hidden_out_w2_list = []
+            # Shared expert down projection.  The post-norm hidden states are
+            # also used to compute the shared-expert gate, matching HF's
+            # ``mlp.shared_expert_gate`` scaling applied after the down projection.
             hidden_out_w2_shared = vec_in[0, s, 0].float() @ self.ref_down[0].float().mT
-            hidden_out_w2_list.append(hidden_out_w2_shared)
+            if x_in is not None:
+                shared_gate = torch.sigmoid(
+                    x_in[0, s].float() @ self.ref_shared_gate_weight.float().mT
+                )
+                hidden_out_w2_shared = hidden_out_w2_shared * shared_gate
+
+            # Routed experts: accumulate in float32 to match HF's index_add_
+            # semantics (HF accumulates into a bf16 tensor, but float32 here
+            # reduces the numeric drift observed in parity checks).
+            hidden_out_w2_routed = torch.zeros(self.dim, dtype=torch.float32, device=vec_in.device)
             ref_down_sel = self.ref_down[1:][indices[0, s]]
             for i in range(self.n_activated_experts):
                 hidden_out_w2_sel = vec_in[0, s, i + 1].float() @ ref_down_sel[i].float().mT
-                hidden_out_w2_list.append(hidden_out_w2_sel * scores[0, s, i])
-            hidden_out_w2 = torch.stack(hidden_out_w2_list, dim=0).to(torch.bfloat16)
-            hidden_out_w2 = torch.sum(hidden_out_w2, dim=0)
+                hidden_out_w2_routed += hidden_out_w2_sel * scores[0, s, i]
 
-            hidden_out_list.append(hidden_out_w2)
+            hidden_out_w2 = hidden_out_w2_shared + hidden_out_w2_routed
+            hidden_out_list.append(hidden_out_w2.to(torch.bfloat16))
         hidden_out = torch.stack(hidden_out_list, dim=0)
         return hidden_out[None, ...]
 

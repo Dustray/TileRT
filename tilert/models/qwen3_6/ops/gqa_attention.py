@@ -363,12 +363,14 @@ class GQAAttention(TileRTModule):
         k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim)
         v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim)
 
-        # Apply per-head RMSNorm on q/k.  q_norm/k_norm weights have shape
-        # (head_dim,) and are broadcast across all heads.
+        # Apply per-head RMSNorm on q/k (HF Qwen3.5-MoE style).  q_norm/k_norm
+        # weights have shape (head_dim,) and are broadcast across all heads.
         q_norm_w = self.q_norm_weights.view(1, 1, 1, self.head_dim)
         k_norm_w = self.k_norm_weights.view(1, 1, 1, self.v_head_dim)
-        q = q / (q.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * q_norm_w
-        k = k / (k.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * k_norm_w
+        q_rms = torch.sqrt(torch.mean(q.float() * q.float(), dim=-1, keepdim=True) + 1e-6)
+        q = ((1.0 + q_norm_w.float()) * q.float() / q_rms).to(q.dtype)
+        k_rms = torch.sqrt(torch.mean(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+        k = ((1.0 + k_norm_w.float()) * k.float() / k_rms).to(k.dtype)
 
         rope_dim = self.rope_dim
         no_pe_dim = self.head_dim - rope_dim
