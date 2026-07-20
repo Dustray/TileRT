@@ -6,6 +6,7 @@ from enum import Enum
 import torch
 from torch import nn
 
+from tilert import logger
 from tilert.models.base import TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
@@ -109,6 +110,7 @@ class RMSNormExpertProj(TileRTModule):
         self, state_dict: dict[str, torch.Tensor], device_id: int | None = None
     ) -> None:
         del device_id
+        logger.debug(f"{self.op_name}: init_reference_weights")
         self.ref_rmsnorm = RMSNorm(self.dim, self.eps)
         self.ref_rmsnorm.weight.data = state_dict[
             self.ref_weights_alias.post_attention_layernorm_weight
@@ -117,6 +119,7 @@ class RMSNormExpertProj(TileRTModule):
         self.is_ref_weights_init = True
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_tilert_weights")
         self.tilert_proj_weight = (
             state_dict[self.tilert_weights_alias.exp_proj_weights].detach().clone()
         )

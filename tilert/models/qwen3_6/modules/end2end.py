@@ -181,9 +181,10 @@ class QwenShowHandsLayer:
         use_topp: bool = False,
     ) -> None:
         validate_temp_vars_layout()
-        print(f"Model args: {model_args.arch_name}")
+        logger.info(f"QwenShowHandsLayer initializing with arch={model_args.arch_name}")
+        logger.debug(f"Model args dump for {model_args.arch_name}:")
         for k_arg, v_arg in model_args.__dict__.items():
-            print(f" - {k_arg}: {v_arg}")
+            logger.debug(f" - {k_arg}: {v_arg}")
 
         self.model_args = model_args
         assert self.model_args.arch_name == "qwen3_6"
@@ -202,6 +203,13 @@ class QwenShowHandsLayer:
         self.top_p = top_p
         self.top_k = top_k
         self.use_topp = use_topp
+
+        logger.info(
+            f"QwenShowHandsLayer configured: model_path={model_path}, "
+            f"num_devices={self.num_devices}, max_seq_len={self.forward_max_seq_len}, "
+            f"with_mtp={with_mtp}, temperature={temperature}, top_p={top_p}, "
+            f"top_k={top_k}, use_topp={use_topp}"
+        )
 
     def _gen_freqs_cis(self) -> torch.Tensor:
         freqs_cis = precompute_freqs_cis(self.model_args)
@@ -223,7 +231,9 @@ class QwenShowHandsLayer:
         as ``model.embed_tokens.weight`` are replicated on every device.
         """
         index_file = "model.safetensors.index.json"
-        with open(os.path.join(model_path, index_file), encoding="utf-8") as f:
+        index_path = os.path.join(model_path, index_file)
+        logger.info(f"Loading weight index for device {device_id}: {index_path}")
+        with open(index_path, encoding="utf-8") as f:
             weights_index = json.load(f)
         weight_file_map = weights_index["weight_map"]
 
@@ -232,8 +242,16 @@ class QwenShowHandsLayer:
 
         if skip_keys:
             weights_list = [k for k in weights_list if k not in skip_keys]
+            logger.debug(
+                f"Device {device_id}: skipping {len(skip_keys)} keys, "
+                f"remaining {len(weights_list)} keys to load"
+            )
 
         target_files = {weight_file_map[k] for k in weights_list if k in weight_file_map}
+        logger.info(
+            f"Device {device_id}: {len(target_files)} safetensor file(s) to load, "
+            f"{len(weights_list)} weight key(s) requested"
+        )
 
         state_dicts: dict[str, torch.Tensor] = {}
         weights_set = set(weights_list)
@@ -255,6 +273,10 @@ class QwenShowHandsLayer:
                 del state_dict
                 torch.cuda.empty_cache()
 
+        logger.info(
+            f"Device {device_id}: loaded {len(state_dicts)} tensors, "
+            f"generating freqs_cis on cuda:{device_id}"
+        )
         state_dicts["freqs_cis"] = self._gen_freqs_cis().to(device_id)
         return state_dicts
 
@@ -269,9 +291,10 @@ class QwenShowHandsLayer:
         new_config = (temperature, top_p, top_k, use_topp)
         current_config = (self.temperature, self.top_p, self.top_k, self.use_topp)
         if new_config == current_config:
+            logger.debug("Sampling config unchanged, skipping CUDA graph recapture")
             return
 
-        print(
+        logger.info(
             f"Recapturing CUDA graphs: "
             f"temperature={temperature}, top_p={top_p}, top_k={top_k}, use_topp={use_topp}"
         )
@@ -653,7 +676,9 @@ class QwenShowHandsLayer:
         """Load the model weights from the given path."""
         if not os.path.exists(model_path):
             raise ValueError(f"Model weights directory {model_path} does not exist")
+        logger.info(f"QwenShowHandsLayer.from_pretrained: {model_path}")
         self._init_weights(model_path)
+        logger.info("QwenShowHandsLayer.from_pretrained completed")
 
     def from_pretrained_with_cache(
         self,
@@ -664,15 +689,19 @@ class QwenShowHandsLayer:
         """Load weights reusing cached MOE/MLP ops."""
         if not os.path.exists(model_path):
             raise ValueError(f"Model weights directory {model_path} does not exist")
+        logger.info(f"QwenShowHandsLayer.from_pretrained_with_cache: {model_path}")
         self._init_weights(
             model_path,
             cached_ffn_ops_per_device=cached_ffn_ops_per_device,
             skip_keys_per_device=skip_keys_per_device,
         )
+        logger.info("QwenShowHandsLayer.from_pretrained_with_cache completed")
 
     def init_random_weights(self) -> None:
         """Generate random weights for smoke testing."""
+        logger.info("QwenShowHandsLayer.init_random_weights")
         self._init_weights(None)
+        logger.info("QwenShowHandsLayer.init_random_weights completed")
 
     def _golden_forward_device(
         self,

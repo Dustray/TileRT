@@ -5,6 +5,7 @@ from enum import Enum
 
 import torch
 
+from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
@@ -489,6 +490,7 @@ class ExpertDownAllReduce(TileRTModule):
         key_prefix: str | None = None,
         device_id: int = 0,
     ) -> None:
+        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
         sharded_list = self.device_sharding(state_dict, key_prefix)
@@ -508,6 +510,7 @@ class ExpertDownAllReduce(TileRTModule):
         return list(self.tilert_weights_alias())
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         weights_list = [state_dict[alias] for alias in self.tensor_alias]
         # Real Qwen3.6 converted checkpoints store down weights in bf16.
@@ -532,6 +535,7 @@ class ExpertDownAllReduce(TileRTModule):
             device_id = self.device_id
         if device_id is None:
             device_id = 0
+        logger.debug(f"{self.op_name}: init_random_weights on cuda:{device_id}")
         dev = f"cuda:{device_id}"
         # Scale by 1/sqrt(fan_in) for stable 40-layer reference numerics.
         shared_down = (

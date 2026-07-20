@@ -9,6 +9,7 @@ from tilert.models.base import TileRTModule
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.utils import apply_rotary_emb
 from tilert.utils import get_profile_log_tensor
+from tilert import logger
 
 __all__ = [
     "qkv_rope",
@@ -119,15 +120,15 @@ class QKVRoPE(TileRTModule):
         return {}
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
         del state_dict
-        pass
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         del state_dict
-        pass
 
     def init_random_weights(self) -> None:
-        pass
+        logger.debug(f"{self.op_name}: init_random_weights on device {self.device_id}")
 
     def init_tilert_vars(
         self, batch_size: int, seq_len: int, device: str = "cuda"

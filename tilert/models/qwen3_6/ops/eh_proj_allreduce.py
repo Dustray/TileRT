@@ -8,6 +8,7 @@ import torch
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
+from tilert import logger
 
 __all__ = [
     "eh_proj_allreduce",
@@ -195,6 +196,7 @@ class EHProjAllReduce(TileRTModule):
             state_dict: State dictionary.
             device_id: Device ID.
         """
+        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         eh_proj_weight = sharded_list[0][device_id]
@@ -208,6 +210,7 @@ class EHProjAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary.
         """
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None
         (self.tilert_proj,) = EHProjAllReduceWeightsConverter(
             self.model_args, self.num_devices
@@ -233,6 +236,7 @@ class EHProjAllReduce(TileRTModule):
         """Initialize the random weights."""
         if device_id is None:
             device_id = self.device_id
+        logger.debug(f"{self.op_name}: init_random_weights on device {device_id}")
         proj_weights = torch.randn(
             self.dim, self.dim * 2, dtype=torch.bfloat16, device=f"cuda:{device_id}"
         )

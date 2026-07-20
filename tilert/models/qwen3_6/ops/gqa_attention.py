@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
@@ -238,6 +239,7 @@ class GQAAttention(TileRTModule):
         }
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
         sharded = self.device_sharding(state_dict)
         did = self.device_id
         self.qkv_proj_weights = sharded[self.tilert_weights_alias.qkv_proj_weights][did]
@@ -246,6 +248,7 @@ class GQAAttention(TileRTModule):
         self.k_norm_weights = sharded[self.tilert_weights_alias.k_norm_weights][did]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         # Prefer the six-tensor dot-weight checkpoint layout when present.
         ref_alias = self.ref_weights_alias()
         if all(alias in state_dict for alias in ref_alias):
@@ -274,6 +277,7 @@ class GQAAttention(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
+        logger.debug(f"{self.op_name}: init_random_weights on {device}")
         # Qwen3.5-MoE full attention doubles the q-projection for the gate.
         qkv_out = (
             self.n_heads * self.head_dim * 2

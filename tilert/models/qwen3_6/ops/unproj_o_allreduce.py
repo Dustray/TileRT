@@ -10,6 +10,7 @@ from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
+from tilert import logger
 
 __all__ = [
     "unproj_o_allreduce",
@@ -421,6 +422,7 @@ class UnProjOAllReduce(TileRTModule):
             device_id: Device ID for this shard; defaults to self.device_id.
         """
         did = self.device_id if device_id is None else device_id
+        logger.debug(f"{self.op_name}: init_reference_weights on device {did}")
         sharded = self.device_sharding(state_dict)
         weights = sharded[self.tilert_weights_alias.unproj_weights][did]
         scales = sharded[self.tilert_weights_alias.unproj_scales][did]
@@ -433,6 +435,7 @@ class UnProjOAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary keyed by tilert weight alias (per-device).
         """
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         tilert_alias = list(self.tilert_weights_alias())
         ref_alias = self.ref_weights_alias
@@ -501,6 +504,7 @@ class UnProjOAllReduce(TileRTModule):
 
     def init_random_weights(self) -> None:
         """Initialize the random weights."""
+        logger.debug(f"{self.op_name}: init_random_weights on device {self.device_id}")
         unproj_o_weights = torch.randn(
             self.dim,
             self.n_heads * self.head_dim,

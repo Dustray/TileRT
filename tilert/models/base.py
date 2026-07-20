@@ -318,6 +318,10 @@ class SerializableTileRTModule(TileRTModule):
         return tensor_alias
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.info(
+            f"{type(self).__name__}.init_tilert_weights: "
+            f"{len(self.exec_seq)} sub-op(s), state_dict has {len(state_dict)} entries"
+        )
         for op, prefix, suffix, retain_weights in zip(
             self.exec_seq, self.prefix_seq, self.suffix_seq, self.retain_weights_seq
         ):
@@ -325,6 +329,10 @@ class SerializableTileRTModule(TileRTModule):
                 logger.debug(f"Skipping init_tilert_weights for {op.op_name} (already initialized)")
                 continue
 
+            logger.debug(
+                f"Initializing tilert weights for {op.op_name} "
+                f"(prefix={prefix!r}, suffix={suffix!r})"
+            )
             keys_to_remove = set()
             op_state_dict = {}
             for op_key in op.get_tilert_weights_alias():
@@ -366,10 +374,15 @@ class SerializableTileRTModule(TileRTModule):
                     continue
 
             op.init_tilert_weights(op_state_dict)
+            logger.debug(
+                f"Initialized tilert weights for {op.op_name}: "
+                f"{len(op_state_dict)} tensor(s)"
+            )
 
             if self.remove_selected and not retain_weights:
                 for k in keys_to_remove:
                     del state_dict[k]
+        logger.info(f"{type(self).__name__}.init_tilert_weights completed")
 
     @staticmethod
     def _alias_to_dot_weight_key(
@@ -431,18 +444,33 @@ class SerializableTileRTModule(TileRTModule):
         return full
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.info(
+            f"{type(self).__name__}.init_reference_weights: "
+            f"{len(self.exec_seq)} sub-op(s), state_dict has {len(state_dict)} entries"
+        )
         for op in self.exec_seq:
+            logger.debug(f"Initializing reference weights for {op.op_name}")
             op.init_reference_weights(state_dict)
+        logger.info(f"{type(self).__name__}.init_reference_weights completed")
 
     def init_random_weights(self) -> None:
+        logger.info(
+            f"{type(self).__name__}.init_random_weights: "
+            f"{len(self.exec_seq)} sub-op(s)"
+        )
         self._random_init_marker = True
         for op in self.exec_seq:
+            logger.debug(f"Random-initializing {op.op_name}")
             op.init_random_weights()
+        logger.info(f"{type(self).__name__}.init_random_weights completed")
 
     def _is_random_init(self) -> bool:
         return getattr(self, "_random_init_marker", False)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
+        logger.debug(
+            f"{type(self).__name__}.init_tilert_vars: batch_size={batch_size}, seq_len={seq_len}"
+        )
         for op in self.exec_seq:
             op.init_tilert_vars(batch_size, seq_len)
 

@@ -14,6 +14,7 @@ from tilert.models.qwen3_6.ops.expert_sel_up_gate_silu import (
     ExpertSelectUpGateSiLUWeightsConverter,
 )
 from tilert.utils import get_profile_log_tensor
+from tilert import logger
 
 __all__ = [
     "RMSNormUpGateSiLUAlgorithm",
@@ -223,6 +224,7 @@ class RMSNormUpGateSiLU(TileRTModule):
             state_dict: State dictionary.
             device_id: Device ID.
         """
+        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         gamma = sharded_list[0][device_id]
@@ -249,6 +251,7 @@ class RMSNormUpGateSiLU(TileRTModule):
         Args:
             state_dict: State dictionary.
         """
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         self.tilert_norm_gamma, self.tilert_weights = RMSNormUpGateSiLUWeightsConverter(
             self.model_args, self.num_devices
@@ -285,6 +288,7 @@ class RMSNormUpGateSiLU(TileRTModule):
         """
         if dev_id is None:
             dev_id = self.device_id
+        logger.debug(f"{self.op_name}: init_random_weights on device {dev_id}")
         gamma = torch.randn(self.dim, dtype=torch.float32, device=f"cuda:{dev_id}")
         gate_weights = torch.randn(
             self.inter_dim, self.dim, dtype=torch.bfloat16, device=f"cuda:{dev_id}"

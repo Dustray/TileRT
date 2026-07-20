@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.common import RMSNorm, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
@@ -308,6 +309,7 @@ class DeltaNetOp(TileRTModule):
         return slices
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
         sharded = self.device_sharding(state_dict)
         did = self.device_id
         self.in_proj_qkv_weights = sharded[self.tilert_weights_alias.in_proj_qkv_weights][did]
@@ -321,6 +323,7 @@ class DeltaNetOp(TileRTModule):
         self.out_proj_weights = sharded[self.tilert_weights_alias.out_proj_weights][did]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
         converter = DeltaNetWeightsConverter(self.model_args, self.num_devices)
         (
@@ -357,6 +360,7 @@ class DeltaNetOp(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
+        logger.debug(f"{self.op_name}: init_random_weights on {device}")
         args = self.model_args
         # Scale random weights by 1/sqrt(fan_in) so each layer preserves the
         # input variance.  This makes the 40-layer reference forward numerically

@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from tilert import logger
 from tilert.models.base import SerializableTileRTModule, TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
@@ -242,11 +243,13 @@ class GatedAttention(SerializableTileRTModule):
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Load weights and also set the RMSNorm module weights from the checkpoint."""
+        logger.debug(f"{self.op_name}: loading tilert weights + layernorms")
         super().init_tilert_weights(state_dict)
         self._load_layernorm_weights(state_dict)
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Load reference weights and also set the RMSNorm module weights."""
+        logger.debug(f"{self.op_name}: loading reference weights + layernorms")
         super().init_reference_weights(state_dict)
         self._load_layernorm_weights(state_dict)
 

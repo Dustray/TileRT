@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from tilert import logger
 from tilert.models.base import SerializableTileRTModule
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.gated_attention import GatedAttention
@@ -70,6 +71,17 @@ class QwenTransformerStack(SerializableTileRTModule):
             self.layer_types.extend([0, 0, 0, 1])
         self.layer_types = self.layer_types[: model_args.n_layers]
 
+        logger.info(
+            f"QwenTransformerStack: building {len(self.layer_types)} layers on "
+            f"cuda:{device_id} (num_devices={num_devices}), "
+            f"cached_ffn_ops={cached_ffn_ops is not None}"
+        )
+        delta_count = sum(1 for t in self.layer_types if t == 0)
+        gqa_count = len(self.layer_types) - delta_count
+        logger.info(
+            f"QwenTransformerStack: {delta_count} DeltaNet + {gqa_count} GatedAttention layers"
+        )
+
         for layer_idx, layer_type in enumerate(self.layer_types):
             ffn_op = cached_ffn_ops[layer_idx] if cached_ffn_ops else None
             if layer_type == 0:
@@ -86,6 +98,11 @@ class QwenTransformerStack(SerializableTileRTModule):
                     num_devices=num_devices,
                 )
             self.register_op(block, prefix=f"layer_{layer_idx}_", suffix=f"_dev_{device_id}")
+            logger.debug(
+                f"Registered layer {layer_idx}: "
+                f"{'DeltaNet' if layer_type == 0 else 'GatedAttention'}"
+            )
+        logger.info("QwenTransformerStack construction completed")
 
     def _block_forward(
         self,

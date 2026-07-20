@@ -12,6 +12,7 @@ from tilert.models.qwen3_6.ops.expert_down_allreduce import (
     ExpertDownAllReduceWeightsConverter,
 )
 from tilert.utils import get_profile_log_tensor
+from tilert import logger
 
 __all__ = [
     "down_allreduce",
@@ -223,6 +224,7 @@ class DownAllReduce(TileRTModule):
             state_dict: State dictionary.
             device_id: Device ID.
         """
+        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         down_weights = sharded_list[0][device_id]
@@ -241,6 +243,7 @@ class DownAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary.
         """
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         self.tilert_weights, self.tilert_scales = DownAllReduceWeightsConverter(
             self.model_args, self.num_devices
@@ -266,6 +269,7 @@ class DownAllReduce(TileRTModule):
         """Initialize the random weights."""
         if device_id is None:
             device_id = self.device_id
+        logger.debug(f"{self.op_name}: init_random_weights on device {device_id}")
         scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
         down_weights = torch.randn(
             self.dim, self.inter_dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"

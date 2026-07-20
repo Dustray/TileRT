@@ -5,6 +5,7 @@ from enum import Enum
 
 import torch
 
+from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
@@ -193,6 +194,7 @@ class RMSNormHeadProj(TileRTModule):
             state_dict: State dictionary.
             device_id: Device ID.
         """
+        logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
         sharded_list = self.device_sharding(state_dict)
 
         gamma, head_proj = sharded_list[0][self.device_id], sharded_list[1][self.device_id]
@@ -206,6 +208,7 @@ class RMSNormHeadProj(TileRTModule):
         Args:
             state_dict: State dictionary.
         """
+        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None
         self.tilert_rmsnorm_gamma, self.tilert_head_proj = RMSNormHeadProjWeightsConverter(
             self.model_args, self.num_devices
@@ -219,6 +222,10 @@ class RMSNormHeadProj(TileRTModule):
             batch_size: Batch size.
             seq_len: Sequence length.
         """
+        logger.debug(
+            f"{self.op_name}: init_tilert_vars batch_size={batch_size}, "
+            f"seq_len={seq_len} on cuda:{self.device_id}"
+        )
         self.hidden_rmsnorm_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -236,6 +243,7 @@ class RMSNormHeadProj(TileRTModule):
         """Initialize the random weights."""
         if device_id is None:
             device_id = self.device_id
+        logger.debug(f"{self.op_name}: init_random_weights on cuda:{device_id}")
         rmsnorm_gamma = torch.randn(self.dim, dtype=torch.float32, device=f"cuda:{device_id}")
         head_proj = torch.randn(
             self.logits_dim, self.dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"

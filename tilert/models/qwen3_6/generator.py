@@ -95,6 +95,10 @@ class Qwen36Generator:
 
         self.default_device = torch.device("cuda:0")
 
+        logger.info(
+            f"Constructing QwenShowHandsLayer: model_path={self.model_weights_dir}, "
+            f"with_mtp={with_mtp}, num_devices inferred from cuda count"
+        )
         self.decode_layer = QwenShowHandsLayer(
             model_args=self.config,
             model_path=self.model_weights_dir,
@@ -108,7 +112,8 @@ class Qwen36Generator:
 
         logger.info(
             f"Qwen36Generator initialized: max_new_tokens={max_new_tokens}, "
-            f"temperature={temperature}, with_mtp={with_mtp}"
+            f"temperature={temperature}, with_mtp={with_mtp}, "
+            f"tokenizer_dir={self.tokenizer_dir}"
         )
 
     def init(self) -> None:
@@ -124,12 +129,15 @@ class Qwen36Generator:
 
     def init_random_weights(self) -> None:
         """Initialize weights randomly (for testing)."""
+        logger.info("Initializing random weights for Qwen36Generator")
         self.decode_layer.init_random_weights()
+        logger.info("Random weights initialization completed")
 
     def from_pretrained(self) -> None:
         """Load the model weights from the given path."""
         logger.info(f"Loading weights from: {self.model_weights_dir}")
         self.decode_layer.from_pretrained(self.model_weights_dir)
+        logger.info(f"Finished loading weights from: {self.model_weights_dir}")
 
     def extract_ffn_cache(self) -> tuple[dict[int, list], dict[int, set[str]]]:
         """Extract MOE/MLP op objects and skip keys from current loaded weights.
@@ -155,9 +163,13 @@ class Qwen36Generator:
         skip_keys_per_device: dict[int, set[str]],
     ) -> None:
         """Load weights reusing cached MOE/MLP ops."""
+        logger.info(
+            f"Loading weights with cached FFN ops from: {self.model_weights_dir}"
+        )
         self.decode_layer.from_pretrained_with_cache(
             self.model_weights_dir, cached_ffn_ops_per_device, skip_keys_per_device
         )
+        logger.info("Finished loading weights with cached FFN ops")
 
     def update_sampling_params(
         self,

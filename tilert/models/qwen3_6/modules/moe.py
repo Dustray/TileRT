@@ -2,6 +2,7 @@
 
 import torch
 
+from tilert import logger
 from tilert.models.base import TileRTModule
 from tilert.models.common import init_func
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
@@ -97,6 +98,7 @@ class QwenMoeBlock(TileRTModule):
 
     def init_random_weights(self, device: str | None = None) -> None:
         """Lazy initialize random weights for sanity testing."""
+        logger.debug(f"{self.op_name}: init_random_weights on {device}")
         if device is None:
             device = f"cuda:{self.device_id}" if torch.cuda.is_available() else "cpu"
         if isinstance(device, str) and device.startswith("cuda:"):
@@ -118,12 +120,15 @@ class QwenMoeBlock(TileRTModule):
         return self.moe.expert_down_allreduce.golden_forward(up_gate_out, indices, weights)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_tilert_weights")
         self.moe.rmsnorm_expert_proj.init_tilert_weights(state_dict)
         self.moe.exp_sel_up_gate_silu.init_tilert_weights(state_dict)
         self.moe.expert_down_allreduce.init_tilert_weights(state_dict)
         self.is_tilert_weights_init = True
+        logger.debug(f"{self.op_name}: tilert weights initialized")
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.debug(f"{self.op_name}: init_reference_weights")
         self.moe.rmsnorm_expert_proj.init_reference_weights(state_dict)
         self.moe.exp_sel_up_gate_silu.init_reference_weights(state_dict)
         self.moe.expert_down_allreduce.init_reference_weights(state_dict)
