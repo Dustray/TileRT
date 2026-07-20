@@ -951,3 +951,16 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 | P2 | 统一 `QwenMoe` / `QwenMoeBlock` 基类为 `SerializableTileRTModule` |
 | P3 | 长序列 prefill 与 KV cache 复用验证 |
 | P3 | top-p/top-k 采样在 golden 路径中完整实现 |
+
+### 13.8 新增 README 官方示例脚本（补充记录）
+
+在 `scripts/verify_qwen36_generator_official_prompt.py` 中实现了一个与 README 官方生成示例风格一致的验证脚本：
+- 使用真实转换后的 TileRT weights（或随机权重）构造 `Qwen36Generator`。
+- 传入自然语言 prompt：`"Tell me three jokes..."`。
+- 调用 `generator.generate(prompt, print_log=True)`，断言返回的 completion 非空。
+
+运行时发现并修复了两个生成器兼容性问题：
+1. **tokenizer `apply_chat_template` 返回 `BatchEncoding`**：Qwen3.6 tokenizer 返回的是 `transformers.BatchEncoding`（类似 dict），而不是普通 list。`generator.py` 中新增 `hasattr(chat_output, "input_ids")` 分支，统一取 `input_ids` 作为 token list。
+2. **生成返回值是 tuple**：`generate()` 返回 `(completion_text, time_list, [], prompt_len)`，脚本中通过 `result[0] if isinstance(result, tuple) else result` 取文本。
+
+随机权重下脚本通过：输出为无意义 token（随机权重未训练，符合预期），但生成 pipeline 完整跑通，可作为 CI smoke test。真实权重下只需把 `use_random_weights = False` 即可验证实际生成质量。
