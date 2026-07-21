@@ -228,17 +228,31 @@ def precompute_mrope_embed(
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos(), emb.sin()
 
-    inv_freq = _mrope_inv_freq(partial_rotary_factor, head_dim, base)
-    t_index = torch.arange(seqlen, dtype=torch.float32, device=inv_freq.device)
-    # Standard 1D layout for each T/H/W grid.
-    freqs_1d = torch.outer(t_index, inv_freq)  # (seq_len, head_dim//2)
-    # Expand to 3 grids; for text generation T/H/W are identical.
-    freqs_3d = freqs_1d[None, None, :, :].expand(3, 1, seqlen, -1)
-    # Apply interleaved M-RoPE.
-    freqs_mrope = _apply_interleaved_mrope(freqs_3d, list(mrope_section))  # (1, seq, head_dim//2)
-    freqs_mrope = freqs_mrope.squeeze(0)  # (seq, head_dim//2)
-    emb = torch.cat([freqs_mrope, freqs_mrope], dim=-1)  # (seq, rope_dim)
-    return emb.cos(), emb.sin()
+    # Compute M-RoPE tables entirely in numpy to avoid any DCU/HIP tensor
+    # operations that can segfault inside a cuda device context.
+    import numpy as np
+
+    dim = int(head_dim * partial_rotary_factor)
+    if dim % 2 != 0:
+        dim = (dim // 2) * 2
+    inv_freq = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+    t_index = np.arange(seqlen, dtype=np.float32)
+    freqs_1d = np.outer(t_index, inv_freq).astype(np.float32)  # (seq_len, dim//2)
+
+    # Replicate to 3 T/H/W grids and apply interleaved M-RoPE in numpy.
+    freqs_3d = np.tile(freqs_1d[np.newaxis, np.newaxis, :, :], (3, 1, 1, 1))
+    freqs_t = freqs_3d[0].copy()
+    section = list(mrope_section)
+    for dim_idx, offset in enumerate((1, 2), start=1):  # H, W
+        length = section[dim_idx] * 3
+        idx = slice(offset, length, 3)
+        freqs_t[..., idx] = freqs_3d[dim_idx, ..., idx]
+    freqs_mrope = freqs_t.squeeze(0)  # (seq_len, dim//2)
+
+    emb = np.concatenate([freqs_mrope, freqs_mrope], axis=-1).astype(np.float32)
+    cos = torch.from_numpy(np.cos(emb).copy())
+    sin = torch.from_numpy(np.sin(emb).copy())
+    return cos.contiguous(), sin.contiguous()
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:

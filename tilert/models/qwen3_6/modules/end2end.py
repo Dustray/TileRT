@@ -189,15 +189,21 @@ class QwenShowHandsLayer:
         self.model_args = model_args
         assert self.model_args.arch_name == "qwen3_6"
 
-        self.num_devices = 8
+        # Respect CUDA_VISIBLE_DEVICES: only use GPUs visible to this process.
+        self.num_devices = torch.cuda.device_count()
+        if self.num_devices == 0:
+            raise RuntimeError("No CUDA/DCU devices available")
         self.forward_max_seq_len = model_args.max_seq_len
 
         self.model_path = model_path
         self.with_weight_conversion = with_weight_conversion
         self.with_mtp = with_mtp
 
-        self.multi_devices_results: list[DeviceResult | None] = [None] * torch.cuda.device_count()
-        self._stack_objects: list[QwenTransformerStack | None] = [None] * torch.cuda.device_count()
+        self.multi_devices_results: list[DeviceResult | None] = [None] * self.num_devices
+        self._stack_objects: list[QwenTransformerStack | None] = [None] * self.num_devices
+        # Persistent KV / recurrent caches for the golden forward path.
+        # Re-initialised on reset_sequence() and lazily created on first forward.
+        self._golden_caches: list[dict[str, Any] | None] = [None] * self.num_devices
 
         self.temperature = temperature
         self.top_p = top_p
@@ -646,19 +652,30 @@ class QwenShowHandsLayer:
 
         threads: list[threading.Thread] = []
         exceptions: list[Exception | None] = [None] * self.num_devices
-        for device_id in range(self.num_devices):
-
-            def _runner(dev_id: int) -> None:
+        # NOTE: DCU backend is unstable when multiple devices initialize weights
+        # concurrently (segmentation faults inside torch.cuda / weight dequant).
+        # Serialize device initialization for Qwen3.6 to work around this.
+        if True:
+            for device_id in range(self.num_devices):
                 try:
-                    __load_weights(dev_id, model_path)
-                except Exception as exc:  # pragma: no cover - surfaced after join
-                    exceptions[dev_id] = exc
+                    __load_weights(device_id, model_path)
+                except Exception as exc:  # pragma: no cover - surfaced after loop
+                    exceptions[device_id] = exc
+                    logger.error(f"Failed to initialize device {device_id}: {exc}")
+        else:
+            for device_id in range(self.num_devices):
 
-            thread = threading.Thread(target=_runner, args=(device_id,))
-            threads.append(thread)
-            thread.start()
-        for thread in threads:
-            thread.join()
+                def _runner(dev_id: int) -> None:
+                    try:
+                        __load_weights(dev_id, model_path)
+                    except Exception as exc:  # pragma: no cover - surfaced after join
+                        exceptions[dev_id] = exc
+
+                thread = threading.Thread(target=_runner, args=(device_id,))
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
         for device_id, exc in enumerate(exceptions):
             if exc is not None:
                 raise RuntimeError(f"Failed to initialize device {device_id}: {exc}") from exc
@@ -757,19 +774,45 @@ class QwenShowHandsLayer:
         # 2. Transformer stack (DeltaNet + Gated Attention layers).
         # freqs_cos/sin_param have shape (max_seq_len, rope_dim).  Pack them as a
         # tuple for the M-RoPE path.
-        h, caches = stack.golden_forward(x, cur_pos, (freqs_cos_param, freqs_sin_param))
+        # IMPORTANT: pass the persistent caches so KV cache and DeltaNet
+        # recurrent state survive across decode steps.
+        if self._golden_caches[device_id] is None:
+            self._golden_caches[device_id] = stack._init_layer_caches((freqs_cos_param, freqs_sin_param))
+        h, self._golden_caches[device_id] = stack.golden_forward(
+            x, cur_pos, (freqs_cos_param, freqs_sin_param), self._golden_caches[device_id]
+        )
 
         # 3. Final RMSNorm + head projection.
         # Params are TileRT-sharded; head projection weight is split across
         # devices as (logits_dim/num_devices, dim).  The reference path needs
-        # the full matrix on every device, so all-gather it here.
+        # the full matrix on every device.  If torch.distributed is available
+        # and initialized we all-gather; otherwise fall back to a local copy
+        # (useful for single-device smoke tests and debugging).
         local_head = params[stack_weight_count + 1]
-        if local_head.dim() == 2 and local_head.size(0) * self.num_devices == self.model_args.vocab_size:
-            head_list = [torch.empty_like(local_head) for _ in range(self.num_devices)]
-            torch.distributed.all_gather(head_list, local_head)
-            full_head = torch.cat(head_list, dim=0)
-        else:
+        full_head: torch.Tensor
+        if (
+            local_head.dim() == 2
+            and local_head.size(0) * self.num_devices == self.model_args.vocab_size
+        ):
             full_head = local_head
+            if torch.distributed.is_initialized():
+                head_list = [torch.empty_like(local_head) for _ in range(self.num_devices)]
+                torch.distributed.all_gather(head_list, local_head)
+                full_head = torch.cat(head_list, dim=0)
+        else:
+            # Converted checkpoint stores the head projection in the TileRT
+            # native block layout (logits_shard/16, 16, 1024).  RMSNormHeadProj
+            # already knows how to consume this layout, but for the reference
+            # path we still need the full vocabulary on every device.
+            local_head_2d = local_head.view(-1, self.model_args.dim)
+            full_head = local_head_2d
+            if (
+                torch.distributed.is_initialized()
+                and local_head_2d.size(0) * self.num_devices == self.model_args.vocab_size
+            ):
+                head_list = [torch.empty_like(local_head_2d) for _ in range(self.num_devices)]
+                torch.distributed.all_gather(head_list, local_head_2d)
+                full_head = torch.cat(head_list, dim=0)
 
         head_proj = RMSNormHeadProj(
             model_args=self.model_args,
@@ -779,7 +822,7 @@ class QwenShowHandsLayer:
         head_proj.ref_rmsnorm_gamma = params[stack_weight_count]
         head_proj.ref_head_proj = full_head
         logits = head_proj.golden_forward(h)
-        # All-gather produces logits_dim on each device; slice local shard.
+        # Gather produces logits_dim on each device; slice local shard.
         local_logits_dim = self.model_args.vocab_size // self.num_devices
         local_logits_start = device_id * local_logits_dim
         local_logits_end = local_logits_start + local_logits_dim
@@ -848,6 +891,8 @@ class QwenShowHandsLayer:
 
     def reset_sequence(self) -> None:
         """Reset the decode sequence state."""
+        # Drop persistent golden caches so the next generation starts fresh.
+        self._golden_caches = [None] * self.num_devices
         try:
             if self.with_mtp:
                 qwen36_show_hands_reset(True)
@@ -859,6 +904,7 @@ class QwenShowHandsLayer:
 
     def cleanup(self) -> None:
         """Release CUDA graphs."""
+        self._golden_caches = [None] * self.num_devices
         try:
             if self.with_mtp:
                 qwen36_show_hands_go_home(True)

@@ -251,6 +251,12 @@ class Qwen36Generator:
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
 
+        logger.info(
+            f"_generate_without_mtp: prompt_len={prompt_len}, "
+            f"max_new_tokens={self.max_new_tokens}, total_len={total_len}, "
+            f"first_20_tokens={prompt_tokens[:20]}"
+        )
+
         tokens = torch.full(
             (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
         )
@@ -287,7 +293,10 @@ class Qwen36Generator:
                     [next_token.item()], skip_special_tokens=True
                 )
                 if print_log:
-                    print(decoded_tokens, end="", flush=True)
+                    print(f"[{next_token.item()}:{decoded_tokens!r}]", end="", flush=True)
+            else:
+                if print_log:
+                    print(f"(prompt pos {cur_pos_val})", end="", flush=True)
 
             if finished.all():
                 break

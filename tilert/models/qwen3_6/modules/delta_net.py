@@ -223,6 +223,9 @@ class DeltaNet(SerializableTileRTModule):
         ffn_out = self.ffn.golden_forward(norm_h)
         out = h + ffn_out
 
+        # ``new_state`` is a tuple ``(conv_state, recurrent_state)`` produced by
+        # ``DeltaNetOp.golden_forward`` to keep both the causal convolution and
+        # the gated delta recurrence alive across decode steps.
         next_state = {"delta_state": new_state} if state is not None else None
         return out, next_state
 

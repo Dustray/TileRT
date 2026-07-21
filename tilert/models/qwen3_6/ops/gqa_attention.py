@@ -368,11 +368,12 @@ class GQAAttention(TileRTModule):
         v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim)
 
         # Apply per-head RMSNorm on q/k.  q_norm/k_norm weights have shape
-        # (head_dim,) and are broadcast across all heads.
+        # (head_dim,) and are broadcast across all heads.  Qwen3.5-MoE uses the
+        # (1 + weight) convention.
         q_norm_w = self.q_norm_weights.view(1, 1, 1, self.head_dim)
         k_norm_w = self.k_norm_weights.view(1, 1, 1, self.v_head_dim)
-        q = q / (q.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * q_norm_w
-        k = k / (k.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * k_norm_w
+        q = q * torch.rsqrt(q.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6) * (1.0 + q_norm_w)
+        k = k * torch.rsqrt(k.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6) * (1.0 + k_norm_w)
 
         rope_dim = self.rope_dim
         no_pe_dim = self.head_dim - rope_dim
@@ -382,10 +383,10 @@ class GQAAttention(TileRTModule):
         from tilert.models.utils import apply_mrope_embed
 
         freqs_cos, freqs_sin = mrope_embed
-        freqs_cos = freqs_cos[start_pos : start_pos + seq_len]
-        freqs_sin = freqs_sin[start_pos : start_pos + seq_len]
+        freqs_cos = freqs_cos[start_pos : start_pos + seq_len].unsqueeze(0)
+        freqs_sin = freqs_sin[start_pos : start_pos + seq_len].unsqueeze(0)
         q_pe, k_pe = apply_mrope_embed(
-            q_pe, k_pe, freqs_cos, freqs_sin, unsqueeze_dim=1
+            q_pe, k_pe, freqs_cos, freqs_sin, unsqueeze_dim=2
         )
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
@@ -414,10 +415,9 @@ class GQAAttention(TileRTModule):
         o = torch.matmul(attn, v_full.float())
         o = o.transpose(1, 2).contiguous()
         # Apply the per-head gate to the projected output.  The gate has the
-        # same shape as the query (bsz, seq_len, n_heads, head_dim); reduce it
-        # to one scalar per head and broadcast across the head dim.
+        # same shape as the query (bsz, seq_len, n_heads, head_dim); apply it
+        # element-wise (Qwen3.5-MoE attention gate), not reduced over head_dim.
         gate = gate.view(bsz, seq_len, self.num_local_heads, self.head_dim)
-        gate = gate.mean(dim=-1).view(bsz, seq_len, self.num_local_heads, 1)
         out = o * torch.sigmoid(gate)
         out = out.view(bsz, seq_len, -1).to(x.dtype)
         out = out @ self.o_proj_weights.T

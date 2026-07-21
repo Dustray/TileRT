@@ -124,7 +124,9 @@ class QwenTransformerStack(SerializableTileRTModule):
         if isinstance(block, GatedAttention):
             k_cache = layer_cache["k_cache"]
             v_cache = layer_cache["v_cache"]
-            out, k_cache, v_cache = block.forward(x, start_pos, layer_cache["mrope_embed"], k_cache, v_cache)
+            out, k_cache, v_cache = block.forward(
+                x, start_pos, layer_cache["mrope_embed"], k_cache, v_cache, layer_cache.get("mask")
+            )
             layer_cache["k_cache"] = k_cache
             layer_cache["v_cache"] = v_cache
             return out, layer_cache
@@ -169,14 +171,31 @@ class QwenTransformerStack(SerializableTileRTModule):
         residual_scale = 1.0 / max(len(self.exec_seq), 1) if self._is_random_init() else 1.0
         shared_k_cache = caches["k_cache"]
         shared_v_cache = caches["v_cache"]
+        # Build a causal mask for multi-token prefill in GQA layers.
+        seq_len = x.size(1)
+        mask = None
+        if seq_len > 1:
+            mask = torch.full(
+                (seq_len, seq_len),
+                float("-inf"),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            mask = torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0)
         for layer_idx, block in enumerate(self.exec_seq):
             layer_cache = {
                 "k_cache": shared_k_cache,
                 "v_cache": shared_v_cache,
                 "mrope_embed": mrope_embed,
                 "delta_state": caches.get("delta_state", {}).get(layer_idx),
+                "mask": mask,
             }
             out, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                logger.warning(
+                    f"QwenTransformerStack layer {layer_idx} produced NaN/Inf; "
+                    f"mean={out.float().mean().item():.4f}, std={out.float().std().item():.4f}"
+                )
             h = h + out * residual_scale
             shared_k_cache = layer_cache["k_cache"]
             shared_v_cache = layer_cache["v_cache"]
