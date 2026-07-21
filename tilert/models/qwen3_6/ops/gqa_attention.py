@@ -333,7 +333,7 @@ class GQAAttention(TileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
@@ -379,18 +379,14 @@ class GQAAttention(TileRTModule):
         q_pe, q_no_pe = torch.split(q, [rope_dim, no_pe_dim], dim=-1)
         k_pe, k_no_pe = torch.split(k, [rope_dim, no_pe_dim], dim=-1)
 
-        from tilert.models.utils import apply_rotary_emb, precompute_freqs_cis
+        from tilert.models.utils import apply_mrope_embed
 
-        local_freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
-        if not torch.is_complex(local_freqs_cis):
-            # Convert real (seq_len, rope_dim) layout to complex cis.
-            local_freqs_cis = precompute_freqs_cis(
-                self.model_args,
-                theta_override=self.model_args.rope_theta,
-                factor_override=self.model_args.rope_factor,
-            )[: local_freqs_cis.size(0)].to(device=local_freqs_cis.device)
-        q_pe = apply_rotary_emb(q_pe, local_freqs_cis, interleaved=False)
-        k_pe = apply_rotary_emb(k_pe, local_freqs_cis, interleaved=False)
+        freqs_cos, freqs_sin = mrope_embed
+        freqs_cos = freqs_cos[start_pos : start_pos + seq_len]
+        freqs_sin = freqs_sin[start_pos : start_pos + seq_len]
+        q_pe, k_pe = apply_mrope_embed(
+            q_pe, k_pe, freqs_cos, freqs_sin, unsqueeze_dim=1
+        )
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
 
@@ -431,13 +427,13 @@ class GQAAttention(TileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Optimized forward placeholder."""
-        del freqs_cis, mask
+        del mrope_embed, mask
         assert self.is_init
         assert self.out is not None
         assert self.profile_logs is not None
@@ -456,11 +452,11 @@ class GQAAttention(TileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.flag_enable_tilert:
-            return self.tilert_forward(x, start_pos, freqs_cis, k_cache, v_cache, mask)
-        return self.golden_forward(x, start_pos, freqs_cis, k_cache, v_cache, mask)
+            return self.tilert_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)
+        return self.golden_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)

@@ -19,7 +19,8 @@ import os
 import sys
 
 import torch
-
+import faulthandler
+faulthandler.enable()
 from tilert import logger
 
 logging.basicConfig(

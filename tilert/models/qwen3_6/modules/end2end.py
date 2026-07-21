@@ -31,7 +31,7 @@ from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack
 from tilert.models.qwen3_6.ops.rmsnorm_head_proj import RMSNormHeadProj
 from tilert.models.qwen3_6.temp_var_indices import Idx, TEMP_VARS_SIZE, validate_temp_vars_layout
-from tilert.models.utils import precompute_freqs_cis
+from tilert.models.utils import precompute_mrope_embed
 from tilert.utils import get_profile_log_tensor
 
 __all__ = [
@@ -211,11 +211,20 @@ class QwenShowHandsLayer:
             f"top_k={top_k}, use_topp={use_topp}"
         )
 
-    def _gen_freqs_cis(self) -> torch.Tensor:
-        freqs_cis = precompute_freqs_cis(self.model_args)
-        # Return real layout (max_seq_len, rope_dim) so it can be sliced by cur_pos
-        # and converted back to complex inside the transformer stack.
-        return torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], -1)
+    def _gen_freqs_cis(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate M-RoPE cos/sin tables for the golden forward path.
+
+        Returns:
+            Tuple of (cos, sin) tensors with shape (max_seq_len, rope_dim).
+        """
+        cos, sin = precompute_mrope_embed(self.model_args)
+        logger.debug(
+            f"Generated M-RoPE tables: cos.shape={tuple(cos.shape)}, "
+            f"sin.shape={tuple(sin.shape)}, use_mrope={self.model_args.use_mrope}, "
+            f"partial_rotary_factor={self.model_args.partial_rotary_factor}, "
+            f"mrope_section={self.model_args.mrope_section}"
+        )
+        return cos, sin
 
     def load_device_weights(
         self,
@@ -275,9 +284,13 @@ class QwenShowHandsLayer:
 
         logger.info(
             f"Device {device_id}: loaded {len(state_dicts)} tensors, "
-            f"generating freqs_cis on cuda:{device_id}"
+            f"generating M-RoPE tables on cuda:{device_id}"
         )
-        state_dicts["freqs_cis"] = self._gen_freqs_cis().to(device_id)
+        cos, sin = self._gen_freqs_cis()
+        state_dicts["freqs_cos"] = cos.to(device_id)
+        state_dicts["freqs_sin"] = sin.to(device_id)
+        # Deprecated: keep ``freqs_cis`` for older callers/tests that expect it.
+        state_dicts["freqs_cis"] = cos.to(device_id)
         return state_dicts
 
     def update_sampling_config(
@@ -561,10 +574,14 @@ class QwenShowHandsLayer:
 
                 # RoPE frequencies are also per-device for convenience.
                 if model_path is not None:
-                    freqs_cis = state_dicts["freqs_cis"]
+                    freqs_cos = state_dicts["freqs_cos"]
+                    freqs_sin = state_dicts["freqs_sin"]
                 else:
-                    freqs_cis = self._gen_freqs_cis().to(device_id)
-                params.append(freqs_cis)
+                    freqs_cos, freqs_sin = self._gen_freqs_cis()
+                    freqs_cos = freqs_cos.to(device_id)
+                    freqs_sin = freqs_sin.to(device_id)
+                params.append(freqs_cos)
+                params.append(freqs_sin)
 
                 intermediates.extend(
                     self.generate_params_with_continuous_storage(
@@ -720,11 +737,12 @@ class QwenShowHandsLayer:
         if stack is None:
             raise RuntimeError(f"QwenTransformerStack not initialized on device {device_id}")
 
-        # Locate the final head projection and embedding weights in params.
+        # Locate the final head projection, embedding, and RoPE weights in params.
         stack_weight_count = len(stack.get_weights_list())
         head_weight_count = 2  # RMSNormHeadProj.get_weights_list().
         embed_weight = params[stack_weight_count + head_weight_count]
-        freqs_cis_param = params[stack_weight_count + head_weight_count + 1]
+        freqs_cos_param = params[stack_weight_count + head_weight_count + 1]
+        freqs_sin_param = params[stack_weight_count + head_weight_count + 2]
 
         # 1. Embedding lookup.  ``token_id`` may be a scalar int32 or a [1]
         # tensor, so flatten it to a single index before indexing.  Also make sure
@@ -737,10 +755,9 @@ class QwenShowHandsLayer:
         intermediates[Idx.CUR_POS][0] = cur_pos
 
         # 2. Transformer stack (DeltaNet + Gated Attention layers).
-        # freqs_cis_param has shape (max_seq_len, rope_dim) in real layout.
-        # Pass the full tensor to golden_forward; GQA attention will slice it
-        # by start_pos internally, and DeltaNet ignores it.
-        h, caches = stack.golden_forward(x, cur_pos, freqs_cis_param)
+        # freqs_cos/sin_param have shape (max_seq_len, rope_dim).  Pack them as a
+        # tuple for the M-RoPE path.
+        h, caches = stack.golden_forward(x, cur_pos, (freqs_cos_param, freqs_sin_param))
 
         # 3. Final RMSNorm + head projection.
         # Params are TileRT-sharded; head projection weight is split across

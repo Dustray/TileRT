@@ -1,6 +1,6 @@
 """Qwen3.6-35B-A3B model arguments and hyperparameters."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 __all__ = [
@@ -43,6 +43,11 @@ class ModelArgsQwen36:
     beta_fast: int = 32
     beta_slow: int = 1
     original_seq_len: int = 262144
+
+    # M-RoPE (Qwen3.5-MoE / Qwen3.6)
+    partial_rotary_factor: float = 0.25
+    mrope_section: list[int] = field(default_factory=lambda: [11, 11, 10])
+    use_mrope: bool = True
 
     # MLP / MoE
     inter_dim: int = 512       # Much smaller than DeepSeek's 2048

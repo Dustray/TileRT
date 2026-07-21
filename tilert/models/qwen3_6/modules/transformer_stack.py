@@ -124,7 +124,7 @@ class QwenTransformerStack(SerializableTileRTModule):
         if isinstance(block, GatedAttention):
             k_cache = layer_cache["k_cache"]
             v_cache = layer_cache["v_cache"]
-            out, k_cache, v_cache = block.forward(x, start_pos, layer_cache["freqs_cis"], k_cache, v_cache)
+            out, k_cache, v_cache = block.forward(x, start_pos, layer_cache["mrope_embed"], k_cache, v_cache)
             layer_cache["k_cache"] = k_cache
             layer_cache["v_cache"] = v_cache
             return out, layer_cache
@@ -134,17 +134,31 @@ class QwenTransformerStack(SerializableTileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
         caches: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Reference forward through all 40 heterogeneous layers."""
-        if caches is None:
-            caches = self._init_layer_caches(freqs_cis)
+        """Reference forward through all 40 heterogeneous layers.
 
-        # Convert real-form freqs_cis back to complex for the reference path.
-        # Real layout produced by some callers is [seq_len, rope_dim].
-        if not torch.is_complex(freqs_cis):
-            freqs_cis = torch.view_as_complex(freqs_cis.view(freqs_cis.size(0), -1, 2))
+        Args:
+            mrope_embed: Either a tuple of (cos, sin) tensors, each of shape
+                ``(max_seq_len, rope_dim)``, or a legacy complex ``freqs_cis``
+                tensor for backward compatibility.
+        """
+        if isinstance(mrope_embed, tuple):
+            freqs_cos, freqs_sin = mrope_embed
+        else:
+            # Backward compatibility: convert complex freqs_cis to (cos, sin).
+            freqs_cis = mrope_embed
+            if torch.is_complex(freqs_cis):
+                freqs_cis = torch.view_as_real(freqs_cis)
+            else:
+                freqs_cis = freqs_cis.view(freqs_cis.size(0), -1, 2)
+            freqs_cos = freqs_cis[..., 0]
+            freqs_sin = freqs_cis[..., 1]
+            mrope_embed = (freqs_cos, freqs_sin)
+
+        if caches is None:
+            caches = self._init_layer_caches(mrope_embed)
 
         h = x
         # Use full residual addition for real pretrained weights; only scale
@@ -159,7 +173,7 @@ class QwenTransformerStack(SerializableTileRTModule):
             layer_cache = {
                 "k_cache": shared_k_cache,
                 "v_cache": shared_v_cache,
-                "freqs_cis": freqs_cis,
+                "mrope_embed": mrope_embed,
                 "delta_state": caches.get("delta_state", {}).get(layer_idx),
             }
             out, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
@@ -176,7 +190,7 @@ class QwenTransformerStack(SerializableTileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         caches: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Optimized forward placeholder.
@@ -184,20 +198,20 @@ class QwenTransformerStack(SerializableTileRTModule):
         Falls back to ``golden_forward`` until the dedicated Qwen3.6 CUDA-graph
         wrappers are implemented.
         """
-        return self.golden_forward(x, start_pos, freqs_cis, caches)
+        return self.golden_forward(x, start_pos, mrope_embed, caches)
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         caches: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.flag_enable_tilert:
-            return self.tilert_forward(x, start_pos, freqs_cis, caches)
-        return self.golden_forward(x, start_pos, freqs_cis, caches)
+            return self.tilert_forward(x, start_pos, mrope_embed, caches)
+        return self.golden_forward(x, start_pos, mrope_embed, caches)
 
-    def _init_layer_caches(self, freqs_cis: torch.Tensor) -> dict[str, Any]:
+    def _init_layer_caches(self, mrope_embed: tuple[torch.Tensor, torch.Tensor]) -> dict[str, Any]:
         """Allocate KV caches for Gated Attention layers.
 
         DeltaNet layers carry their own recurrent state in ``caches["delta_state"]``.
@@ -221,7 +235,7 @@ class QwenTransformerStack(SerializableTileRTModule):
                 dtype=torch.bfloat16,
                 device=dev,
             ),
-            "freqs_cis": freqs_cis,
+            "mrope_embed": mrope_embed,
             "delta_state": {},
         }
 
