@@ -1,6 +1,8 @@
 # Qwen3.6-35B-A3B 接入 TileRT 技术方案
 
-> 最近更新：2026-07-18 — 已根据官方 `modeling_qwen3_5_moe.py` 将 Qwen3.6 RoPE 统一为 M-RoPE；`weight_converter.py` 已适配 Qwen3.6 权重结构并修复类型注解回归。
+> 最近更新：2026-07-22 — 调整目标为：跳过 HF → TileRT 权重转换，直接基于原始 HuggingFace checkpoint 跑通 `golden_forward` 路径与官方 prompt 测例。当前卡在 ExpertDownAllReduce 在多线程初始化时默认 CUDA device 切换不正确，导致 device 0 重复承载 device 1 的 MoE down-projection 权重，出现 device 0 48.4 GiB / device 1 26.6 GiB 的严重不平衡，正在定位修复。
+
+测试环境用tilert-qwen3.6容器
 
 ## 0. 背景术语说明
 
@@ -73,6 +75,19 @@
 - 循环: 10 次，每次 4 层 = 40 层
 - 每层的具体类型由 `text_config.layer_types` 数组给出，例如前 4 层为
   `["linear_attention", "linear_attention", "linear_attention", "full_attention", ...]`
+
+## 2.1 当前目标（2026-07-21）
+
+**不再修复/使用 HF → TileRT 权重转换脚本，直接基于原始 HuggingFace checkpoint 跑通 golden/reference forward。**
+
+- 源模型路径：`/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
+- 原始 checkpoint key 前缀为 `model.language_model.*`（文本部分）
+- `QwenShowHandsLayer` 需要新增从原始 HF checkpoint 直接加载 reference weights 的能力：
+  1. 读取 `model.safetensors.index.json`，按 layer 加载所需 safetensors shard。
+  2. 对每一层调用 `DeltaNetOp` / `GQAAttention` 的 `device_sharding` + `init_reference_weights`。
+  3. 对每层 MoE 调用 `RMSNormExpertProj` / `ExpertSelectUpGateSiLU` / `ExpertDownAllReduce` 的 `init_reference_weights`。
+  4. 对 final head 调用 `RMSNormHeadProj.init_reference_weights`。
+- 验证脚本：`scripts/verify_qwen36_generator_official_prompt.py` 使用真实权重跑 `generator.generate()`，输出应为语义通顺的文本。
 
 ## 3. 关键参数 (ModelArgsQwen36)
 
@@ -964,3 +979,67 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 2. **生成返回值是 tuple**：`generate()` 返回 `(completion_text, time_list, [], prompt_len)`，脚本中通过 `result[0] if isinstance(result, tuple) else result` 取文本。
 
 随机权重下脚本通过：输出为无意义 token（随机权重未训练，符合预期），但生成 pipeline 完整跑通，可作为 CI smoke test。真实权重下只需把 `use_random_weights = False` 即可验证实际生成质量。
+
+## 14. 跳过权重转换、直接基于原始 HF checkpoint 的 reference 路径（2026-07-21 ~ 2026-07-22）
+
+### 14.1 目标调整
+
+用户要求**不再运行 HF → TileRT 权重转换**，直接拿原始 HuggingFace checkpoint 跑 golden forward，并通过 `scripts/verify_qwen36_generator_official_prompt.py`。
+
+- 源路径：`/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
+- 原始 checkpoint 使用 `model.safetensors.index.json`，26 个 shard，总大小约 71.9 GB，文本权重 key 前缀为 `model.language_model.*`。
+- 需要让 `QwenShowHandsLayer.from_pretrained()` 检测 HF-source checkpoint，并直接调用各 op 的 `init_reference_weights()`。
+
+仿照deepseek模块的流程完善qwen模块，根据deepseek模型的大小看，原始qwen模型进入golden forward流程需要做TP切分，否则显存不够用。
+qwen模型的执行逻辑参考来自HunggingFace的modeling_qwen3_5_moe.py
+
+### 14.2 已完成适配
+
+| 文件 | 修改内容 |
+|------|----------|
+| `tilert/models/qwen3_6/modules/end2end.py` | 新增 `_is_hf_source_checkpoint()`、`_load_hf_source_per_device()`、`_shard_hf_layer_state()`；HF-source 路径在主线程一次性加载完整 CPU state dict，每个设备线程按层切片后调用 `block.init_reference_weights()`；顶层 `model.embed_tokens.weight`、`model.norm.weight`、`lm_head.weight`、`freqs_cis` 复制到对应 device。 |
+| `tilert/models/qwen3_6/ops/gqa_attention.py` | `GQAAttention.init_reference_weights_sharded` 按 head-dim TP 切分 q/k/v/o，q_norm/k_norm 复用完整 `[256]` 张量。 |
+| `tilert/models/qwen3_6/modules/gated_attention.py` | `QwenAttentionRef.init_reference_weights_sharded` 同步 head-dim TP 切分，复用 q_norm/k_norm。 |
+| `tilert/models/qwen3_6/ops/expert_sel_up_gate_silu.py` | 对本地 MoE gate/up shard 先 `.contiguous()` 再反量化，避免完整 `(n_experts, num_devices, ...)` storage 被拖到 GPU。 |
+| `tilert/models/qwen3_6/ops/expert_down_allreduce.py` | 对本地 down shard 先 `.contiguous()` 再反量化；`ref_down` 转 bf16。 |
+| `tilert/models/qwen3_6/ops/rmsnorm_expert_proj.py` | `profile_logs` 延迟分配且按 `device_id`，避免默认 `cuda:0`。 |
+| `tilert/utils.py` | `get_profile_log_tensor()` 默认 `device_index=0` 的问题通过调用方显式传 `device=` 规避。 |
+| `tilert/models/qwen3_6/modules/end2end.py` | `generate_params_with_continuous_storage()` 的 `device` 参数从 `int` 改为显式 `torch.device(f"cuda:{device_id}")`，避免在多线程环境下默认设备歧义。 |
+
+### 14.3 当前瓶颈：device 0 内存不平衡
+
+- 40 层真实权重加载成功后：
+  - device 0 占用约 **48.375 GiB**
+  - device 1 占用约 **26.569 GiB**
+- `gc` 统计显示 device 0 上有 **160 个**形状含 `(257, *, *)` 的张量（约 43.1 GiB），device 1 上只有 **80 个**（约 21.6 GiB），说明 device 0 上存在 device 1 的 MoE expert 权重副本。
+- 对 MoE gate/up/down 本地 shard 加 `.contiguous()` 后，不平衡**未消除**，说明根因不在 op 内部切片/移动。
+- 单独初始化一个 `ExpertSelectUpGateSiLU` + `ExpertDownAllReduce` 时两设备内存平衡（各约 0.812 GiB），问题仅在多线程 40 层加载场景出现。
+- 已确认 `ExpertDownAllReduce.ref_down` 中 `device_id=1` 的实例实际位于 `cuda:0`，表明多线程 `init_reference_weights` 中 `.to(f"cuda:{device_id}")` 受到默认 CUDA 设备上下文影响，未正确切到目标设备。
+
+### 14.4 根因假设与下一步
+
+- 在 `_load_weights` 的 per-device 线程中虽然使用了 `with torch.cuda.device(device_id)`，但 `ExpertDownAllReduce.init_reference_weights` 的 `torch.stack(...).to(f"cuda:{device_id}")` 仍把张量放到了默认 device（cuda:0）。
+- 需要显式把 `.to(f"cuda:{device_id}")` 改为 `with torch.cuda.device(device_id): ... .to(dev)`，或者使用 `torch.as_tensor(..., device=dev)` / `tensor.cuda(device_id)`，确保分配发生在目标设备上下文。
+- 修复后预期 device 0 / device 1 内存应接近平衡（各约 35 GiB 以下），然后再运行官方 prompt smoke test。
+
+### 14.5 预切分并行加载方案（2026-07-23）
+
+单纯把 `_init_weights` 里的串行循环改成 `threading.Thread(8)` 并不能加速加载，因为 Python GIL 会把 CPU 密集型的 `device_sharding` 串行化。实际观测到 8 个线程虽然都启动了，但 `py-spy` 显示只有一个线程处于 `active`，其余均为 `idle`，整体速度没有提升。
+
+因此改用**预切分方案**：在 `hf_source_loader.py` 中一次性为所有 device 切好每一层的权重，然后每个 device 的加载线程只执行 `tensor.to(cuda:{device_id})` 和 `init_tilert_weights`。具体改动：
+
+- 新增 `_unshard_to_per_device`：根据 `device_sharding` 返回张量的第 0 维或第 1 维是否等于 `num_devices`，提取对应 device 的 slice。
+- `load_hf_source_weights` 不再由每个线程独立调用（重复切分 8 次），而是返回单个 device 的已切分 state dict；`_init_weights` 在调用线程内部直接 `to(device)`。
+- 保留 `_HF_CHECKPOINT_CPU_CACHE`，完整 checkpoint 仍只从磁盘读一次。
+
+这样 8 个 device 的加载线程只做 GPU 内存分配与初始化，CPU 切分只发生一次，整体加载时间预计从约 15 分钟降到数分钟。
+
+### 14.6 待办（当前）
+
+| 优先级 | 任务 | 状态 |
+|--------|------|------|
+| P0 | 实现 `hf_source_loader.py` 预切分，移除 8 次重复 `device_sharding` | 进行中 |
+| P0 | 重新加载 40 层，验证 device 0 / device 1 内存平衡 | 待验证 |
+| P0 | 运行 `scripts/verify_qwen36_generator_official_prompt.py`（8 卡） | 待验证 |
+| P1 | 与 HF `AutoModelForCausalLM` 在小 prompt 上对比 logits | 待验证 |
+| P1 | 更新 plan 与 session memory | 进行中 |

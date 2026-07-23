@@ -70,13 +70,30 @@ def _safe_weight_dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Ten
         return weight.to(torch.bfloat16) * scale.to(torch.bfloat16).view(1)
 
     # Check whether the kernel's reshape-based fallback would work.
-    m, n = weight.shape
-    block_size = 128
-    if m % block_size == 0 and n % block_size == 0 and scale.shape == (
-        m // block_size,
-        n // block_size,
-    ):
-        return _weight_dequant_torch(weight, scale, block_size)
+    if weight.dim() == 2:
+        m, n = weight.shape
+        block_size = 128
+        if m % block_size == 0 and n % block_size == 0 and scale.shape == (
+            m // block_size,
+            n // block_size,
+        ):
+            return _weight_dequant_torch(weight, scale, block_size)
+
+    # Handle rank-3 stacked expert weights produced by the Qwen3.6 converter:
+    # weight shape (n_experts, dim, expert_dim), scale shape
+    # (n_experts, dim/block_size, expert_dim/block_size).
+    if weight.dim() == 3 and scale.dim() == 3:
+        n_experts, dim, expert_dim = weight.shape
+        block_size = 128
+        if (
+            dim % block_size == 0
+            and expert_dim % block_size == 0
+            and scale.shape == (n_experts, dim // block_size, expert_dim // block_size)
+        ):
+            dequant_list = []
+            for i in range(n_experts):
+                dequant_list.append(_weight_dequant_torch(weight[i], scale[i], block_size))
+            return torch.stack(dequant_list, dim=0)
 
     # Scale shape is unexpected: cast the weight and ignore the scale.  This
     # keeps the golden path executable even when the checkpoint's quantization
@@ -124,9 +141,15 @@ class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization (RMSNorm).
 
+    Qwen3.5-MoE/Qwen3.6 use the convention ``output = x / rms * (1 + weight)``
+    with ``weight`` initialized to zeros, so the default gain is 1.  This keeps
+    backward compatibility with checkpoints that expect the standard
+    ``weight`` tensor while making the Qwen-specific gain explicit.
+
     Args:
         dim (int): Dimension of the input tensor.
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
+        weight (torch.Tensor | None): Optional pre-initialized weight vector.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, weight: torch.Tensor | None = None):
@@ -135,9 +158,12 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
         if weight is None:
-            self.weight = nn.Parameter(init_func(torch.empty(dim, dtype=torch.float32)))
+            self.weight = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         else:
             self.weight = torch.nn.Parameter(weight)
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
@@ -147,18 +173,17 @@ class RMSNorm(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor.
+            residual (torch.Tensor | None): Optional residual to add before norm.
 
         Returns:
-            torch.Tensor: Normalized tensor with the same shape as input.
+            Normalized tensor, or (normalized, residual) tuple if residual given.
         """
-        dtype = torch.bfloat16
         if residual is None:
-            x = x.float()
-            var_s = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(var_s + self.eps)
-            return (self.weight * x).to(dtype)
+            output = self._norm(x.float())
+            output = output * (1.0 + self.weight.float())
+            return output.type_as(x)
 
         x = residual = x.float() + residual.float()
-        var_s = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var_s + self.eps)
-        return (self.weight * x).to(dtype), residual.to(dtype)
+        output = self._norm(x)
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x), residual.type_as(x)

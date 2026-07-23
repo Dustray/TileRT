@@ -19,7 +19,8 @@ import os
 import sys
 
 import torch
-
+import faulthandler
+faulthandler.enable()
 from tilert import logger
 
 logging.basicConfig(
@@ -31,8 +32,8 @@ logging.basicConfig(
 def main():
     torch.set_num_threads(64)
 
-    use_random_weights = True
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
+    use_random_weights = False
+    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 
     # Sanity check for tokenizer files (copied by weight_converter now).
     required_tok_files = ("tokenizer_config.json", "tokenizer.json", "vocab.json")

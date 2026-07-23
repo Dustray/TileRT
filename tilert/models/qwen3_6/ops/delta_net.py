@@ -20,6 +20,16 @@ from tilert.models.common import RMSNorm, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
 
+try:
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        torch_chunk_gated_delta_rule,
+        torch_recurrent_gated_delta_rule,
+    )
+
+    _TRANSFORMERS_DELTA_AVAILABLE = True
+except Exception:  # pragma: no cover - transformers may be older
+    _TRANSFORMERS_DELTA_AVAILABLE = False
+
 __all__ = [
     "delta_net",
     "DeltaNetAlgorithm",
@@ -472,23 +482,239 @@ class DeltaNetOp(TileRTModule):
         output = output.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_v_heads * self.value_head_dim)
         return output, (state, norm_state)
 
+    def _gated_delta_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        g: torch.Tensor,
+        state: torch.Tensor | None = None,
+        chunk_size: int = 64,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference gated DeltaNet recurrence matching the official rule.
+
+        Delegates to the official ``transformers`` helpers when available:
+
+        * ``torch_recurrent_gated_delta_rule`` for single-token decode steps,
+          avoiding the heavy chunk padding/loop overhead of the chunked path.
+        * ``torch_chunk_gated_delta_rule`` for longer sequences.
+
+        This keeps TileRT's golden path bit-level compatible with the official
+        Qwen3.5-MoE/Qwen3.6 model without relying on ``fla`` / ``causal-conv1d``.
+        """
+        initial_dtype = q.dtype
+        bsz, seq_len, _ = q.shape
+        q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
+        k = k.view(bsz, seq_len, self.n_k_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.n_v_heads, self.value_head_dim)
+
+        if self.n_v_heads // self.n_k_heads > 1:
+            reps = self.n_v_heads // self.n_k_heads
+            q = q.repeat_interleave(reps, dim=2)
+            k = k.repeat_interleave(reps, dim=2)
+
+        # beta/g currently (bsz, seq_len, num_v_heads).
+        beta = beta.view(bsz, seq_len, q.shape[2])
+        g = g.view(bsz, seq_len, q.shape[2])
+
+        if _TRANSFORMERS_DELTA_AVAILABLE:
+            if seq_len == 1 and state is not None:
+                # Fast recurrent decode path: O(1) per token instead of
+                # padding to a full chunk and running the chunk loop.
+                attn_out, recurrent_state = torch_recurrent_gated_delta_rule(
+                    q, k, v, g, beta,
+                    initial_state=state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                return attn_out, recurrent_state
+
+            attn_out, recurrent_state = torch_chunk_gated_delta_rule(
+                q, k, v, g, beta,
+                chunk_size=chunk_size,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return attn_out, recurrent_state
+
+        # Pure-PyTorch fallback when the official helpers are unavailable.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        q = self._l2norm(q.float(), dim=-1, eps=1e-6).to(initial_dtype)
+        k = self._l2norm(k.float(), dim=-1, eps=1e-6).to(initial_dtype)
+        beta = beta.transpose(1, 2)
+        g = g.transpose(1, 2)
+        q, k, v, beta, g = [x.contiguous().to(torch.float32) for x in (q, k, v, beta, g)]
+
+        batch_size, num_heads, sequence_length, k_head_dim = k.shape
+        v_head_dim = v.shape[-1]
+        pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+        q = F.pad(q, (0, 0, 0, pad_size))
+        k = F.pad(k, (0, 0, 0, pad_size))
+        v = F.pad(v, (0, 0, 0, pad_size))
+        beta = F.pad(beta, (0, pad_size))
+        g = F.pad(g, (0, pad_size))
+        total_sequence_length = sequence_length + pad_size
+        scale = 1.0 / (q.shape[-1] ** 0.5)
+        q = q * scale
+
+        v_beta = v * beta.unsqueeze(-1)
+        k_beta = k * beta.unsqueeze(-1)
+        q, k, v, k_beta, v_beta = [
+            x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+            for x in (q, k, v, k_beta, v_beta)
+        ]
+        g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+        mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0)
+
+        g = g.cumsum(dim=-1)
+        decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+        attn = -((k_beta @ k.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+        v = attn @ v_beta
+        k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+        last_recurrent_state = (
+            torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(v)
+            if state is None
+            else state.to(v)
+        )
+        core_attn_out = torch.zeros_like(v)
+        mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
+
+        for i in range(0, total_sequence_length // chunk_size):
+            q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+            attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+            v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+            v_new = v_i - v_prime
+            attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+            core_attn_out[:, :, i] = attn_inter + attn @ v_new
+            last_recurrent_state = (
+                last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            )
+
+        core_attn_out = core_attn_out.reshape(
+            core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+        )
+        core_attn_out = core_attn_out[:, :, :sequence_length]
+        core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+        core_attn_out = core_attn_out.reshape(bsz, seq_len, -1)
+        return core_attn_out, last_recurrent_state
+
+    @staticmethod
+    def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+        return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+    def _rmsnorm_gated(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Gated RMSNorm matching ``Qwen3_5MoeRMSNormGated``.
+
+        The official implementation normalises first, multiplies by the
+        learnable weight (not ``1 + weight``), and then applies the SiLU gate.
+        """
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        x = weight * x.to(input_dtype)
+        x = x * F.silu(gate.to(torch.float32))
+        return x.to(input_dtype)
+
+    def _causal_conv1d_update(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor | None,
+        weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stateful causal depthwise convolution update matching FLA convention.
+
+        Args:
+            hidden_states: (bsz, hidden_size, seq_len).
+            conv_state: (bsz, hidden_size, state_len) or None.
+            weight: (hidden_size, kernel_size).
+
+        Returns:
+            (output, updated_conv_state) with output shape
+            (bsz, hidden_size, seq_len).
+        """
+        bsz, hidden_size, seq_len = hidden_states.shape
+        kernel_size = weight.shape[-1]
+        if conv_state is None:
+            conv_state = torch.zeros(bsz, hidden_size, kernel_size, dtype=hidden_states.dtype, device=hidden_states.device)
+        hidden_new = torch.cat([conv_state, hidden_states], dim=-1)
+        conv_state = hidden_new[:, :, -kernel_size:].contiguous()
+        out = F.conv1d(
+            hidden_new,
+            weight.unsqueeze(1),
+            groups=hidden_size,
+        )
+        out = F.silu(out[:, :, -seq_len:])
+        return out, conv_state
+
     def golden_forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        state: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference forward using simple linear attention.
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Reference forward implementing the gated DeltaNet recurrence.
 
-        Uses only ``in_proj_qkv`` and ``out_proj`` for a quick sanity check.
-        The full gated delta-net recurrence requires the FLA kernel.
+        Replicates the official Qwen3.5-MoE/Qwen3.6 ``Qwen3_5MoeGatedDeltaNet``
+        computation: in_proj_qkv/z/b/a, causal depthwise conv1d, gated delta
+        rule, and gated RMSNorm, followed by the output projection.
+
+        ``state`` is a tuple ``(conv_state, recurrent_state)`` so that both
+        the causal convolution and the linear recurrence remember history
+        across decode steps.  ``conv_state`` has shape
+        ``(bsz, conv_dim, kernel_size)`` and ``recurrent_state`` has shape
+        ``(bsz, num_heads, k_head_dim, v_head_dim)``.
         """
         del start_pos
         assert self.in_proj_qkv_weights is not None
+        assert self.in_proj_z_weights is not None
+        assert self.in_proj_a_weights is not None
+        assert self.in_proj_b_weights is not None
+        assert self.conv1d_weights is not None
+        assert self.A_log is not None
+        assert self.dt_bias is not None
+        assert self.norm_weights is not None
         assert self.out_proj_weights is not None
-        qkv = x @ self.in_proj_qkv_weights.T
+
+        original_shape = x.shape
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        bsz, seq_len, dim = x.shape
+
+        # Unpack persistent state.
+        conv_state, recurrent_state = state if state is not None else (None, None)
+
+        # Projections.
+        mixed_qkv = x @ self.in_proj_qkv_weights.T
+        z = x @ self.in_proj_z_weights.T
+        b = x @ self.in_proj_b_weights.T
+        a = x @ self.in_proj_a_weights.T
+
+        # Causal depthwise conv1d (groups = conv_dim) with cross-step state.
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, conv_dim, seq_len)
+        conv_weight = self.conv1d_weights.squeeze(1)  # (conv_dim, kernel_size)
+        mixed_qkv, conv_state = self._causal_conv1d_update(mixed_qkv, conv_state, conv_weight)
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, seq_len, conv_dim)
+
+        # Split into q/k/v.
         q, k, v = torch.split(
-            qkv,
+            mixed_qkv,
             [
                 self.n_heads * self.head_dim,
                 self.n_k_heads * self.head_dim,
@@ -496,9 +722,23 @@ class DeltaNetOp(TileRTModule):
             ],
             dim=-1,
         )
-        attn_out, new_state = self._linear_attention(q, k, v, state)
+
+        # Decay gate g and beta.
+        beta = torch.sigmoid(b)
+        # A is stored as log(A); official uses -exp(A_log) * softplus(a + dt_bias).
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        attn_out, recurrent_state = self._gated_delta_attention(q, k, v, beta, g, recurrent_state)
+
+        # Gated RMSNorm.
+        attn_out = attn_out.reshape(-1, self.value_head_dim)
+        z_gate = z.reshape(-1, self.value_head_dim)
+        attn_out = self._rmsnorm_gated(attn_out, z_gate, self.norm_weights)
+        attn_out = attn_out.reshape(bsz, seq_len, -1)
+
         out = attn_out @ self.out_proj_weights.T
-        return out, new_state
+        out = out.view(original_shape)
+        return out, (conv_state, recurrent_state)
 
     def tilert_forward(
         self,

@@ -77,6 +77,7 @@ class ExpertSelectUpGateSiLURefWeightsAlias:
             + [f"{self.key_prefix}.shared_expert.up_proj.weight_scale_inv"]
             + [f"{self.key_prefix}.experts.gate_up_proj.weight_scale_inv"]
             + [f"{self.key_prefix}.gate.e_score_correction_bias"]
+            + [f"{self.key_prefix}.shared_expert_gate.weight"]
         )
 
     def __call__(self) -> list[str]:
@@ -399,6 +400,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             if tilert_weights_alias is not None
             else ExpertSelectUpGateSiLUTilertWeightsAlias()
         )
+        if not isinstance(self.tilert_weights_alias, ExpertSelectUpGateSiLUTilertWeightsAlias):
+            self.tilert_weights_alias = ExpertSelectUpGateSiLUTilertWeightsAlias()
         self.ref_weights_alias = (
             ref_weights_alias
             if ref_weights_alias is not None
@@ -406,10 +409,15 @@ class ExpertSelectUpGateSiLU(TileRTModule):
                 key_prefix="mlp", n_routed_experts=self.n_routed_experts
             )
         )
+        if not isinstance(self.ref_weights_alias, ExpertSelectUpGateSiLURefWeightsAlias):
+            self.ref_weights_alias = ExpertSelectUpGateSiLURefWeightsAlias(
+                key_prefix="mlp", n_routed_experts=self.n_routed_experts
+            )
 
         self.ref_bias: torch.Tensor | None = None
         self.ref_gate: torch.Tensor | None = None
         self.ref_up: torch.Tensor | None = None
+        self.ref_shared_expert_gate: torch.Tensor | None = None
 
         self.tilert_bias: torch.Tensor | None = None
         self.tilert_weights: torch.Tensor | None = None
@@ -638,6 +646,16 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         gate_scales = torch.cat([shared_gate_s, routed_gate_s], dim=0)
         up_weights = torch.cat([shared_up, routed_up], dim=0)
         up_scales = torch.cat([shared_up_s, routed_up_s], dim=0)
+
+        # Shared-expert gate is a (1, dim) matrix replicated on all devices.
+        shared_expert_gate = weights_map.get(
+            f"{key_prefix}.shared_expert_gate.weight",
+            torch.zeros(1, self.dim, dtype=torch.bfloat16),
+        )
+        if shared_expert_gate.dim() == 1:
+            shared_expert_gate = shared_expert_gate.unsqueeze(0)
+        shared_expert_gate = shared_expert_gate[None, :, :].repeat(self.num_devices, 1, 1)
+
         tilert_alias = self.tilert_weights_alias
         return {
             tilert_alias.exp_bias: bias,
@@ -645,6 +663,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             tilert_alias.exp_gate_scales: gate_scales,
             tilert_alias.exp_up_weights: up_weights,
             tilert_alias.exp_up_scales: up_scales,
+            "shared_expert_gate": shared_expert_gate,
         }
 
     def init_reference_weights(
@@ -689,6 +708,12 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             ],
             dim=0,
         )
+        shared_expert_gate = sharded.get("shared_expert_gate")
+        if shared_expert_gate is not None:
+            gate = shared_expert_gate[did]
+            if gate.dim() == 1:
+                gate = gate.unsqueeze(0)
+            self.ref_shared_expert_gate = gate
 
     def get_tilert_weights_alias(self) -> list[str]:
         """Return the alias list keyed into ``state_dict`` for this op."""
@@ -804,6 +829,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             device=device,
         )
         key_prefix = self.ref_weights_alias.key_prefix
+        shared_expert_gate = torch.randn(1, self.dim, dtype=torch.bfloat16, device=device) / (
+            self.dim ** 0.5
+        )
         ref_state_dict = {
             f"{key_prefix}.gate.e_score_correction_bias": bias,
             f"{key_prefix}.shared_expert.gate_proj.weight": shared_gate,
@@ -812,6 +840,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             f"{key_prefix}.shared_expert.gate_proj.weight_scale_inv": shared_gate_scale,
             f"{key_prefix}.shared_expert.up_proj.weight_scale_inv": shared_up_scale,
             f"{key_prefix}.experts.gate_up_proj.weight_scale_inv": routed_scale,
+            f"{key_prefix}.shared_expert_gate.weight": shared_expert_gate,
         }
         self.init_reference_weights(ref_state_dict)
         sharded = self.device_sharding(ref_state_dict)
@@ -833,7 +862,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
     def _ref_expert_select_qwen36(
         self, scores: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference routing for Qwen3.6 (softmax + top-k + route_scale)."""
+        """Reference routing for Qwen3.6 (softmax + top-k + normalize + route_scale)."""
         original_scores = scores
         if self.ref_bias is not None:
             scores = scores + self.ref_bias
@@ -841,6 +870,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
         indices = indices.view(*original_scores.shape[:-1], self.n_activated_experts)
         weights = scores.gather(-1, indices)
+        # Qwen3.5-MoE normalizes the top-k weights to sum to 1 before scaling.
+        weights /= weights.sum(dim=-1, keepdim=True)
         weights *= self.route_scale
         return weights, indices
 
@@ -883,6 +914,12 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             hidden_out_w1 = torch.stack(hidden_out_w1_list, dim=0)
             hidden_out_w3 = torch.stack(hidden_out_w3_list, dim=0)
             hidden_out = F.silu(hidden_out_w1.float()) * hidden_out_w3.float()
+            # Apply the shared-expert gate to the shared expert output only.
+            if self.ref_shared_expert_gate is not None:
+                shared_gate = torch.sigmoid(
+                    x_in[0, s].float() @ self.ref_shared_expert_gate.float().mT
+                )
+                hidden_out[0] = hidden_out[0] * shared_gate.squeeze(-1)
             hidden_out = hidden_out.to(torch.bfloat16)
             hidden_out_list.append(hidden_out)
         hidden_out = torch.stack(hidden_out_list, dim=0)

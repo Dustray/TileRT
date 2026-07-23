@@ -282,9 +282,11 @@ class RMSNormHeadProj(TileRTModule):
         assert bsz == 1
         hidden_in_float = hidden_in.float().detach()
         gamma = self.ref_rmsnorm_gamma.float().detach()
-        hidden_rmsnorm = torch.nn.functional.rms_norm(
-            hidden_in_float, [hidden_in_float.size(-1)], gamma, self.eps
+        # Qwen3.5-MoE/Qwen3.6 use the (1 + weight) RMSNorm convention.
+        hidden_rmsnorm = hidden_in_float * torch.rsqrt(
+            hidden_in_float.pow(2).mean(dim=-1, keepdim=True) + self.eps
         )
+        hidden_rmsnorm = hidden_rmsnorm * (1.0 + gamma)
         # Handle both full 2-D head projection and the per-device sharded layout
         # produced by device_sharding for the reference path.
         head_proj = self.ref_head_proj

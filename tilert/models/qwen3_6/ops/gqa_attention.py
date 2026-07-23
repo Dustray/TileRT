@@ -162,11 +162,13 @@ class GQAAttention(TileRTModule):
         self.head_dim = model_args.qk_head_dim
         self.v_head_dim = model_args.v_head_dim
         self.rope_dim = model_args.rope_dim
-        # The converted Qwen3.6 checkpoint stores full attention weights on
-        # every device (replicated), not sharded by tensor-parallel rank.  Use
-        # the full head counts here; the per-device ``_dev_N`` suffix selects
-        # the replicated copy rather than a shard.
-        self.num_local_heads = self.n_heads
+        # True tensor-parallel sharding by head.  Q heads are evenly split
+        # across devices; KV heads are replicated on every device because
+        # n_kv_heads (2) is much smaller than num_devices (8).
+        if self.n_heads % self.num_devices == 0:
+            self.num_local_heads = self.n_heads // self.num_devices
+        else:
+            self.num_local_heads = max(1, self.n_heads // self.num_devices)
         self.num_local_kv_heads = self.n_kv_heads
 
         self.tilert_weights_alias = GQAAttentionTilertWeightsAlias()
@@ -215,19 +217,36 @@ class GQAAttention(TileRTModule):
         k_norm_w = weights_map[f"{prefix}.k_norm.weight"]
 
         # The q-projection output is split into query and gate, so it is twice
-        # the size of a normal Q projection.  With replicated full weights each
-        # device gets the full matrices, not a TP shard.
-        q_per_dev = self.n_heads * self.head_dim * 2
-        kv_per_dev = self.n_kv_heads * self.v_head_dim
-        qkv_parts = [
-            torch.cat([q_w, k_w, v_w], dim=0)
-            for _ in range(self.num_devices)
-        ]
-        # o_proj is also replicated across devices.
-        o_parts = [o_w for _ in range(self.num_devices)]
+        # the size of a normal Q projection.  Shard Q heads evenly across
+        # devices while replicating the small GQA KV heads on every device.
+        q_heads_per_dev = self.num_local_heads
+        q_dim_per_dev = q_heads_per_dev * self.head_dim * 2
+        kv_dim = self.n_kv_heads * self.head_dim
+        v_dim = self.n_kv_heads * self.v_head_dim
 
-        # q_norm/k_norm are per-head weights; with replicated full weights
-        # every device receives the full norm vectors.
+        q_w = q_w.view(self.n_heads, self.head_dim * 2, self.dim)
+        q_parts = [
+            q_w[did * q_heads_per_dev : (did + 1) * q_heads_per_dev]
+            .reshape(q_dim_per_dev, self.dim)
+            for did in range(self.num_devices)
+        ]
+        qkv_parts = [
+            torch.cat([q_parts[did], k_w, v_w], dim=0)
+            for did in range(self.num_devices)
+        ]
+
+        # o_proj is column-sharded by head: each device owns the columns that
+        # correspond to its local Q heads.
+        o_w = o_w.view(self.dim, self.n_heads, self.v_head_dim)
+        o_parts = [
+            o_w[:, did * q_heads_per_dev : (did + 1) * q_heads_per_dev, :]
+            .reshape(self.dim, q_heads_per_dev * self.v_head_dim)
+            for did in range(self.num_devices)
+        ]
+
+        # q_norm/k_norm are per-head vectors; replicate the full vectors because
+        # every device uses the same norm weights for its local KV heads and
+        # the Q-head shards just index into the same vectors.
         q_norm_parts = [q_norm_w for _ in range(self.num_devices)]
         k_norm_parts = [k_norm_w for _ in range(self.num_devices)]
 
@@ -333,7 +352,7 @@ class GQAAttention(TileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
@@ -350,7 +369,7 @@ class GQAAttention(TileRTModule):
 
         qkv = x @ self.qkv_proj_weights.T
         # Qwen3.5-MoE full attention: q-projection is doubled; the second half is
-        # the per-head gating signal.
+        # the per-head gating signal.  Sizes now reflect the local shard.
         q_gate, k, v = torch.split(
             qkv,
             [
@@ -362,35 +381,32 @@ class GQAAttention(TileRTModule):
         )
         q, gate = torch.chunk(q_gate, 2, dim=-1)
 
-        # Keep (bsz, seq_len, n_heads, head_dim) for apply_rotary_emb.
+        # Keep (bsz, seq_len, n_local_heads, head_dim) for apply_rotary_emb.
         q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim)
         k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim)
         v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim)
 
         # Apply per-head RMSNorm on q/k.  q_norm/k_norm weights have shape
-        # (head_dim,) and are broadcast across all heads.
+        # (head_dim,) and are broadcast across all heads.  Qwen3.5-MoE uses the
+        # (1 + weight) convention.
         q_norm_w = self.q_norm_weights.view(1, 1, 1, self.head_dim)
         k_norm_w = self.k_norm_weights.view(1, 1, 1, self.v_head_dim)
-        q = q / (q.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * q_norm_w
-        k = k / (k.norm(dim=-1, keepdim=True) / (self.head_dim**0.5) + 1e-6) * k_norm_w
+        q = q * torch.rsqrt(q.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6) * (1.0 + q_norm_w)
+        k = k * torch.rsqrt(k.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6) * (1.0 + k_norm_w)
 
         rope_dim = self.rope_dim
         no_pe_dim = self.head_dim - rope_dim
         q_pe, q_no_pe = torch.split(q, [rope_dim, no_pe_dim], dim=-1)
         k_pe, k_no_pe = torch.split(k, [rope_dim, no_pe_dim], dim=-1)
 
-        from tilert.models.utils import apply_rotary_emb, precompute_freqs_cis
+        from tilert.models.utils import apply_mrope_embed
 
-        local_freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
-        if not torch.is_complex(local_freqs_cis):
-            # Convert real (seq_len, rope_dim) layout to complex cis.
-            local_freqs_cis = precompute_freqs_cis(
-                self.model_args,
-                theta_override=self.model_args.rope_theta,
-                factor_override=self.model_args.rope_factor,
-            )[: local_freqs_cis.size(0)].to(device=local_freqs_cis.device)
-        q_pe = apply_rotary_emb(q_pe, local_freqs_cis, interleaved=False)
-        k_pe = apply_rotary_emb(k_pe, local_freqs_cis, interleaved=False)
+        freqs_cos, freqs_sin = mrope_embed
+        freqs_cos = freqs_cos[start_pos : start_pos + seq_len].unsqueeze(0)
+        freqs_sin = freqs_sin[start_pos : start_pos + seq_len].unsqueeze(0)
+        q_pe, k_pe = apply_mrope_embed(
+            q_pe, k_pe, freqs_cos, freqs_sin, unsqueeze_dim=2
+        )
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
 
@@ -418,26 +434,29 @@ class GQAAttention(TileRTModule):
         o = torch.matmul(attn, v_full.float())
         o = o.transpose(1, 2).contiguous()
         # Apply the per-head gate to the projected output.  The gate has the
-        # same shape as the query (bsz, seq_len, n_heads, head_dim); reduce it
-        # to one scalar per head and broadcast across the head dim.
+        # same shape as the query (bsz, seq_len, n_local_heads, head_dim);
+        # apply it element-wise (Qwen3.5-MoE attention gate).
         gate = gate.view(bsz, seq_len, self.num_local_heads, self.head_dim)
-        gate = gate.mean(dim=-1).view(bsz, seq_len, self.num_local_heads, 1)
         out = o * torch.sigmoid(gate)
         out = out.view(bsz, seq_len, -1).to(x.dtype)
         out = out @ self.o_proj_weights.T
+
+        # Sum the per-device partial results to form the full hidden state.
+        if self.num_devices > 1 and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(out)
         return out, k_cache, v_cache
 
     def tilert_forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Optimized forward placeholder."""
-        del freqs_cis, mask
+        del mrope_embed, mask
         assert self.is_init
         assert self.out is not None
         assert self.profile_logs is not None
@@ -456,11 +475,11 @@ class GQAAttention(TileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.flag_enable_tilert:
-            return self.tilert_forward(x, start_pos, freqs_cis, k_cache, v_cache, mask)
-        return self.golden_forward(x, start_pos, freqs_cis, k_cache, v_cache, mask)
+            return self.tilert_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)
+        return self.golden_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)

@@ -29,9 +29,13 @@ from tilert import logger
 from tilert.models.base import TileRTModule
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack
+from tilert.models.qwen3_6.modules.hf_source_loader import (
+    _is_hf_checkpoint,
+    load_hf_source_weights,
+)
 from tilert.models.qwen3_6.ops.rmsnorm_head_proj import RMSNormHeadProj
 from tilert.models.qwen3_6.temp_var_indices import Idx, TEMP_VARS_SIZE, validate_temp_vars_layout
-from tilert.models.utils import precompute_freqs_cis
+from tilert.models.utils import precompute_mrope_embed
 from tilert.utils import get_profile_log_tensor
 
 __all__ = [
@@ -189,15 +193,21 @@ class QwenShowHandsLayer:
         self.model_args = model_args
         assert self.model_args.arch_name == "qwen3_6"
 
-        self.num_devices = 8
+        # Respect CUDA_VISIBLE_DEVICES: only use GPUs visible to this process.
+        self.num_devices = torch.cuda.device_count()
+        if self.num_devices == 0:
+            raise RuntimeError("No CUDA/DCU devices available")
         self.forward_max_seq_len = model_args.max_seq_len
 
         self.model_path = model_path
         self.with_weight_conversion = with_weight_conversion
         self.with_mtp = with_mtp
 
-        self.multi_devices_results: list[DeviceResult | None] = [None] * torch.cuda.device_count()
-        self._stack_objects: list[QwenTransformerStack | None] = [None] * torch.cuda.device_count()
+        self.multi_devices_results: list[DeviceResult | None] = [None] * self.num_devices
+        self._stack_objects: list[QwenTransformerStack | None] = [None] * self.num_devices
+        # Persistent KV / recurrent caches for the golden forward path.
+        # Re-initialised on reset_sequence() and lazily created on first forward.
+        self._golden_caches: list[dict[str, Any] | None] = [None] * self.num_devices
 
         self.temperature = temperature
         self.top_p = top_p
@@ -211,11 +221,20 @@ class QwenShowHandsLayer:
             f"top_k={top_k}, use_topp={use_topp}"
         )
 
-    def _gen_freqs_cis(self) -> torch.Tensor:
-        freqs_cis = precompute_freqs_cis(self.model_args)
-        # Return real layout (max_seq_len, rope_dim) so it can be sliced by cur_pos
-        # and converted back to complex inside the transformer stack.
-        return torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], -1)
+    def _gen_freqs_cis(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate M-RoPE cos/sin tables for the golden forward path.
+
+        Returns:
+            Tuple of (cos, sin) tensors with shape (max_seq_len, rope_dim).
+        """
+        cos, sin = precompute_mrope_embed(self.model_args)
+        logger.debug(
+            f"Generated M-RoPE tables: cos.shape={tuple(cos.shape)}, "
+            f"sin.shape={tuple(sin.shape)}, use_mrope={self.model_args.use_mrope}, "
+            f"partial_rotary_factor={self.model_args.partial_rotary_factor}, "
+            f"mrope_section={self.model_args.mrope_section}"
+        )
+        return cos, sin
 
     def load_device_weights(
         self,
@@ -275,9 +294,13 @@ class QwenShowHandsLayer:
 
         logger.info(
             f"Device {device_id}: loaded {len(state_dicts)} tensors, "
-            f"generating freqs_cis on cuda:{device_id}"
+            f"generating M-RoPE tables on cuda:{device_id}"
         )
-        state_dicts["freqs_cis"] = self._gen_freqs_cis().to(device_id)
+        cos, sin = self._gen_freqs_cis()
+        state_dicts["freqs_cos"] = cos.to(device_id)
+        state_dicts["freqs_sin"] = sin.to(device_id)
+        # Deprecated: keep ``freqs_cis`` for older callers/tests that expect it.
+        state_dicts["freqs_cis"] = cos.to(device_id)
         return state_dicts
 
     def update_sampling_config(
@@ -487,35 +510,58 @@ class QwenShowHandsLayer:
                         if skip_keys_per_device is not None
                         else None
                     )
-                    state_dicts = self.load_device_weights(
-                        model_path,
-                        device_id,
-                        [
-                            "model.embed_tokens.weight",
-                            f"layer_{self.model_args.n_layers}_lm_head.weight_dev_{device_id}",
-                            f"layer_{self.model_args.n_layers}_model.norm.weight_dev_{device_id}",
-                        ],
-                        skip_keys=skip_keys,
-                    )
+                    if _is_hf_checkpoint(model_path):
+                        # Load the original HF checkpoint and shard weights in
+                        # memory.  The stack must already be constructed so that
+                        # each layer's ``device_sharding`` can be invoked.
+                        stack = QwenTransformerStack(
+                            self.model_args,
+                            device_id,
+                            self.num_devices,
+                        )
+                        state_dicts = load_hf_source_weights(
+                            model_path,
+                            self.model_args,
+                            self.num_devices,
+                            device_id,
+                            stack,
+                        )
+                    else:
+                        state_dicts = self.load_device_weights(
+                            model_path,
+                            device_id,
+                            [
+                                "model.embed_tokens.weight",
+                                f"layer_{self.model_args.n_layers}_lm_head.weight_dev_{device_id}",
+                                f"layer_{self.model_args.n_layers}_model.norm.weight_dev_{device_id}",
+                            ],
+                            skip_keys=skip_keys,
+                        )
 
                 cached_ffn_ops = (
                     cached_ffn_ops_per_device.get(device_id)
                     if cached_ffn_ops_per_device is not None
                     else None
                 )
-                stack = QwenTransformerStack(
-                    self.model_args,
-                    device_id,
-                    self.num_devices,
-                    cached_ffn_ops=cached_ffn_ops,
-                )
-                if model_path is not None:
-                    stack.init_tilert_weights(state_dicts)
+                if model_path is not None and _is_hf_checkpoint(model_path):
+                    # Stack was already created above so device_sharding could
+                    # be called; just keep the reference.
+                    pass
                 else:
-                    stack.init_random_weights()
-                    # Mark the top-level stack as random-init so the residual
-                    # scaling heuristic is applied only for smoke tests.
-                    stack._random_init_marker = True
+                    stack = QwenTransformerStack(
+                        self.model_args,
+                        device_id,
+                        self.num_devices,
+                        cached_ffn_ops=cached_ffn_ops,
+                    )
+                    if model_path is not None:
+                        stack.init_tilert_weights(state_dicts)
+                    else:
+                        stack.init_random_weights()
+                        # Mark the top-level stack as random-init so the residual
+                        # scaling heuristic is applied only for smoke tests.
+                        stack._random_init_marker = True
+
                 self._stack_objects[device_id] = stack
 
                 params.extend(stack.get_weights_list())
@@ -542,6 +588,11 @@ class QwenShowHandsLayer:
                     for alias, prefixed in prefixed_aliases.items():
                         if alias not in head_state and prefixed in state_dicts:
                             head_state[alias] = state_dicts[prefixed]
+                    # HF-source loader already emits the prefixed keys; ensure
+                    # both bare and prefixed aliases are present for the op.
+                    for alias in head_proj.tilert_weights_alias():
+                        if alias not in head_state and prefixed_aliases[alias] in state_dicts:
+                            head_state[alias] = state_dicts[prefixed_aliases[alias]]
                     head_proj.init_tilert_weights(head_state)
                 else:
                     head_proj.init_random_weights(device_id=device_id)
@@ -561,10 +612,18 @@ class QwenShowHandsLayer:
 
                 # RoPE frequencies are also per-device for convenience.
                 if model_path is not None:
-                    freqs_cis = state_dicts["freqs_cis"]
+                    freqs_cos = state_dicts["freqs_cos"]
+                    freqs_sin = state_dicts["freqs_sin"]
                 else:
-                    freqs_cis = self._gen_freqs_cis().to(device_id)
-                params.append(freqs_cis)
+                    freqs_cos, freqs_sin = self._gen_freqs_cis()
+                # Ensure the RoPE tables live on the compute device; the HF
+                # source loader keeps them as small CPU tensors for memory
+                # friendliness, but the golden forward path assumes they share
+                # a device with Q/K/V.
+                freqs_cos = freqs_cos.to(device_id)
+                freqs_sin = freqs_sin.to(device_id)
+                params.append(freqs_cos)
+                params.append(freqs_sin)
 
                 intermediates.extend(
                     self.generate_params_with_continuous_storage(
@@ -629,19 +688,30 @@ class QwenShowHandsLayer:
 
         threads: list[threading.Thread] = []
         exceptions: list[Exception | None] = [None] * self.num_devices
-        for device_id in range(self.num_devices):
-
-            def _runner(dev_id: int) -> None:
+        # NOTE: DCU backend is unstable when multiple devices initialize weights
+        # concurrently (segmentation faults inside torch.cuda / weight dequant).
+        # Serialize device initialization for Qwen3.6 to work around this.
+        if False:
+            for device_id in range(self.num_devices):
                 try:
-                    __load_weights(dev_id, model_path)
-                except Exception as exc:  # pragma: no cover - surfaced after join
-                    exceptions[dev_id] = exc
+                    __load_weights(device_id, model_path)
+                except Exception as exc:  # pragma: no cover - surfaced after loop
+                    exceptions[device_id] = exc
+                    logger.error(f"Failed to initialize device {device_id}: {exc}")
+        else:
+            for device_id in range(self.num_devices):
 
-            thread = threading.Thread(target=_runner, args=(device_id,))
-            threads.append(thread)
-            thread.start()
-        for thread in threads:
-            thread.join()
+                def _runner(dev_id: int) -> None:
+                    try:
+                        __load_weights(dev_id, model_path)
+                    except Exception as exc:  # pragma: no cover - surfaced after join
+                        exceptions[dev_id] = exc
+
+                thread = threading.Thread(target=_runner, args=(device_id,))
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
         for device_id, exc in enumerate(exceptions):
             if exc is not None:
                 raise RuntimeError(f"Failed to initialize device {device_id}: {exc}") from exc
@@ -720,11 +790,12 @@ class QwenShowHandsLayer:
         if stack is None:
             raise RuntimeError(f"QwenTransformerStack not initialized on device {device_id}")
 
-        # Locate the final head projection and embedding weights in params.
+        # Locate the final head projection, embedding, and RoPE weights in params.
         stack_weight_count = len(stack.get_weights_list())
         head_weight_count = 2  # RMSNormHeadProj.get_weights_list().
         embed_weight = params[stack_weight_count + head_weight_count]
-        freqs_cis_param = params[stack_weight_count + head_weight_count + 1]
+        freqs_cos_param = params[stack_weight_count + head_weight_count + 1]
+        freqs_sin_param = params[stack_weight_count + head_weight_count + 2]
 
         # 1. Embedding lookup.  ``token_id`` may be a scalar int32 or a [1]
         # tensor, so flatten it to a single index before indexing.  Also make sure
@@ -737,22 +808,47 @@ class QwenShowHandsLayer:
         intermediates[Idx.CUR_POS][0] = cur_pos
 
         # 2. Transformer stack (DeltaNet + Gated Attention layers).
-        # freqs_cis_param has shape (max_seq_len, rope_dim) in real layout.
-        # Pass the full tensor to golden_forward; GQA attention will slice it
-        # by start_pos internally, and DeltaNet ignores it.
-        h, caches = stack.golden_forward(x, cur_pos, freqs_cis_param)
+        # freqs_cos/sin_param have shape (max_seq_len, rope_dim).  Pack them as a
+        # tuple for the M-RoPE path.
+        # IMPORTANT: pass the persistent caches so KV cache and DeltaNet
+        # recurrent state survive across decode steps.
+        if self._golden_caches[device_id] is None:
+            self._golden_caches[device_id] = stack._init_layer_caches((freqs_cos_param, freqs_sin_param))
+        h, self._golden_caches[device_id] = stack.golden_forward(
+            x, cur_pos, (freqs_cos_param, freqs_sin_param), self._golden_caches[device_id]
+        )
 
         # 3. Final RMSNorm + head projection.
         # Params are TileRT-sharded; head projection weight is split across
         # devices as (logits_dim/num_devices, dim).  The reference path needs
-        # the full matrix on every device, so all-gather it here.
+        # the full matrix on every device.  If torch.distributed is available
+        # and initialized we all-gather; otherwise fall back to a local copy
+        # (useful for single-device smoke tests and debugging).
         local_head = params[stack_weight_count + 1]
-        if local_head.dim() == 2 and local_head.size(0) * self.num_devices == self.model_args.vocab_size:
-            head_list = [torch.empty_like(local_head) for _ in range(self.num_devices)]
-            torch.distributed.all_gather(head_list, local_head)
-            full_head = torch.cat(head_list, dim=0)
-        else:
+        full_head: torch.Tensor
+        if (
+            local_head.dim() == 2
+            and local_head.size(0) * self.num_devices == self.model_args.vocab_size
+        ):
             full_head = local_head
+            if torch.distributed.is_initialized():
+                head_list = [torch.empty_like(local_head) for _ in range(self.num_devices)]
+                torch.distributed.all_gather(head_list, local_head)
+                full_head = torch.cat(head_list, dim=0)
+        else:
+            # Converted checkpoint stores the head projection in the TileRT
+            # native block layout (logits_shard/16, 16, 1024).  RMSNormHeadProj
+            # already knows how to consume this layout, but for the reference
+            # path we still need the full vocabulary on every device.
+            local_head_2d = local_head.view(-1, self.model_args.dim)
+            full_head = local_head_2d
+            if (
+                torch.distributed.is_initialized()
+                and local_head_2d.size(0) * self.num_devices == self.model_args.vocab_size
+            ):
+                head_list = [torch.empty_like(local_head_2d) for _ in range(self.num_devices)]
+                torch.distributed.all_gather(head_list, local_head_2d)
+                full_head = torch.cat(head_list, dim=0)
 
         head_proj = RMSNormHeadProj(
             model_args=self.model_args,
@@ -762,7 +858,7 @@ class QwenShowHandsLayer:
         head_proj.ref_rmsnorm_gamma = params[stack_weight_count]
         head_proj.ref_head_proj = full_head
         logits = head_proj.golden_forward(h)
-        # All-gather produces logits_dim on each device; slice local shard.
+        # Gather produces logits_dim on each device; slice local shard.
         local_logits_dim = self.model_args.vocab_size // self.num_devices
         local_logits_start = device_id * local_logits_dim
         local_logits_end = local_logits_start + local_logits_dim
@@ -831,6 +927,8 @@ class QwenShowHandsLayer:
 
     def reset_sequence(self) -> None:
         """Reset the decode sequence state."""
+        # Drop persistent golden caches so the next generation starts fresh.
+        self._golden_caches = [None] * self.num_devices
         try:
             if self.with_mtp:
                 qwen36_show_hands_reset(True)
@@ -842,6 +940,7 @@ class QwenShowHandsLayer:
 
     def cleanup(self) -> None:
         """Release CUDA graphs."""
+        self._golden_caches = [None] * self.num_devices
         try:
             if self.with_mtp:
                 qwen36_show_hands_go_home(True)

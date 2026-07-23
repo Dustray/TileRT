@@ -3,6 +3,8 @@
 __all__ = [
     "precompute_freqs_cis",
     "apply_rotary_emb",
+    "precompute_mrope_embed",
+    "apply_mrope_embed",
 ]
 
 import math
@@ -153,6 +155,151 @@ def apply_rotary_emb(
     if not interleaved:
         y_out = torch.cat([y_out[..., 0::2], y_out[..., 1::2]], dim=-1)
     return y_out.to(dtype)
+
+
+def _mrope_inv_freq(partial_rotary_factor: float, head_dim: int, base: float, device=None) -> torch.Tensor:
+    """Compute inverse frequencies for M-RoPE.
+
+    Matches ``Qwen3_5MoeTextRotaryEmbedding.compute_default_rope_parameters``:
+    ``dim = int(head_dim * partial_rotary_factor)`` and
+    ``inv_freq = 1 / base^(arange(0, dim, 2) / dim)``.
+    """
+    dim = int(head_dim * partial_rotary_factor)
+    if dim % 2 != 0:
+        dim = (dim // 2) * 2
+    return 1.0 / (
+        base
+        ** (torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(dtype=torch.float32) / dim)
+    )
+
+
+def _apply_interleaved_mrope(
+    freqs: torch.Tensor, mrope_section: list[int]
+) -> torch.Tensor:
+    """Apply interleaved M-RoPE layout.
+
+    Args:
+        freqs: (3, batch, seq_len, head_dim // 2) tensor of T/H/W frequencies.
+        mrope_section: [n_t, n_h, n_w] sections summing to head_dim // 2.
+
+    Returns:
+        (batch, seq_len, head_dim // 2) tensor with interleaved T/H/W segments.
+    """
+    # Matches ``Qwen3_5MoeTextRotaryEmbedding.apply_interleaved_mrope``.
+    freqs_t = freqs[0].clone()
+    for dim, offset in enumerate((1, 2), start=1):  # H, W
+        length = mrope_section[dim] * 3
+        idx = slice(offset, length, 3)
+        freqs_t[..., idx] = freqs[dim, ..., idx]
+    return freqs_t
+
+
+def precompute_mrope_embed(
+    args,
+    max_seq_len: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-compute M-RoPE cosine/sine embeddings for Qwen3.5-MoE/Qwen3.6.
+
+    Args:
+        args: Model arguments. Must contain ``rope_theta``, ``qk_head_dim`` or
+            ``rope_dim``, ``partial_rotary_factor``, ``mrope_section``, and
+            optionally ``use_mrope``.
+        max_seq_len: Sequence length to precompute. Defaults to ``args.max_seq_len``.
+
+    Returns:
+        Tuple of (cos, sin) tensors with shape ``(max_seq_len, rope_dim)``
+        where ``rope_dim = int(head_dim * partial_rotary_factor)``.
+    """
+    head_dim = getattr(args, "qk_head_dim", getattr(args, "head_dim", None))
+    if head_dim is None:
+        raise AttributeError("args must contain qk_head_dim or head_dim")
+    partial_rotary_factor = getattr(args, "partial_rotary_factor", 1.0)
+    mrope_section = getattr(args, "mrope_section", None)
+    use_mrope = getattr(args, "use_mrope", mrope_section is not None)
+    base = getattr(args, "rope_theta", 10000.0)
+    seqlen = max_seq_len if max_seq_len is not None else args.max_seq_len
+
+    if not use_mrope or mrope_section is None:
+        # Fallback to standard 1D RoPE (keeps existing callers working).
+        dim = getattr(args, "rope_dim", int(head_dim * partial_rotary_factor))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        t_index = torch.arange(seqlen, dtype=torch.float32)
+        freqs = torch.outer(t_index, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos(), emb.sin()
+
+    # Compute M-RoPE tables entirely in numpy to avoid any DCU/HIP tensor
+    # operations that can segfault inside a cuda device context.
+    import numpy as np
+
+    dim = int(head_dim * partial_rotary_factor)
+    if dim % 2 != 0:
+        dim = (dim // 2) * 2
+    inv_freq = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+    t_index = np.arange(seqlen, dtype=np.float32)
+    freqs_1d = np.outer(t_index, inv_freq).astype(np.float32)  # (seq_len, dim//2)
+
+    # Replicate to 3 T/H/W grids and apply interleaved M-RoPE in numpy.
+    freqs_3d = np.tile(freqs_1d[np.newaxis, np.newaxis, :, :], (3, 1, 1, 1))
+    freqs_t = freqs_3d[0].copy()
+    section = list(mrope_section)
+    for dim_idx, offset in enumerate((1, 2), start=1):  # H, W
+        length = section[dim_idx] * 3
+        idx = slice(offset, length, 3)
+        freqs_t[..., idx] = freqs_3d[dim_idx, ..., idx]
+    freqs_mrope = freqs_t.squeeze(0)  # (seq_len, dim//2)
+
+    emb = np.concatenate([freqs_mrope, freqs_mrope], axis=-1).astype(np.float32)
+    cos = torch.from_numpy(np.cos(emb).copy())
+    sin = torch.from_numpy(np.sin(emb).copy())
+    return cos.contiguous(), sin.contiguous()
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input (non-interleaved)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_mrope_embed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply M-RoPE cosine/sine embeddings to query and key tensors.
+
+    Matches the official ``apply_rotary_pos_emb`` (non-interleaved) used by
+    Qwen3.5-MoE/Qwen3.6.
+
+    Args:
+        q: Query tensor, shape ``(..., seq_len, head_dim)`` or
+            ``(..., n_heads, seq_len, head_dim)``.
+        k: Key tensor with same rank as ``q``.
+        cos: Cosine embedding, shape ``(seq_len, rotary_dim)`` or broadcastable.
+        sin: Sine embedding, shape ``(seq_len, rotary_dim)`` or broadcastable.
+        unsqueeze_dim: Dimension along which to unsqueeze cos/sin so they
+            broadcast to q/k. Defaults to 1 (heads dim for
+            ``(batch, heads, seq, head_dim)``).
+
+    Returns:
+        Rotated ``(q_embed, k_embed)`` tensors.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    q_embed = q_rot * cos + _rotate_half(q_rot) * sin
+    k_embed = k_rot * cos + _rotate_half(k_rot) * sin
+
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    return q_embed, k_embed
 
 
 class SwizzleMode(IntEnum):

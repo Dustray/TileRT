@@ -289,11 +289,15 @@ class UnProjOAllReduce(TileRTModule):
             if tilert_weights_alias is not None
             else UnProjOAllReduceTilertWeightsAlias()
         )
+        if not isinstance(self.tilert_weights_alias, UnProjOAllReduceTilertWeightsAlias):
+            self.tilert_weights_alias = UnProjOAllReduceTilertWeightsAlias()
         self.ref_weights_alias = (
             ref_weights_alias
             if ref_weights_alias is not None
             else UnProjOAllReduceRefWeightsAlias()
         )
+        if not isinstance(self.ref_weights_alias, UnProjOAllReduceRefWeightsAlias):
+            self.ref_weights_alias = UnProjOAllReduceRefWeightsAlias()
 
         self.arch_name = self.model_args.arch_name
         self.dim = self.model_args.dim

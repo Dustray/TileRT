@@ -161,7 +161,15 @@ class QwenMoeBlock(TileRTModule):
 
     def device_sharding(self, raw_weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         sharded = {}
-        sharded.update(self.moe.rmsnorm_expert_proj.device_sharding(raw_weights_map))
+        rmsnorm = self.moe.rmsnorm_expert_proj
+        rms_w = raw_weights_map.get(rmsnorm.ref_weights_alias.post_attention_layernorm_weight)
+        gate_w = raw_weights_map.get(rmsnorm.ref_weights_alias.mlp_gate_weight)
+        if rms_w is not None and gate_w is not None:
+            sw1, sw2 = rmsnorm.device_sharding(rms_w, gate_w)
+            for alias, w in zip(rmsnorm.tilert_weights_alias(), (sw1, sw2)):
+                sharded[alias] = w
         sharded.update(self.moe.exp_sel_up_gate_silu.device_sharding(raw_weights_map))
-        sharded.update(self.moe.expert_down_allreduce.device_sharding(raw_weights_map, key_prefix="mlp"))
+        dw, ds = self.moe.expert_down_allreduce.device_sharding(raw_weights_map, key_prefix="mlp")
+        for alias, w in zip(self.moe.expert_down_allreduce.tilert_weights_alias(), (dw, ds)):
+            sharded[alias] = w
         return sharded

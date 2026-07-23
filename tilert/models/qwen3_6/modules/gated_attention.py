@@ -10,6 +10,7 @@ from tilert.models.base import SerializableTileRTModule, TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.moe import QwenMoeBlock
+from tilert.models.utils import apply_mrope_embed, apply_rotary_emb
 from tilert.models.qwen3_6.ops.gqa_attention import (
     GQAAttention as GQAAttentionOp,
     GQAAttentionAlgorithm,
@@ -112,7 +113,7 @@ class QwenAttentionRef(TileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
@@ -140,10 +141,16 @@ class QwenAttentionRef(TileRTModule):
         if self.k_norm_weight is not None:
             k = self._rmsnorm_heads(k, self.k_norm_weight)
 
+        freqs_cos, freqs_sin = mrope_embed
+        # Slice the full tables to the current decode window.
+        cur_cos = freqs_cos[start_pos : start_pos + seq_len]
+        cur_sin = freqs_sin[start_pos : start_pos + seq_len]
+
         q_pe, q_no_pe = torch.split(q, [self.rope_dim, self.no_pe_dim], dim=-1)
         k_pe, k_no_pe = torch.split(k, [self.rope_dim, self.no_pe_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=False)
-        k_pe = apply_rotary_emb(k_pe, freqs_cis, interleaved=False)
+        q_pe, k_pe = apply_mrope_embed(
+            q_pe, k_pe, cur_cos, cur_sin, unsqueeze_dim=1
+        )
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
 
@@ -264,7 +271,7 @@ class GatedAttention(SerializableTileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
@@ -275,7 +282,7 @@ class GatedAttention(SerializableTileRTModule):
         # Pre-attention norm + GQA (o_proj applied internally) + residual.
         norm_x = self.input_layernorm(x)
         attn_out, k_cache, v_cache = self.attn.golden_forward(
-            norm_x, start_pos, freqs_cis, k_cache, v_cache, mask
+            norm_x, start_pos, mrope_embed, k_cache, v_cache, mask
         )
         h = x + attn_out
 
@@ -290,14 +297,14 @@ class GatedAttention(SerializableTileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Optimized forward using ``GQAAttentionOp`` + ``UnProjOAllReduce`` + ``QwenMoeBlock``."""
         attn_out, k_cache, v_cache = self.attn.forward(
-            x, start_pos, freqs_cis, k_cache, v_cache, mask
+            x, start_pos, mrope_embed, k_cache, v_cache, mask
         )
         out = self.unproj_o_allreduce.forward(attn_out)
         out = self.ffn.forward(out)
@@ -307,11 +314,11 @@ class GatedAttention(SerializableTileRTModule):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        mrope_embed: tuple[torch.Tensor, torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.flag_enable_tilert:
-            return self.tilert_forward(x, start_pos, freqs_cis, k_cache, v_cache, mask)
-        return self.golden_forward(x, start_pos, freqs_cis, k_cache, v_cache, mask)
+            return self.tilert_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)
+        return self.golden_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)
