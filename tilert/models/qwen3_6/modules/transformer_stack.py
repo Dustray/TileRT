@@ -43,6 +43,7 @@ class QwenTransformerStack(SerializableTileRTModule):
         device_id: int,
         num_devices: int,
         cached_ffn_ops: list | None = None,
+        moe_sync_callback: Any | None = None,
     ):
         super().__init__(
             model_args=model_args,
@@ -54,6 +55,7 @@ class QwenTransformerStack(SerializableTileRTModule):
         self.model_args = model_args
         self.device_id = device_id
         self.num_devices = num_devices
+        self.moe_sync_callback = moe_sync_callback
 
         if cached_ffn_ops is not None:
             assert len(cached_ffn_ops) == model_args.n_layers, (
@@ -98,39 +100,29 @@ class QwenTransformerStack(SerializableTileRTModule):
                     num_devices=num_devices,
                 )
             self.register_op(block, prefix=f"layer_{layer_idx}_", suffix=f"_dev_{device_id}")
+            # Pass the TP8 MoE all-reduce callback down to each layer so the
+            # layer can aggregate its FFN partial output before adding the
+            # residual.  This keeps replicated attention/residual components
+            # out of the all-reduce sum.
+            block.moe_sync_callback = self.moe_sync_callback
             logger.debug(
                 f"Registered layer {layer_idx}: "
                 f"{'DeltaNet' if layer_type == 0 else 'GatedAttention'}"
             )
         logger.info("QwenTransformerStack construction completed")
 
-    def _block_forward(
-        self,
-        block: SerializableTileRTModule,
-        x: torch.Tensor,
-        start_pos: int,
-        layer_cache: dict[str, Any],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Route one layer through the correct forward signature.
-
-        Each block is a full Transformer layer and already applies its own
-        internal residual connections and layer norms.
-        """
-        if isinstance(block, DeltaNet):
-            out, layer_cache["delta_state"] = block.forward(
-                x, start_pos, layer_cache.get("delta_state")
-            )
-            return out, layer_cache
-        if isinstance(block, GatedAttention):
-            k_cache = layer_cache["k_cache"]
-            v_cache = layer_cache["v_cache"]
-            out, k_cache, v_cache = block.forward(
-                x, start_pos, layer_cache["mrope_embed"], k_cache, v_cache, layer_cache.get("mask")
-            )
-            layer_cache["k_cache"] = k_cache
-            layer_cache["v_cache"] = v_cache
-            return out, layer_cache
-        raise TypeError(f"Unsupported block type: {type(block)}")
+    def _prepare_mrope_embed(
+        self, mrope_embed: tuple[torch.Tensor, torch.Tensor] | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize RoPE tables to a (cos, sin) tuple."""
+        if isinstance(mrope_embed, tuple):
+            return mrope_embed
+        freqs_cis = mrope_embed
+        if torch.is_complex(freqs_cis):
+            freqs_cis = torch.view_as_real(freqs_cis)
+        else:
+            freqs_cis = freqs_cis.view(freqs_cis.size(0), -1, 2)
+        return freqs_cis[..., 0], freqs_cis[..., 1]
 
     def golden_forward(
         self,
@@ -141,37 +133,16 @@ class QwenTransformerStack(SerializableTileRTModule):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Reference forward through all 40 heterogeneous layers.
 
-        Args:
-            mrope_embed: Either a tuple of (cos, sin) tensors, each of shape
-                ``(max_seq_len, rope_dim)``, or a legacy complex ``freqs_cis``
-                tensor for backward compatibility.
+        Dispatches each block via ``block.forward()`` so that individual ops
+        can decide between golden/tilert based on ``flag_enable_tilert``.
         """
-        if isinstance(mrope_embed, tuple):
-            freqs_cos, freqs_sin = mrope_embed
-        else:
-            # Backward compatibility: convert complex freqs_cis to (cos, sin).
-            freqs_cis = mrope_embed
-            if torch.is_complex(freqs_cis):
-                freqs_cis = torch.view_as_real(freqs_cis)
-            else:
-                freqs_cis = freqs_cis.view(freqs_cis.size(0), -1, 2)
-            freqs_cos = freqs_cis[..., 0]
-            freqs_sin = freqs_cis[..., 1]
-            mrope_embed = (freqs_cos, freqs_sin)
-
+        mrope_embed = self._prepare_mrope_embed(mrope_embed)
         if caches is None:
             caches = self._init_layer_caches(mrope_embed)
 
         h = x
-        # Use full residual addition for real pretrained weights; only scale
-        # the residual branch when randomly initialized weights are detected
-        # (by checking whether any child module was created with the
-        # ``is_random_init`` marker).  This keeps random-init sanity tests
-        # numerically bounded without changing real-model semantics.
-        residual_scale = 1.0 / max(len(self.exec_seq), 1) if self._is_random_init() else 1.0
         shared_k_cache = caches["k_cache"]
         shared_v_cache = caches["v_cache"]
-        # Build a causal mask for multi-token prefill in GQA layers.
         seq_len = x.size(1)
         mask = None
         if seq_len > 1:
@@ -182,25 +153,35 @@ class QwenTransformerStack(SerializableTileRTModule):
                 device=x.device,
             )
             mask = torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0)
+
         for layer_idx, block in enumerate(self.exec_seq):
-            layer_cache = {
-                "k_cache": shared_k_cache,
-                "v_cache": shared_v_cache,
-                "mrope_embed": mrope_embed,
-                "delta_state": caches.get("delta_state", {}).get(layer_idx),
-                "mask": mask,
-            }
-            out, layer_cache = self._block_forward(block, h, start_pos, layer_cache)
+            if isinstance(block, DeltaNet):
+                out, layer_state = block.forward(
+                    h, start_pos, caches.get("delta_state", {}).get(layer_idx)
+                )
+                if layer_state is not None:
+                    caches.setdefault("delta_state", {})[layer_idx] = layer_state["delta_state"]
+            elif isinstance(block, GatedAttention):
+                out, shared_k_cache, shared_v_cache = block.forward(
+                    h, start_pos, mrope_embed, shared_k_cache, shared_v_cache, mask
+                )
+            else:
+                raise TypeError(f"Unsupported block type: {type(block)}")
+
             if torch.isnan(out).any() or torch.isinf(out).any():
                 logger.warning(
                     f"QwenTransformerStack layer {layer_idx} produced NaN/Inf; "
                     f"mean={out.float().mean().item():.4f}, std={out.float().std().item():.4f}"
                 )
-            h = h + out * residual_scale
-            shared_k_cache = layer_cache["k_cache"]
-            shared_v_cache = layer_cache["v_cache"]
-            if "delta_state" in layer_cache:
-                caches.setdefault("delta_state", {})[layer_idx] = layer_cache["delta_state"]
+
+            # ``block.forward`` returns the full layer output already
+            # containing the attention and FFN residuals (matching HF's
+            # Qwen3_5MoeDecoderLayer convention).  Do not add it to ``h``
+            # again.  The per-layer MoE partial output is all-reduced inside
+            # the block before the FFN residual is added, so no extra
+            # synchronization is needed here.
+            h = out
+
         caches["k_cache"] = shared_k_cache
         caches["v_cache"] = shared_v_cache
         return h, caches
@@ -214,8 +195,8 @@ class QwenTransformerStack(SerializableTileRTModule):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Optimized forward placeholder.
 
-        Falls back to ``golden_forward`` until the dedicated Qwen3.6 CUDA-graph
-        wrappers are implemented.
+        Currently routes through ``golden_forward`` because the dedicated
+        Qwen3.6 CUDA-graph wrappers are not yet implemented.
         """
         return self.golden_forward(x, start_pos, mrope_embed, caches)
 

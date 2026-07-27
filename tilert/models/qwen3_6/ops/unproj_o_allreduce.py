@@ -303,14 +303,9 @@ class UnProjOAllReduce(TileRTModule):
         self.dim = self.model_args.dim
         self.n_heads = self.model_args.n_heads
         self.head_dim = self.model_args.v_head_dim
-
-        if self.n_heads % self.num_devices == 0:
-            self.num_local_heads = self.n_heads // self.num_devices
-        else:
-            n_local = math.ceil(self.n_heads / self.num_devices)
-            if n_local % 2 != 0:
-                n_local += 1
-            self.num_local_heads = n_local
+        # EP8: no head-dim tensor parallelism; replicate the full o_proj on every
+        # device.  num_local_heads is only used for sharding layout below.
+        self.num_local_heads = self.n_heads
 
         self.block_size = self.model_args.block_size
         self.algorithm: UnProjOAllReduceAlgorithm = algorithm
@@ -360,57 +355,14 @@ class UnProjOAllReduce(TileRTModule):
                 device=unproj_o_weight.device,
             )
 
-        if self.n_heads % self.num_devices == 0:
-            unproj_o_weight = unproj_o_weight.reshape(self.dim, self.num_devices, -1)
-            unproj_o_weight = unproj_o_weight.transpose(0, 1)
-            unproj_o_scale = unproj_o_scale.reshape(
-                self.dim // self.block_size, self.num_devices, -1
-            )
-            unproj_o_scale = unproj_o_scale.transpose(0, 1)
-        else:
-            cols_per_head = self.head_dim
-            cols_per_dev = self.num_local_heads * cols_per_head
-            W = unproj_o_weight.view(self.dim, self.n_heads, cols_per_head)
-
-            scale_cols_per_head = cols_per_head // self.block_size
-            scale_cols_per_dev = self.num_local_heads * scale_cols_per_head
-            S = unproj_o_scale.view(self.dim // self.block_size, self.n_heads, scale_cols_per_head)
-
-            W_devs = []
-            S_devs = []
-            for dev in range(self.num_devices):
-                start = dev * self.num_local_heads
-                end = min(self.n_heads, start + self.num_local_heads)
-                real = max(0, end - start)
-
-                dev_W = torch.zeros(
-                    self.dim,
-                    self.num_local_heads,
-                    cols_per_head,
-                    dtype=W.dtype,
-                    device=W.device,
-                )
-                if real > 0:
-                    dev_W[:, :real] = W[:, start:end]
-                W_devs.append(dev_W.reshape(self.dim, cols_per_dev))
-
-                dev_S = torch.zeros(
-                    self.dim // self.block_size,
-                    self.num_local_heads,
-                    scale_cols_per_head,
-                    dtype=S.dtype,
-                    device=S.device,
-                )
-                if real > 0:
-                    dev_S[:, :real] = S[:, start:end]
-                S_devs.append(dev_S.reshape(self.dim // self.block_size, scale_cols_per_dev))
-
-            unproj_o_weight = torch.stack(W_devs, dim=0)
-            unproj_o_scale = torch.stack(S_devs, dim=0)
-
+        # EP8: replicate the full o_proj weight/scale on every device.
         return {
-            self.tilert_weights_alias.unproj_weights: unproj_o_weight.contiguous(),
-            self.tilert_weights_alias.unproj_scales: unproj_o_scale.contiguous(),
+            self.tilert_weights_alias.unproj_weights: torch.stack(
+                [unproj_o_weight for _ in range(self.num_devices)], dim=0
+            ).contiguous(),
+            self.tilert_weights_alias.unproj_scales: torch.stack(
+                [unproj_o_scale for _ in range(self.num_devices)], dim=0
+            ).contiguous(),
         }
 
     def init_reference_weights(

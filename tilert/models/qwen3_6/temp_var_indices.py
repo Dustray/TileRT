@@ -40,22 +40,22 @@ class QwenTempVarIdx(IntEnum):
     SCORES = 9  # Router scores before top-k [bsz, seq, n_routed_experts] fp32.
     SEL_PROBS = 10  # Selected expert probabilities [bsz, seq, n_activated] fp32.
     SEL_INDICES = 11  # Selected expert indices [bsz, seq, n_activated] int32.
-    UP_GATE = 12  # Up * gate * SiLU output [bsz, seq, n_total, inter_dim_per_dev] bf16.
+    UP_GATE = 12  # Up * gate * SiLU output [bsz, seq, n_total, inter_dim] bf16.
     EXP_OUT = 13  # MoE/MLP output [bsz, seq, dim] bf16.
 
     # Head projection / sampling.
-    LOGITS_OUT = 14  # Shard of logits on this device [bsz, seq, vocab_per_dev] fp32.
+    LOGITS_OUT = 14  # Full logits replicated on this device [bsz, seq, vocab_size] fp32.
     TOKEN_OUT = 15  # Sampled next token [bsz, seq, 1] int32.
     SAMPLING_SEED = 16  # Request-level seed [bsz, seq] int64.
     SAMPLING_POSITIONS = 17  # Per-step position offsets [bsz, seq] int64.
     SAMPLING_CONFIG = 18  # [temperature, top_p, top_k_float, use_topp_flag] fp32.
     TOP_P_SCORES = 19  # Sampled token score [bsz, seq] fp32.
-    TOP_P_DEBUG = 20  # Debug buffer for top-p kernel [bsz, seq, vocab_per_dev] fp32.
+    TOP_P_DEBUG = 20  # Debug buffer for top-p kernel [bsz, seq, vocab_size] fp32.
 
     # Optional / reserved slots for future kernels.
     X_QUANT = 21  # Quantized activation [bsz, seq, dim] fp8.
     X_SCALE = 22  # Activation scale [bsz, seq, dim // block_size] fp32.
-    MOE_UP_GATE = 23  # Extra workspace for fused MoE [bsz, seq, ...] bf16.
+    MOE_UP_GATE = 23  # Extra workspace for fused MoE [bsz, seq, n_total, inter_dim] bf16.
 
     # MTP-related (reserved, Qwen3.6 currently has one MTP layer).
     DRAFT_TOKENS = 24

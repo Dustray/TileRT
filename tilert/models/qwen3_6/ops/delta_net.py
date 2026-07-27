@@ -200,9 +200,11 @@ class DeltaNetOp(TileRTModule):
         self.head_dim = model_args.delta_key_head_dim
         self.value_head_dim = model_args.delta_value_head_dim
         self.dim = model_args.dim
-        self.num_local_heads = self.n_heads // num_devices
-        self.num_local_k_heads = max(1, self.n_k_heads // num_devices)
-        self.num_local_v_heads = max(1, self.n_v_heads // num_devices)
+        # EP8: no tensor parallelism for DeltaNet weights; replicate full
+        # projection matrices on every device.
+        self.num_local_heads = self.n_heads
+        self.num_local_k_heads = self.n_k_heads
+        self.num_local_v_heads = self.n_v_heads
 
         self.tilert_weights_alias = DeltaNetTilertWeightsAlias()
         self.ref_weights_alias = DeltaNetRefWeightsAlias()
@@ -246,77 +248,26 @@ class DeltaNetOp(TileRTModule):
     def device_sharding(
         self, weights_map: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Shard DeltaNet reference weights across devices.
+        """Replicate full DeltaNet reference weights on every device (EP8).
 
-        Splits the column dimensions of the projection weights so each device
-        owns a contiguous slice.  The output dimensions differ per tensor:
-
-        - in_proj_qkv: (n_q_heads + 2*n_kv_heads) * head_dim
-        - in_proj_z/out_proj: value_dim (n_kv_heads * value_head_dim)
-        - in_proj_a/in_proj_b: n_kv_heads * a/b dim
-        - conv1d: same as in_proj_qkv
-        - A_log/dt_bias/norm: small per-head/per-value vectors, split similarly
+        Under EP8 only the MoE experts are sharded across devices; attention
+        and DeltaNet projection weights are replicated in full.  This method
+        stacks the same full tensors ``num_devices`` times so the downstream
+        ``init_reference_weights`` can still index ``[device_id]``.
         """
         prefix = self.ref_weights_alias.key_prefix
         aliases = self.ref_weights_alias.ref_tensor_alias
-        out_slices = self._get_local_out_slices()
-
-        args = self.model_args
-        sharded: dict[str, list[torch.Tensor]] = {alias: [] for alias in self.tilert_weights_alias()}
-        for dev in range(self.num_devices):
-            slc = out_slices[dev]
-            qkv = weights_map[aliases[0]][slc[0]]
-            z = weights_map[aliases[1]][slc[1]]
-            a = weights_map[aliases[2]][slc[2]]
-            b = weights_map[aliases[3]][slc[3]]
-            # conv1d weight layout is (out_channels, 1, kernel_size); the
-            # out-channel dimension matches ``in_proj_qkv`` so slice dim 0.
-            conv1d = weights_map[aliases[4]][slc[0], :, :]
-            A_log = weights_map[aliases[5]][slc[2]]
-            dt_bias = weights_map[aliases[6]][slc[3]]
-            # ``norm.weight`` has shape (delta_value_head_dim,).  It is not
-            # the same size as z/gate dim, so split it evenly across devices.
-            norm_slc = slc[4]
-            norm = weights_map[aliases[7]][norm_slc]
-            out_proj = weights_map[aliases[8]][:, slc[1]]
-            sharded[self.tilert_weights_alias.in_proj_qkv_weights].append(qkv)
-            sharded[self.tilert_weights_alias.in_proj_z_weights].append(z)
-            sharded[self.tilert_weights_alias.in_proj_a_weights].append(a)
-            sharded[self.tilert_weights_alias.in_proj_b_weights].append(b)
-            sharded[self.tilert_weights_alias.conv1d_weights].append(conv1d)
-            sharded[self.tilert_weights_alias.A_log].append(A_log)
-            sharded[self.tilert_weights_alias.dt_bias].append(dt_bias)
-            sharded[self.tilert_weights_alias.norm_weights].append(norm)
-            sharded[self.tilert_weights_alias.out_proj_weights].append(out_proj)
 
         return {
-            alias: torch.stack(tensors, dim=0).contiguous()
-            for alias, tensors in sharded.items()
+            alias: torch.stack(
+                [weights_map[ref_alias] for _ in range(self.num_devices)], dim=0
+            ).contiguous()
+            for alias, ref_alias in zip(self.tilert_weights_alias(), aliases)
         }
 
     def _get_local_out_slices(self) -> list[list[slice]]:
-        """Return per-device column slices for each DeltaNet projection."""
-        args = self.model_args
-        qkv_out = args.delta_conv_dim  # n_q_heads * head_dim + 2 * n_kv_heads * head_dim
-        z_out = args.delta_gate_dim    # n_kv_heads * value_head_dim
-        a_out = args.delta_a_dim       # n_kv_heads * a_dim
-        b_out = args.delta_b_dim       # n_kv_heads * b_dim
-        norm_out = args.delta_value_head_dim  # per-device split for norm.weight
-        qkv_per_dev = qkv_out // self.num_devices
-        z_per_dev = z_out // self.num_devices
-        a_per_dev = a_out // self.num_devices
-        b_per_dev = b_out // self.num_devices
-        norm_per_dev = norm_out // self.num_devices
-        slices = []
-        for dev in range(self.num_devices):
-            slices.append([
-                slice(dev * qkv_per_dev, (dev + 1) * qkv_per_dev),
-                slice(dev * z_per_dev, (dev + 1) * z_per_dev),
-                slice(dev * a_per_dev, (dev + 1) * a_per_dev),
-                slice(dev * b_per_dev, (dev + 1) * b_per_dev),
-                slice(dev * norm_per_dev, (dev + 1) * norm_per_dev),
-            ])
-        return slices
+        """Unused under EP8; kept for backward compatibility only."""
+        return []
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")

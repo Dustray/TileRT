@@ -162,13 +162,9 @@ class GQAAttention(TileRTModule):
         self.head_dim = model_args.qk_head_dim
         self.v_head_dim = model_args.v_head_dim
         self.rope_dim = model_args.rope_dim
-        # True tensor-parallel sharding by head.  Q heads are evenly split
-        # across devices; KV heads are replicated on every device because
-        # n_kv_heads (2) is much smaller than num_devices (8).
-        if self.n_heads % self.num_devices == 0:
-            self.num_local_heads = self.n_heads // self.num_devices
-        else:
-            self.num_local_heads = max(1, self.n_heads // self.num_devices)
+        # EP8: no tensor parallelism for attention weights.  Replicate the full
+        # attention matrices on every device; only MoE experts are sharded.
+        self.num_local_heads = self.n_heads
         self.num_local_kv_heads = self.n_kv_heads
 
         self.tilert_weights_alias = GQAAttentionTilertWeightsAlias()
@@ -202,11 +198,12 @@ class GQAAttention(TileRTModule):
     def device_sharding(
         self, weights_map: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Shard GQA reference weights across devices.
+        """Replicate full GQA reference weights on every device (EP8).
 
-        For the reference/golden path we split q/k/v/o_proj and q_norm/k_norm
-        along the head dimension so each device owns ``num_local_heads`` Q
-        heads and ``num_local_kv_heads`` KV heads.
+        Under EP8 attention weights are not tensor-parallel sharded; only the
+        MoE experts are split across devices.  This method stacks the same full
+        q/k/v/o_proj and q_norm/k_norm tensors ``num_devices`` times so that
+        ``init_reference_weights`` can simply index ``[device_id]``.
         """
         prefix = self.ref_weights_alias.key_prefix
         q_w = weights_map[f"{prefix}.q_proj.weight"]
@@ -216,45 +213,21 @@ class GQAAttention(TileRTModule):
         q_norm_w = weights_map[f"{prefix}.q_norm.weight"]
         k_norm_w = weights_map[f"{prefix}.k_norm.weight"]
 
-        # The q-projection output is split into query and gate, so it is twice
-        # the size of a normal Q projection.  Shard Q heads evenly across
-        # devices while replicating the small GQA KV heads on every device.
-        q_heads_per_dev = self.num_local_heads
-        q_dim_per_dev = q_heads_per_dev * self.head_dim * 2
-        kv_dim = self.n_kv_heads * self.head_dim
-        v_dim = self.n_kv_heads * self.v_head_dim
-
-        q_w = q_w.view(self.n_heads, self.head_dim * 2, self.dim)
-        q_parts = [
-            q_w[did * q_heads_per_dev : (did + 1) * q_heads_per_dev]
-            .reshape(q_dim_per_dev, self.dim)
-            for did in range(self.num_devices)
-        ]
-        qkv_parts = [
-            torch.cat([q_parts[did], k_w, v_w], dim=0)
-            for did in range(self.num_devices)
-        ]
-
-        # o_proj is column-sharded by head: each device owns the columns that
-        # correspond to its local Q heads.
-        o_w = o_w.view(self.dim, self.n_heads, self.v_head_dim)
-        o_parts = [
-            o_w[:, did * q_heads_per_dev : (did + 1) * q_heads_per_dev, :]
-            .reshape(self.dim, q_heads_per_dev * self.v_head_dim)
-            for did in range(self.num_devices)
-        ]
-
-        # q_norm/k_norm are per-head vectors; replicate the full vectors because
-        # every device uses the same norm weights for its local KV heads and
-        # the Q-head shards just index into the same vectors.
-        q_norm_parts = [q_norm_w for _ in range(self.num_devices)]
-        k_norm_parts = [k_norm_w for _ in range(self.num_devices)]
+        qkv_proj_weights = torch.cat([q_w, k_w, v_w], dim=0)
 
         return {
-            self.tilert_weights_alias.qkv_proj_weights: torch.stack(qkv_parts, dim=0).contiguous(),
-            self.tilert_weights_alias.o_proj_weights: torch.stack(o_parts, dim=0).contiguous(),
-            self.tilert_weights_alias.q_norm_weights: torch.stack(q_norm_parts, dim=0).contiguous(),
-            self.tilert_weights_alias.k_norm_weights: torch.stack(k_norm_parts, dim=0).contiguous(),
+            self.tilert_weights_alias.qkv_proj_weights: torch.stack(
+                [qkv_proj_weights for _ in range(self.num_devices)], dim=0
+            ).contiguous(),
+            self.tilert_weights_alias.o_proj_weights: torch.stack(
+                [o_w for _ in range(self.num_devices)], dim=0
+            ).contiguous(),
+            self.tilert_weights_alias.q_norm_weights: torch.stack(
+                [q_norm_w for _ in range(self.num_devices)], dim=0
+            ).contiguous(),
+            self.tilert_weights_alias.k_norm_weights: torch.stack(
+                [k_norm_w for _ in range(self.num_devices)], dim=0
+            ).contiguous(),
         }
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -316,8 +289,6 @@ class GQAAttention(TileRTModule):
             dtype=torch.bfloat16,
             device=device,
         ) / ((self.n_heads * self.v_head_dim) ** 0.5)
-        # q_norm/k_norm are per-head scalars; the checkpoint stores one value
-        # per head (head_dim entries per head).
         # q_norm/k_norm are per-head scalars applied to each head individually.
         q_norm_w = torch.ones(
             self.head_dim,
@@ -329,10 +300,7 @@ class GQAAttention(TileRTModule):
             dtype=torch.float32,
             device=device,
         )
-        # Build a synthetic checkpoint dict so we can reuse ``device_sharding``,
-        # which correctly handles any ``num_devices`` split.  This keeps the
-        # random-init reference path working for both single-device and
-        # multi-device sanity tests.
+        # EP8: reuse device_sharding (which now replicates full weights).
         q_split = self.n_heads * self.head_dim * 2
         state_dict = {
             f"{self.ref_weights_alias.key_prefix}.q_proj.weight": qkv_w[:q_split],
@@ -441,9 +409,7 @@ class GQAAttention(TileRTModule):
         out = out.view(bsz, seq_len, -1).to(x.dtype)
         out = out @ self.o_proj_weights.T
 
-        # Sum the per-device partial results to form the full hidden state.
-        if self.num_devices > 1 and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(out)
+        # EP8: attention weights are replicated, so no all-reduce is needed.
         return out, k_cache, v_cache
 
     def tilert_forward(

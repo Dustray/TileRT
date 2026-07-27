@@ -183,7 +183,17 @@ class RMSNormHeadProj(TileRTModule):
         rmsnorm_gamma = rmsnorm_gamma.repeat(self.num_devices, 1)
         head_proj = weights_dict[head_proj_key]
 
-        head_proj = head_proj.reshape(self.num_devices, -1, self.dim)
+        # Detect already-sharded TileRT checkpoint: each device already owns a
+        # vocab shard of shape (vocab_shard, dim).  Stack them; otherwise
+        # replicate the full head projection.
+        if head_proj.dim() == 2 and head_proj.size(0) * self.num_devices == self.logits_dim:
+            head_proj = head_proj[None, ...].repeat(self.num_devices, 1, 1)
+        elif head_proj.dim() == 3 and head_proj.size(0) == self.num_devices:
+            # Already stacked (e.g. from init_random_weights/device_sharding).
+            pass
+        else:
+            # EP8 / replicated full vocab layout.
+            head_proj = head_proj[None, ...].repeat(self.num_devices, 1, 1)
         return rmsnorm_gamma.contiguous(), head_proj.contiguous()
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -231,8 +241,9 @@ class RMSNormHeadProj(TileRTModule):
             dtype=torch.bfloat16,
             device=f"cuda:{self.device_id}",
         )
+        # EP8: full vocab logits on every device.
         self.hidden_out = torch.zeros(
-            (batch_size, seq_len, self.logits_dim // self.num_devices),
+            (batch_size, seq_len, self.logits_dim),
             dtype=torch.float32,
             device=f"cuda:{self.device_id}",
         )
@@ -291,9 +302,12 @@ class RMSNormHeadProj(TileRTModule):
         # produced by device_sharding for the reference path.
         head_proj = self.ref_head_proj
         if head_proj.dim() == 3:
-            # TileRT-sharded layout: (logits_shard, 16, 1024) blocks.
-            # Reconstruct (logits_shard * 16, dim) for matmul.
-            head_proj = head_proj.transpose(1, 2).reshape(-1, self.dim)
+            if head_proj.size(-1) == 1024 and head_proj.size(-2) == 16:
+                # TileRT-swizzled layout: (logits_shard, 16, 1024) blocks.
+                head_proj = head_proj.transpose(1, 2).reshape(-1, self.dim)
+            else:
+                # Already dense per-device vocab shard.
+                head_proj = head_proj.reshape(-1, self.dim)
         return hidden_rmsnorm.float() @ head_proj.T.float()
 
     def tilert_forward(

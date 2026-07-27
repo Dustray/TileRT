@@ -74,36 +74,29 @@ def _unshard_to_per_device(
 ) -> dict[str, torch.Tensor]:
     """Convert a sharded state dict with a device dimension to per-device keys.
 
-    TileRT ``device_sharding`` methods stack per-device slices either at
-    dimension 0 (the default, e.g. QKV/O projections) or at dimension 1 for
-    MoE weights whose first dimension is the expert count.  This helper
-    extracts the slice belonging to ``device_id`` and avoids keeping full
-    replicated tensors on every device.
-
-    Heuristic:
-      * 0-D tensors: returned as-is.
-      * Dim 0 == ``num_devices``: device shards are along dim 0 (e.g.
-        ``qkv_proj_weights``, ``o_proj_weights``, ``shared_expert_gate``).
-      * Dim 1 == ``num_devices``: device shards are along dim 1 for stacked
-        expert weights whose first dimension is the expert count (e.g.
-        ``exp_gate_weights``, ``exp_up_weights``, ``exp_down_weights``).
-      * Otherwise: keep the full tensor (small replicated tensors such as
-        ``unproj_o_gamma`` and ``exp_proj_weights``).
+    Layout conventions:
+      * Attention / DeltaNet / O-projection / lm_head weights are replicated on
+        every device; ``device_sharding`` stacks them along dim 0.
+      * MoE gate/up/down weights are tensor-parallel sharded along the
+        *intermediate* dimension, while the second dimension is the
+        ``num_devices`` TP shard slot.  They have shape
+        ``(n_experts, num_devices, ...)`` and we extract ``[:, device_id]`` to
+        keep the local inter_dim shard for every expert (shared + all routed).
+      * Small replicated tensors such as ``unproj_o_gamma`` and
+        ``exp_proj_weights`` are returned as-is.
     """
     per_device: dict[str, torch.Tensor] = {}
     for key, tensor in sharded.items():
         if tensor.dim() == 0:
             per_device[key] = tensor
             continue
-        # Device shards stacked along dimension 0.
+        # TP8 MoE expert-stacked weights: (n_experts, num_devices, ...)
+        if tensor.dim() >= 3 and tensor.size(1) == num_devices:
+            per_device[key] = tensor[:, device_id]
+            continue
+        # Replicated weights stacked along dim 0 (attention, norm, lm_head).
         if tensor.size(0) == num_devices:
             per_device[key] = tensor[device_id]
-            continue
-        # Device shards stacked along dimension 1 for MoE expert-stacked
-        # weights; the first dimension is the expert count (257 routed + 1
-        # shared = 258 for gate/up, 257 for down after concatenation).
-        if tensor.dim() >= 2 and tensor.size(1) == num_devices:
-            per_device[key] = tensor[:, device_id]
             continue
         per_device[key] = tensor
     return per_device
@@ -191,18 +184,96 @@ def _split_state_dict_by_layer(
     return embeddings, layers, head_norm
 
 
+def _precompute_all_device_states(
+    model_path: str,
+    model_args: ModelArgsQwen36,
+    num_devices: int,
+    stack: QwenTransformerStack,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], list[dict[str, dict[str, torch.Tensor]]]]:
+    """Load the HF checkpoint once and shard every layer for all devices.
+
+    Returns:
+      * ``embeddings``: embedding tensors (replicated across devices later).
+      * ``head_state_per_device``: dict mapping device_id -> head state dict.
+      * ``per_device_layer_states``: list of length ``n_layers``; each element is
+        a dict mapping device_id -> per-device TileRT state dict for that layer.
+
+    This centralizes the CPU-heavy ``device_sharding`` work so that it runs
+    exactly once, regardless of how many devices are being loaded.
+    """
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_path, encoding="utf-8") as f:
+        weight_index = json.load(f)["weight_map"]
+
+    full_state = _load_hf_checkpoint_into_cpu(model_path, weight_index)
+    embeddings, per_layer, head_norm = _split_state_dict_by_layer(
+        full_state, model_args.n_layers
+    )
+
+    head_proj = RMSNormHeadProj(
+        model_args=model_args,
+        device_id=0,
+        num_devices=num_devices,
+    )
+    head_sharded_gamma, head_sharded_head = head_proj.device_sharding(
+        {**head_norm, **embeddings}
+    )
+    n_layers = model_args.n_layers
+    head_state_per_device: dict[str, torch.Tensor] = {}
+    for did in range(num_devices):
+        head_state_per_device[str(did)] = {
+            f"layer_{n_layers}_model.norm.weight_dev_{did}": head_sharded_gamma[did],
+            f"layer_{n_layers}_lm_head.weight_dev_{did}": head_sharded_head[did],
+        }
+
+    per_device_layer_states: list[dict[str, dict[str, torch.Tensor]]] = []
+    for layer_idx, layer_state in enumerate(per_layer):
+        if not layer_state:
+            per_device_layer_states.append({str(did): {} for did in range(num_devices)})
+            continue
+        stripped = _strip_language_model_prefix(layer_state)
+        local_state: dict[str, torch.Tensor] = {}
+        lead = f"layers.{layer_idx}."
+        for key, tensor in stripped.items():
+            if key.startswith(lead):
+                local_state[key[len(lead):]] = tensor
+            else:
+                local_state[key] = tensor
+        block = stack.exec_seq[layer_idx]
+        sharded = block.device_sharding(local_state)
+
+        layer_states: dict[str, dict[str, torch.Tensor]] = {}
+        for did in range(num_devices):
+            per_device = _unshard_to_per_device(sharded, did, num_devices)
+            device_state = {
+                f"layer_{layer_idx}_{alias}_dev_{did}": tensor
+                for alias, tensor in per_device.items()
+            }
+            layer_states[str(did)] = device_state
+        per_device_layer_states.append(layer_states)
+
+    return embeddings, head_state_per_device, per_device_layer_states
+
+
 def load_hf_source_weights(
     model_path: str,
     model_args: ModelArgsQwen36,
     num_devices: int,
     device_id: int,
     stack: QwenTransformerStack,
+    precomputed: tuple[
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        list[dict[str, dict[str, torch.Tensor]]],
+    ]
+    | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build the per-device TileRT state dict from an HF checkpoint.
 
-    This function is intended to be called once per device.  It shards the
-    loaded CPU tensors according to each op's ``device_sharding`` method and
-    moves only the selected device shard to ``cuda:{device_id}``.
+    When ``precomputed`` is provided (the common case for multi-device loading),
+    this function only moves the already-sharded CPU tensors to
+    ``cuda:{device_id}`` and assembles the final state dict.  The expensive
+    ``device_sharding`` calls happen once in ``_precompute_all_device_states``.
 
     The returned dict contains keys that match the existing
     ``init_tilert_weights`` conventions:
@@ -212,30 +283,14 @@ def load_hf_source_weights(
       * ``layer_{n_layers}_model.norm.weight_dev_{device_id}``
       * ``layer_{n_layers}_lm_head.weight_dev_{device_id}``
     """
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
-    with open(index_path, encoding="utf-8") as f:
-        weight_index = json.load(f)["weight_map"]
-
-    # Load once.  In a multi-thread/multi-process setting the caller may want
-    # to cache this; for now we load per-call to keep the loader self-contained.
-    full_state = _load_hf_checkpoint_into_cpu(model_path, weight_index)
-    embeddings, per_layer, head_norm = _split_state_dict_by_layer(
-        full_state, model_args.n_layers
-    )
-
-    # Build head projection on the target device (small, cheap).
     dev = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
-    head_proj = RMSNormHeadProj(
-        model_args=model_args,
-        device_id=device_id,
-        num_devices=num_devices,
-    )
-    head_state = _head_state_from_hf(
-        {**head_norm, **embeddings},
-        head_proj,
-        num_devices,
-        device_id,
-    )
+
+    if precomputed is None:
+        embeddings, head_state_per_device, per_device_layer_states = (
+            _precompute_all_device_states(model_path, model_args, num_devices, stack)
+        )
+    else:
+        embeddings, head_state_per_device, per_device_layer_states = precomputed
 
     result: dict[str, torch.Tensor] = {}
 
@@ -255,30 +310,15 @@ def load_hf_source_weights(
     result["freqs_sin"] = sin
     result["freqs_cis"] = cos  # backward compat
 
-    # Shard each layer and rename to TileRT per-device keys.
-    for layer_idx, layer_state in enumerate(per_layer):
-        if not layer_state:
-            continue
-        stripped = _strip_language_model_prefix(layer_state)
-        # Strip the leading ``layers.{idx}.`` so the block sees the local
-        # aliases that match its op-level ``ref_weights_alias``.
-        local_state = {}
-        lead = f"layers.{layer_idx}."
-        for key, tensor in stripped.items():
-            if key.startswith(lead):
-                local_state[key[len(lead):]] = tensor
-            else:
-                local_state[key] = tensor
-        block = stack.exec_seq[layer_idx]
-        sharded = block.device_sharding(local_state)
-        per_device = _unshard_to_per_device(sharded, device_id, num_devices)
-        for alias, tensor in per_device.items():
-            result[f"layer_{layer_idx}_{alias}_dev_{device_id}"] = tensor.to(dev)
+    # Move the pre-sharded layer states to the target device.
+    for layer_states in per_device_layer_states:
+        device_state = layer_states.get(str(device_id), {})
+        for alias, tensor in device_state.items():
+            result[alias] = tensor.to(dev)
 
-    result.update(head_state)
     # Move head tensors to target device.
-    for key in list(head_state.keys()):
-        result[key] = result[key].to(dev)
+    for alias, tensor in head_state_per_device[str(device_id)].items():
+        result[alias] = tensor.to(dev)
 
     logger.info(
         f"HF-source loader: device {device_id} received {len(result)} tensors"

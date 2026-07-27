@@ -58,7 +58,10 @@ class ModelArgsQwen36:
     n_activated_experts: int = 8
     n_shared_experts: int = 1
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
-    route_scale: float = 2.5
+    # Qwen3.5/3.6-MoE HF implementation does not use an additional route_scale.
+    # Keep the field default to 1.0 so the qwen36 reference path matches
+    # Qwen3_5MoeTopKRouter exactly (softmax + topk + normalize).
+    route_scale: float = 1.0
 
     # Layer structure: exact heterogeneous pattern from text_config.layer_types
     layer_types: list[str] | None = None  # e.g. ["linear_attention", ...]

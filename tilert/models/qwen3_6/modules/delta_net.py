@@ -218,10 +218,16 @@ class DeltaNet(SerializableTileRTModule):
         attn_out, new_state = self.attn.golden_forward(norm_x, start_pos, prev_state)
         h = x + attn_out
 
-        # Post-attention norm + MoE FFN + residual.
+        # Post-attention norm + MoE FFN (partial TP8 sum) + all-reduce.
         norm_h = self.post_attention_layernorm(h)
-        ffn_out = self.ffn.golden_forward(norm_h)
-        out = h + ffn_out
+        ffn_partial = self.ffn.golden_forward(norm_h)
+        if self.moe_sync_callback is not None:
+            ffn_full = self.moe_sync_callback(ffn_partial)
+        else:
+            ffn_full = ffn_partial
+
+        # Final residual uses the all-reduced (full) FFN output.
+        out = h + ffn_full
 
         # ``new_state`` is a tuple ``(conv_state, recurrent_state)`` produced by
         # ``DeltaNetOp.golden_forward`` to keep both the causal convolution and

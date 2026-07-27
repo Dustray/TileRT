@@ -46,8 +46,9 @@ class QwenAttentionRef(TileRTModule):
         self.head_dim = model_args.qk_head_dim
         self.rope_dim = model_args.rope_dim
         self.no_pe_dim = self.head_dim - self.rope_dim
-        self.num_local_heads = self.n_heads // num_devices
-        self.num_local_kv_heads = max(1, self.n_kv_heads // num_devices)
+        # EP8: replicate full attention weights on every device.
+        self.num_local_heads = self.n_heads
+        self.num_local_kv_heads = self.n_kv_heads
 
         self.q_proj_weight: torch.Tensor | None = None
         self.k_proj_weight: torch.Tensor | None = None
@@ -131,9 +132,9 @@ class QwenAttentionRef(TileRTModule):
         k = linear(x, self.k_proj_weight)
         v = linear(x, self.v_proj_weight)
 
-        q = h.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply per-head RMSNorm to Q/K query/key projections when present.
         if self.q_norm_weight is not None:
@@ -161,8 +162,8 @@ class QwenAttentionRef(TileRTModule):
         v_full = v_cache[:bsz, : start_pos + seq_len].transpose(1, 2)
 
         # GQA repeat
-        if self.n_heads != self.n_kv_heads:
-            reps = self.n_heads // self.n_kv_heads
+        if self.num_local_heads != self.num_local_kv_heads:
+            reps = self.num_local_heads // self.num_local_kv_heads
             k_full = k_full.repeat_interleave(reps, dim=1)
             v_full = v_full.repeat_interleave(reps, dim=1)
 
@@ -286,10 +287,16 @@ class GatedAttention(SerializableTileRTModule):
         )
         h = x + attn_out
 
-        # Post-attention norm + MoE FFN + residual.
+        # Post-attention norm + MoE FFN (partial TP8 sum) + all-reduce.
         norm_h = self.post_attention_layernorm(h)
-        ffn_out = self.ffn.golden_forward(norm_h)
-        out = h + ffn_out
+        ffn_partial = self.ffn.golden_forward(norm_h)
+        if self.moe_sync_callback is not None:
+            ffn_full = self.moe_sync_callback(ffn_partial)
+        else:
+            ffn_full = ffn_partial
+
+        # Final residual uses the all-reduced (full) FFN output.
+        out = h + ffn_full
 
         return out, k_cache, v_cache
 

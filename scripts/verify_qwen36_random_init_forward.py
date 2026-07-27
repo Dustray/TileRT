@@ -64,10 +64,9 @@ def main():
         logits.isfinite().all().item(),
     )
 
-    # LOGITS_OUT is (max_batch_size, max_seq_len, vocab_size // num_devices).
-    # The first two dims are padded to the max layout sizes.
-    assert logits.shape[2] * layer.num_devices == model_args.vocab_size, (
-        f"Logits last dim {logits.shape[2]} not vocab_size/num_devices"
+    # EP8: LOGITS_OUT is full vocab on every device.
+    assert logits.shape[2] == model_args.vocab_size, (
+        f"Logits last dim {logits.shape[2]} not vocab_size"
     )
     assert logits.isfinite().all(), "Logits contain NaN/Inf"
     assert 0 <= next_token < model_args.vocab_size, f"Invalid next_token {next_token}"

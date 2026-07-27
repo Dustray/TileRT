@@ -1,8 +1,15 @@
 # Qwen3.6-35B-A3B 接入 TileRT 技术方案
 
-> 最近更新：2026-07-22 — 调整目标为：跳过 HF → TileRT 权重转换，直接基于原始 HuggingFace checkpoint 跑通 `golden_forward` 路径与官方 prompt 测例。当前卡在 ExpertDownAllReduce 在多线程初始化时默认 CUDA device 切换不正确，导致 device 0 重复承载 device 1 的 MoE down-projection 权重，出现 device 0 48.4 GiB / device 1 26.6 GiB 的严重不平衡，正在定位修复。
+> 最近更新：2026-07-24 — EP8（Expert Parallelism）原生路径继续推进。随机初始化 40 层 `QwenShowHandsLayer` 的 `golden_forward` smoke test 已通过；MoE reference 路径当前采用「每设备只保存本地 32 个 routed expert + 用 `local_indices = indices % n_local_routed` 把全局 expert id 映射到本地 shard」的临时 workaround，保证 smoke test 不越界崩溃。
+>
+> **本次会话进展**：修复了真实 HF 权重加载 EP8 layout 时 MoE 权重转换器的 reshape 错误。根因是 `device_sharding` 会返回 4D stacked 张量 `(n_local_experts, num_devices, ...)`，而 `ExpertDownAllReduceWeightsConverter.convert_to_general` 与 `ExpertSelectUpGateSiLUWeightsConverter.convert_to_fp8mma` 期望的是 3D per-device 张量。已在 `init_tilert_weights` 中增加切片逻辑：当第二维等于 `num_devices` 时自动取出当前 device 的 slice。随机初始化 smoke test 此前已验证通过；真实权重测试待服务器空闲后执行。
 
-测试环境用tilert-qwen3.6容器
+测试环境用 tilert-qwen3.6 容器（`/data/hpctest/ssct004t/env/bin/python`，torch 2.7.1 + transformers 4.46.3）；执行任何 torch 脚本前需设置：
+
+```bash
+export LD_LIBRARY_PATH=/opt/dtk-26.04/lib:/opt/dtk-26.04/hip/lib:/opt/dtk-26.04/.hyhal/rocm_smi/lib
+export PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT:$PYTHONPATH
+```
 
 ## 0. 背景术语说明
 
@@ -990,8 +997,20 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 - 原始 checkpoint 使用 `model.safetensors.index.json`，26 个 shard，总大小约 71.9 GB，文本权重 key 前缀为 `model.language_model.*`。
 - 需要让 `QwenShowHandsLayer.from_pretrained()` 检测 HF-source checkpoint，并直接调用各 op 的 `init_reference_weights()`。
 
-仿照deepseek模块的流程完善qwen模块，根据deepseek模型的大小看，原始qwen模型进入golden forward流程需要做TP切分，否则显存不够用。
-qwen模型的执行逻辑参考来自HunggingFace的modeling_qwen3_5_moe.py
+参考 DeepSeek-V3.2 模块的 TP 流程，早期尝试对 Qwen3.6 也做 **TP8（Tensor Parallelism across 8 devices）**：
+- Attention/DeltaNet 的 projection 矩阵按 output/feature 维度切分到 8 卡；
+- MoE 的 gate/up/down 按 `inter_dim` 切分到 8 卡；
+- 需要在每层 Linear 后做 all-reduce / all-gather。
+
+但 Qwen3.6 当前没有可用的 `libtilert_qwen36.so` CUDA kernel，`torch.distributed` 在 TileRT 的 Python golden 路径中也未初始化，导致 all-reduce 被跳过，输出为 garbage tokens。HF fallback 虽然能跑通，但速度慢（~282 ms/token），且偏离原生路径目标。
+
+因此，用户明确将方向调整为 **EP8（Expert Parallelism only，无 TP）**：
+- 非 MoE 权重（attention、DeltaNet、norm、lm_head、embedding）在每卡上**完整复制**；
+- 256 个 MoE expert 按 32 个/卡分片到 8 卡（EP8）；
+- 在 MoE 层前后插入 **all-to-all** 通信：前向把 token 按 top-k 选中的 expert 发到对应卡，后向/输出再把结果聚合回来；
+- 不需要 `torch.distributed` 做 all-reduce，通信仅在 MoE 子层做 all-to-all；在 Python reference 阶段可用 `torch.Tensor.scatter` / `gather` 或 `torch.distributed` 的 `all_to_all` 模拟；后续 CUDA kernel 实现真正的 EP8 all-to-all。
+
+后续实现细节见第 18 节「EP8 原生路径重新设计」。
 
 ### 14.2 已完成适配
 
@@ -1043,3 +1062,271 @@ qwen模型的执行逻辑参考来自HunggingFace的modeling_qwen3_5_moe.py
 | P0 | 运行 `scripts/verify_qwen36_generator_official_prompt.py`（8 卡） | 待验证 |
 | P1 | 与 HF `AutoModelForCausalLM` 在小 prompt 上对比 logits | 待验证 |
 | P1 | 更新 plan 与 session memory | 进行中 |
+
+---
+
+## 15. HF vs TileRT 逐操作一致性审计结果（2026-07-23）
+
+> 本轮审计目标：对照官方 HF `modeling_qwen3_5_moe.py` 中每个关键操作，检查 `tilert/models/qwen3_6/` 各 op/block 的参考实现（`golden_forward`）是否语义一致。审计范围覆盖 GQA、DeltaNet、MoE、RMSNorm、M-RoPE、Head Projection 与端到端 forward 流程。
+
+### 15.1 顶层架构
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `Qwen3_5MoeForConditionalGeneration` → `Qwen3_5MoeModel` → `Qwen3_5MoeTextModel` | `QwenShowHandsLayer` → `QwenTransformerStack` (40 层) → `RMSNormHeadProj` | ✅ 一致 |
+| 40 层 `Qwen3_5MoeDecoderLayer`，`layer_types` 决定 linear/full attention | `QwenTransformerStack` 按 `[0,0,0,1]` 循环构造 `DeltaNet`/`GatedAttention` | ✅ 一致 |
+| `embed_tokens` → 40 层 → `model.norm` → `lm_head` | `embed_weight` → `stack.forward()` → `RMSNormHeadProj.golden_forward()` | ✅ 一致 |
+
+### 15.2 GQA Attention
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `q_proj` 输出 `2 * n_heads * head_dim`（query + gate） | `GQAAttentionWeightsConverter` 把 q/k/v 拼接成 `qkv_proj_weights`，q 显式处理 2x | ✅ 一致 |
+| `q_norm`、`k_norm` 为 per-head RMSNorm，weight `(head_dim,)` | `GQAAttentionOp.golden_forward` 用 `(1,1,1,head_dim)` 广播 | ✅ 一致 |
+| `head_dim=256`, `num_heads=16`, `num_kv_heads=2`, GQA 8x | `model_args` 对应一致 | ✅ 一致 |
+| `scaling = head_dim^-0.5` | `scores = matmul / sqrt(head_dim)` | ✅ 一致 |
+| M-RoPE 3D cos/sin + interleaved rotate_half | `precompute_mrope_embed` / `apply_mrope_embed` 复刻同样逻辑 | ✅ 一致 |
+| gate = `sigmoid(gate)`，attn output 乘 gate | `out = o * sigmoid(gate)` | ✅ 一致 |
+| KV cache `(bsz, n_kv_heads, seq_len, head_dim)` 追加写入 | cache 形状转置后等价 | ✅ 一致 |
+
+### 15.3 DeltaNet / Gated DeltaNet
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `in_proj_qkv/z/a/b`, `conv1d`, `A_log`, `dt_bias`, `norm`, `out_proj` | `DeltaNetOp` 同名权重一一对应 | ✅ 一致 |
+| `conv_dim = 8192` | `model_args.delta_conv_dim = 8192` | ✅ 一致 |
+| causal conv1d 状态 `(bsz, hidden_size, kernel_size)` + silu | `_causal_conv1d_update` 一致 | ✅ 一致 |
+| `torch_recurrent_gated_delta_rule` / `torch_chunk_gated_delta_rule` | `_gated_delta_attention` 直接调用 | ✅ 一致 |
+| beta = `sigmoid(b)`，g = `-exp(A_log) * softplus(a + dt_bias)` | 完全一致 | ✅ 一致 |
+| Gated RMSNorm: `norm(x) * silu(gate)` | `_rmsnorm_gated` 一致 | ✅ 一致 |
+
+### 15.4 MoE FFN
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `Qwen3_5MoeTopKRouter`: softmax → topk → normalize | `ExpertSelectUpGateSiLU._ref_expert_select_qwen36` 相同 | ✅ 一致 |
+| `top_k=8`, `num_experts=256` | `n_activated_experts=8`, `n_routed_experts=256` | ✅ 一致 |
+| Router 输出仅做归一化，**无额外 scale** | TileRT 乘 `route_scale=2.5` | ⚠️ 待确认（HF 无 `route_scale`） |
+| Stacked `experts.gate_up_proj/down_proj` | `ExpertSelectUpGateSiLU` / `ExpertDownAllReduce` 已适配 | ✅ 一致 |
+| Shared expert + shared_expert_gate | `ExpertSelectUpGateSiLU.golden_forward` 已在 up_gate_silu 之后对 shared expert 输出乘 `sigmoid(shared_gate @ x)` | ✅ 一致 |
+| HF 中 shared expert gate 在 down-proj 后乘 | `ExpertDownAllReduce.golden_forward` **未实现** shared expert gate 乘法 | ❌ 差异 |
+
+### 15.5 RMSNorm
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `Qwen3_5MoeRMSNorm`: `x / rms * (1.0 + weight)` | `tilert.models.common.RMSNorm` 一致 | ✅ 一致 |
+| `Qwen3_5MoeRMSNormGated`: `norm(x) * weight * silu(gate)` | `DeltaNetOp._rmsnorm_gated` 一致 | ✅ 一致 |
+
+### 15.6 Head Projection
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `model.norm` + `lm_head` | `RMSNormHeadProj.golden_forward` | ✅ 一致 |
+| `lm_head` tied with `embed_tokens` | `RMSNormHeadProj` 单独加载；转换流程已解绑 | ✅ 一致 |
+
+### 15.7 总体 Forward 流程
+
+| HF | TileRT | 状态 |
+|---|---|---|
+| `embed` → 40 层（input_layernorm → attn → residual → post_attn_norm → mlp → residual）→ final norm → lm_head | `end2end._golden_forward_device` 已拆成 stack + head_proj | ✅ 一致 |
+| causal mask | `transformer_stack.golden_forward` 对 `seq_len>1` 构造 triu mask | ✅ 一致 |
+
+### 15.8 本轮发现的不一致与修复建议
+
+1. **`route_scale` 是否存在**
+   - HF `Qwen3_5MoeTopKRouter` 仅做 softmax + topk + normalize，无 `route_scale`。
+   - TileRT `model_args.route_scale = 2.5` 且 `_ref_expert_select_qwen36` 最后乘了它。
+   - **建议**：如果目标是 bit-exact 对齐 HF，应将 Qwen3.6 的 `route_scale` 默认值改为 `1.0`（或在 qwen36 分支去掉该乘法）。若官方 Qwen3.6 配置确实含 `route_scale`，则保留并注明与 HF 的差异。
+
+2. **`ExpertDownAllReduce.golden_forward` 缺少 shared expert gate 乘法**
+   - HF `Qwen3_5MoeSparseMoeBlock`：
+     ```python
+     shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+     expert_output = expert_output + shared_expert_output
+     ```
+   - TileRT 当前在 `ExpertSelectUpGateSiLU.golden_forward` 里已经乘了 shared gate，但 `ExpertDownAllReduce.golden_forward` 没有。因为 `ExpertSelectUpGateSiLU` 的 hidden_out 结构里 `[0]` 是 shared expert，`ExpertDownAllReduce` 如果把 `[0]` 当作普通 down 输出加进去，shared gate 实际上已经被应用过了。
+   - **结论**： golden 路径的 shared expert gate 已经在 `ExpertSelectUpGateSiLU` 中实现，与 HF 整体等价，只是位置从 down 之后提前到了 up_gate_silu 之后。数值上对 shared expert 这条分支结果一致（乘法满足结合律），不影响端到端结果。可保持现状，或统一改到 `ExpertDownAllReduce` 以与 HF 代码结构对齐。
+
+### 15.9 本轮审计后的待办
+
+| 优先级 | 任务 | 说明 |
+|--------|------|------|
+| P0 | 确认 `route_scale=2.5` 是否为 Qwen3.6 官方设定 | 决定是否需要把 qwen36 分支改为 `route_scale=1.0` |
+| P0 | 跑 `verify_qwen36_hf_weights_forward.py` / `verify_qwen36_real_weights_forward.py` 与 HF 对比 logits | 验证上述差异是否影响 token 级输出 |
+| P1 | 可选：把 shared expert gate 逻辑从 `ExpertSelectUpGateSiLU` 移到 `ExpertDownAllReduce`，与 HF 代码结构对齐 | 便于后续维护与 CUDA kernel 设计 |
+
+---
+
+## 16. Qwen3.6 op 与 HF 实现对照
+
+> 以下对照基于 `docs/modeling_qwen3_5_moe.py`（HF 官方实现）与 `tilert/models/qwen3_6/ops/*.py`。
+
+### 注意力相关
+
+| HF 类/操作 | TileRT op | 状态 | 备注 |
+|---|---|---|---|
+| `Qwen3_5MoeTextRotaryEmbedding.forward` (M-RoPE 3D cos/sin) | `tilert.models.utils.precompute_mrope_embed` | ✅ | 输出形状与数值均与 HF 一致 |
+| `apply_rotary_pos_emb` (非交错 rotate_half) | `tilert.models.utils.apply_mrope_embed` | ✅ | 使用相同 rotate_half 实现 |
+| `Qwen3_5MoeAttention.forward` | `GQAAttentionOp.golden_forward` | ✅ | q_proj 2x gate、q_norm/k_norm、sigmoid gate 均已实现 |
+| `Qwen3_5MoeGatedDeltaNet.forward` | `DeltaNetOp.golden_forward` | ✅ | 调用 FLA 的 chunk/recurrent gated delta rule；conv1d、gated rmsnorm 对齐 |
+
+### MoE / FFN
+
+| HF 类/操作 | TileRT op | 状态 | 备注 |
+|---|---|---|---|
+| `Qwen3_5MoeRMSNorm` | `common.RMSNorm` | ✅ | `x / rms * (1 + weight)` 约定 |
+| `Qwen3_5MoeRMSNormGated` | `DeltaNetOp._rmsnorm_gated` | ✅ | norm(x) * silu(gate) |
+| `Qwen3_5MoeTopKRouter.forward` | `ExpertSelectUpGateSiLU._ref_expert_select_qwen36` | ⚠️ | 多乘 `route_scale=2.5`；HF 无此 scale |
+| `Qwen3_5MoeExperts.forward` | `ExpertSelectUpGateSiLU.golden_forward` + `ExpertDownAllReduce.golden_forward` | ✅ | 加权求和等价 |
+| `Qwen3_5MoeSparseMoeBlock.forward` 中 `shared_expert_gate` | `ExpertSelectUpGateSiLU.golden_forward` | ✅ | 已在 up_gate_silu 之后应用；HF 在 down-proj 之后应用，数值等价 |
+
+### 顶层
+
+| HF 类/操作 | TileRT 模块 | 状态 | 备注 |
+|---|---|---|---|
+| `Qwen3_5MoeTextModel.forward` | `QwenShowHandsLayer._golden_forward_device` | ✅ | embed → stack → norm → lm_head |
+| `Qwen3_5MoeTextModel.embed_tokens` | `end2end` 中 `params[stack_weight_count + 2]` | ✅ | 每 device 复制完整 embedding |
+| `Qwen3_5MoeTextModel.norm` + `lm_head` | `RMSNormHeadProj.golden_forward` | ✅ | final RMSNorm + head projection |
+
+---
+
+## 17. EP8 原生路径重新设计（2026-07-23 起）
+
+> 本节为当前主要工作方向。用户已明确要求： abandon TP8，改为 **EP8（Expert Parallelism only，无 Tensor Parallelism）** 原生路径。文档已于 2026-07-23 完成并进入代码实现阶段。
+
+### 17.1 为什么放弃 TP8
+
+| 问题 | TP8 方案 | EP8 方案 |
+|---|---|---|
+| 是否需要 `torch.distributed` | ✅ 必须初始化并支持 all-reduce/all-gather | ❌ 不需要；仅 MoE 层需要 all-to-all，可用 Python 模拟 |
+| CUDA kernel 成熟度 | 无 `libtilert_qwen36.so`，无法执行 TP 集合通信 | 无 kernel 时可用 golden Python 路径直接跑 |
+| 注意力/FFN 分片复杂度 | 每层 Linear 都要按 device 数切分 + 通信 | Attention/DeltaNet 完整复制，无需通信 |
+| 调试难度 | 输出错误需排查每个 Linear 的切分与 reduce | MoE 前后仅一处 all-to-all，容易定位 |
+| 与 HF 对齐 | 需要把 HF 权重切到 TP layout，容易引入误差 | 直接加载 HF 原始权重，仅对 experts 做 EP 分片 |
+| 显存 | 每张卡只存 1/8 attention 权重，总参分布不均 | 每张卡存完整 attention + 1/8 experts，总参更均衡 |
+
+结论：在 kernel 尚未 ready、且目标是尽快打通「原始 HF checkpoint → 多卡 golden forward → 可生成文本」的前提下，EP8 是最小可行且可扩展的方案。
+
+### 17.2 EP8 总体布局
+
+```text
+8 张 DCU（device 0..7）
+
+每张卡持有：
+  - embed_tokens.weight          [248320, 2048]      完整复制
+  - model.norm.weight            [2048]              完整复制
+  - lm_head.weight               [248320, 2048]      完整复制
+  - 40 层中每层：
+      - input_layernorm.weight     [2048]              完整复制
+      - post_attention_layernorm.weight [2048]       完整复制
+      - self_attn / linear_attn 全部投影矩阵          完整复制
+        (q_proj/k_proj/v_proj/o_proj 或 DeltaNet 的 in_proj_* / out_proj 等)
+      - 32 个 routed experts 的 gate_up_proj / down_proj
+        (原 256 experts 均分 8 份)
+      - shared_expert (1 expert) 的 gate_up_proj / down_proj  完整复制
+      - shared_expert_gate.weight  [2048, hidden*2] 或类似  完整复制
+      - router/gate.weight         [256, 2048]         完整复制（router 很小）
+```
+
+关键点：
+- `n_routed_experts = 256`，`ep_size = 8` → 每卡 `256 / 8 = 32` 个 routed experts。
+- `n_activated_experts = 8`（top-8）不变。
+- attention / DeltaNet 的权重全部复制，不做任何 TP 切分；因此 Q/K/V/O projection 在单卡内完整计算。
+- MoE 层内：router 在所有卡上完整运行，得到 top-8 expert indices；然后做 all-to-all，把 token 路由到持有对应 expert 的卡；本地 expert 计算完成后，再把结果 all-to-all 发回原卡；最后按 router weight 加权求和。
+
+### 17.3 需要修改的文件清单
+
+#### 17.3.1 权重加载与转换
+
+| 文件 | 当前 TP8 行为 | EP8 目标行为 |
+|---|---|---|
+| `tilert/models/qwen3_6/modules/end2end.py` | `_load_hf_source_per_device` 按 output/feature 维度切 attention/DeltaNet；按 inter_dim 切 MoE | 非 MoE 权重整 tensor 复制到每卡；MoE experts 按 expert 维度切 32/卡 |
+| `tilert/models/qwen3_6/ops/gqa_attention.py` | `init_reference_weights_sharded` 按 head-dim TP 切 q/k/v/o；`device_sharding` 也按 device 数切 | 完全移除 head-dim TP 切分，每卡使用完整权重；`device_sharding` 返回完整张量 |
+| `tilert/models/qwen3_6/ops/delta_net.py` | `device_sharding` 按 qkv/z/a/b/out 输出维度切 8 份 | 完整复制到每卡，不再切分 |
+| `tilert/models/qwen3_6/ops/expert_sel_up_gate_silu.py` | `process_gate_up_weights` 沿 inter_dim 插入 device 维度 | 改为沿 expert 维度插入 device 维度：`experts.gate_up_proj` 形状 [256, 2*inter, hidden] → [8, 32, 2*inter, hidden]；本地卡取对应 slice |
+| `tilert/models/qwen3_6/ops/expert_down_allreduce.py` | `process_down_weights` 沿 inter_dim 插入 device 维度 | 改为沿 expert 维度插入 device 维度：`experts.down_proj` 形状 [256, hidden, inter] → [8, 32, hidden, inter]；本地卡取对应 slice |
+| `tilert/models/qwen3_6/modules/gated_attention.py` | `QwenAttentionRef` 按 head 切分 | 完整复制 |
+| `tilert/models/qwen3_6/modules/delta_net.py` | `QwenDeltaNetRef` 按输出维度切分 | 完整复制 |
+
+#### 17.3.2 MoE 层：all-to-all 插入点
+
+| 文件 | 修改点 |
+|---|---|
+| `tilert/models/qwen3_6/ops/expert_sel_up_gate_silu.py` | `_ref_expert_select_qwen36` 仍返回完整 top-8 indices / weights；新增 `_route_tokens_all_to_all`：根据 indices 把激活张量按目标 expert 所在卡 scatter；本地只保留目标卡上的 token |
+| `tilert/models/qwen3_6/ops/expert_down_allreduce.py` | 本地 expert 计算后，新增 `_gather_tokens_all_to_all`：把各卡计算结果按原 token 位置 gather 回来；然后按 router weight 求和；不再需要 all-reduce |
+| `tilert/models/qwen3_6/modules/moe.py` | `QwenMoeBlock.golden_forward` 串联：router → topk → all-to-all → local expert up/gate/silu → local expert down → all-to-all → weighted sum → shared expert → residual |
+
+#### 17.3.3 顶层与采样
+
+| 文件 | 修改点 |
+|---|---|
+| `tilert/models/qwen3_6/modules/end2end.py` | 移除 TP 相关的 logits all-gather；每卡直接计算完整 `[248320]` logits；采样只在 device 0（或 rank 0）上做，避免多卡重复；`LOGITS_OUT` buffer 形状从 `(31040,)` 改为 `(vocab_size,)` |
+| `tilert/models/qwen3_6/modules/transformer_stack.py` | 移除 `residual_scale`（真实权重下本来就关闭）；确保每卡独立计算完整 hidden states |
+| `tilert/models/qwen3_6/generator.py` | 无需改动；生成器只调用 `decode_layer.forward`，EP8 后接口保持一致 |
+
+### 17.4 all-to-all 的 Python reference 实现
+
+在 CUDA kernel 未就绪前，先使用 PyTorch 分布式或纯 tensor 操作模拟 EP8 all-to-all：
+
+```python
+def _route_tokens_all_to_all(x, indices, num_experts=256, ep_size=8):
+    """
+    x:       (tokens, hidden)
+    indices: (tokens, topk)  int64, 取值 [0, num_experts)
+    返回：
+      local_x:     list[Tensor]，长度 ep_size，每个是发往对应卡的 token 子集
+      local_idx:   list[Tensor]，每个是本地 expert 在这些 token 中对应的真实 expert id
+      recv_counts: list[int]，每张卡收到的 token 数
+    """
+    experts_per_rank = num_experts // ep_size
+    local_x = [[] for _ in range(ep_size)]
+    local_idx = [[] for _ in range(ep_size)]
+    for t in range(x.shape[0]):
+        for k in range(indices.shape[1]):
+            eid = int(indices[t, k].item())
+            rank = eid // experts_per_rank
+            local_x[rank].append(x[t])
+            local_idx[rank].append(eid % experts_per_rank)
+    # 实际实现中应使用 torch.distributed.all_to_all 做真正的通信
+    return [torch.stack(v, dim=0) if v else torch.empty(0, x.shape[-1], dtype=x.dtype, device=x.device) for v in local_x], \
+           [torch.tensor(v, dtype=torch.int64, device=x.device) for v in local_idx]
+```
+
+后续 kernel 版本应替换为 NCCL / RCCL `all_to_all` 或 TileRT 自定义通信算子。
+
+### 17.5 验证计划
+
+| 步骤 | 脚本/方法 | 通过标准 |
+|---|---|---|
+| 1 | `scripts/verify_qwen36_random_init_forward.py` | 随机权重 EP8 40 层 forward 输出 finite、形状正确 | ✅ 已通过 |
+| 2 | 修复 MoE converter 对 4D EP8 stacked 权重的 reshape 错误 | `convert_to_general` / `convert_to_fp8mma` 在 `init_tilert_weights` 中接收 3D per-device 输入 | ✅ 已修复 |
+| 3 | `scripts/verify_qwen36_real_weights_forward.py` | 真实 HF 权重加载成功、内存均衡、连续 4 个 token 有效 | ⏳ 待执行 |
+| 4 | `scripts/verify_qwen36_generator_official_prompt.py` | 官方 prompt 能生成非空、可读文本（不用 fallback） | ⏳ 待执行 |
+| 5 | 与 HF `AutoModelForCausalLM` 对比 logits | 相同 prompt 下 top-1 token 一致或误差 < 1e-2 | ⏳ 待执行 |
+| 6 | 关闭 `TILERT_QWEN36_HF_FALLBACK=1` 原生路径 | 不依赖 HF fallback 也能生成 | ⏳ 待执行 |
+
+### 17.6 风险与回退
+
+| 风险 | 应对措施 |
+|---|---|
+| all-to-all Python 实现慢 | 先打通正确性；后续用 `torch.distributed` 或 C++ kernel 替换 |
+| 真实权重加载后显存仍超 | 只在 2 张卡验证；若 8 卡有压力，可先 4 卡 EP4，再扩展到 EP8 |
+| shared expert 复制导致单卡显存偏高 | shared expert 只占 1/256 routed experts 规模，可接受；必要时也做 EP |
+| router / gate 权重小但复制 8 份 | 只有 `[256, 2048]`，可忽略 |
+| 当前 `QwenMoeBlock` 非 `SerializableTileRTModule` | 本次不强制改基类；优先保证 EP8 路径跑通 |
+
+### 17.7 当前状态
+
+- ✅ Plan 文档已更新 EP8 设计章节（本节）。
+- ✅ `expert_sel_up_gate_silu.py`、`expert_down_allreduce.py`：已完成 EP8 expert-dim 分片；`init_reference_weights` 处理本地 shard，smoke test 临时用 `indices % n_local_routed` 映射全局 expert id。
+- ✅ 非 MoE 权重（attention / DeltaNet / norm / lm_head / embedding）：已完成每卡完整复制。
+- ✅ `scripts/verify_qwen36_random_init_forward.py` 通过：随机初始化 40 层 forward，logits shape `(1, 512, 248320)` finite，next token 合法。
+- ✅ 修复真实权重加载时的 MoE 权重转换器 reshape 错误：
+  - `tilert/models/qwen3_6/ops/expert_down_allreduce.py` 的 `init_tilert_weights`
+  - `tilert/models/qwen3_6/ops/expert_sel_up_gate_silu.py` 的 `init_tilert_weights`
+  - 修复逻辑：检测 4D stacked 输入并自动切片为 3D per-device 输入后再调用 converter。
+- ⏳ 真实 HF 权重端到端验证（`verify_qwen36_real_weights_forward.py`、`verify_qwen36_generator_official_prompt.py`）—— 待服务器空闲后执行。
+- ⏳ 实现 MoE 层真正的 all-to-all 通信（当前 reference 用本地 shard 模运算 hack，非真实 EP8 数值）。
+- ⏳ 与 HF `AutoModelForCausalLM` 对比 logits。
+

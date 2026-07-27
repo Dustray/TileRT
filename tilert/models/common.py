@@ -82,6 +82,8 @@ def _safe_weight_dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Ten
     # Handle rank-3 stacked expert weights produced by the Qwen3.6 converter:
     # weight shape (n_experts, dim, expert_dim), scale shape
     # (n_experts, dim/block_size, expert_dim/block_size).
+    # TP8 may make expert_dim smaller than block_size; in that case fall back to
+    # a per-expert, per-row block-wise dequantization using the actual scale grid.
     if weight.dim() == 3 and scale.dim() == 3:
         n_experts, dim, expert_dim = weight.shape
         block_size = 128
@@ -93,6 +95,22 @@ def _safe_weight_dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Ten
             dequant_list = []
             for i in range(n_experts):
                 dequant_list.append(_weight_dequant_torch(weight[i], scale[i], block_size))
+            return torch.stack(dequant_list, dim=0)
+
+        # Fallback for small TP-sharded expert_dim (e.g. 64 < 128): the scale
+        # grid is (n_experts, ceil(dim/block_size), 1) and each scale row covers a
+        # full block of output columns.  We dequantize each row independently.
+        if dim % block_size == 0 and scale.shape == (n_experts, dim // block_size, 1):
+            dequant_list = []
+            for i in range(n_experts):
+                w = weight[i].to(torch.bfloat16)
+                s = scale[i].to(torch.bfloat16)
+                rows = dim // block_size
+                parts = []
+                for r in range(rows):
+                    row = w[r * block_size : (r + 1) * block_size, :]
+                    parts.append(row * s[r, 0].view(1))
+                dequant_list.append(torch.cat(parts, dim=0))
             return torch.stack(dequant_list, dim=0)
 
     # Scale shape is unexpected: cast the weight and ignore the scale.  This

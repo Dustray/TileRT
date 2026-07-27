@@ -14,11 +14,13 @@ wrappers and ``forward()`` need to be switched over.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
 import threading
 import time
+import warnings
 from typing import Any
 
 import torch
@@ -31,12 +33,20 @@ from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack
 from tilert.models.qwen3_6.modules.hf_source_loader import (
     _is_hf_checkpoint,
+    _precompute_all_device_states,
     load_hf_source_weights,
 )
 from tilert.models.qwen3_6.ops.rmsnorm_head_proj import RMSNormHeadProj
 from tilert.models.qwen3_6.temp_var_indices import Idx, TEMP_VARS_SIZE, validate_temp_vars_layout
 from tilert.models.utils import precompute_mrope_embed
 from tilert.utils import get_profile_log_tensor
+
+try:
+    from transformers import AutoModelForCausalLM
+
+    _HAS_TRANSFORMERS = True
+except Exception:  # pragma: no cover
+    _HAS_TRANSFORMERS = False
 
 __all__ = [
     "QwenShowHandsLayer",
@@ -197,7 +207,18 @@ class QwenShowHandsLayer:
         self.num_devices = torch.cuda.device_count()
         if self.num_devices == 0:
             raise RuntimeError("No CUDA/DCU devices available")
-        self.forward_max_seq_len = model_args.max_seq_len
+        # Until the Qwen3.6 CUDA backend is enabled, the golden reference path
+        # only decodes one token at a time.  Avoid allocating temp buffers sized
+        # for the full 256K context window (especially the logits tensor) by
+        # default; the CUDA-graph path can override via the environment.
+        self.forward_max_seq_len = int(
+            os.environ.get("TILERT_QWEN36_FORWARD_MAX_SEQ_LEN", "1")
+        )
+        if self.forward_max_seq_len != model_args.max_seq_len:
+            logger.info(
+                f"Golden forward: using forward_max_seq_len={self.forward_max_seq_len} "
+                f"(set TILERT_QWEN36_FORWARD_MAX_SEQ_LEN to override)"
+            )
 
         self.model_path = model_path
         self.with_weight_conversion = with_weight_conversion
@@ -205,9 +226,29 @@ class QwenShowHandsLayer:
 
         self.multi_devices_results: list[DeviceResult | None] = [None] * self.num_devices
         self._stack_objects: list[QwenTransformerStack | None] = [None] * self.num_devices
+        self._head_proj_objects: list[RMSNormHeadProj | None] = [None] * self.num_devices
         # Persistent KV / recurrent caches for the golden forward path.
-        # Re-initialised on reset_sequence() and lazily created on first forward.
+        # Owned by the end-to-end layer and passed into the stack so that
+        # individual blocks can update their own state.
         self._golden_caches: list[dict[str, Any] | None] = [None] * self.num_devices
+
+        # TP8 MoE all-reduce state.  Because the Qwen3.6 backend does not yet
+        # provide a C++ all-reduce, we implement it in the golden path with a
+        # threading.Barrier and per-device shared buffers.
+        self._moe_barrier: threading.Barrier | None = None
+        self._moe_partial_buf: list[torch.Tensor] | None = None
+        self._moe_aggregated_buf: list[torch.Tensor] | None = None
+
+        # Optional Hugging Face fallback path.  When the TileRT kernels are
+        # not available and the golden path cannot produce correct results
+        # (e.g. tensor-parallel weights are not aggregated), we can delegate
+        # the actual forward to a real transformers model loaded on cuda:0.
+        self._hf_model: Any | None = None
+        self._hf_past_key_values: Any | None = None
+        self._hf_input_ids: torch.Tensor | None = None
+        self._hf_fallback_enabled = (
+            os.environ.get("TILERT_QWEN36_HF_FALLBACK", "0") == "1"
+        )
 
         self.temperature = temperature
         self.top_p = top_p
@@ -415,11 +456,11 @@ class QwenShowHandsLayer:
 
         dim = self.model_args.dim
         batch_seq = (batch_size, seq_len)
-        vocab_per_device = self.model_args.vocab_size // self.num_devices
+        vocab_per_device = self.model_args.vocab_size
         n_routed_experts = self.model_args.n_routed_experts
         n_activated_experts = self.model_args.n_activated_experts
         n_total_experts = n_activated_experts + self.model_args.n_shared_experts
-        moe_inter_dim = self.model_args.inter_dim // self.num_devices
+        moe_inter_dim = self.model_args.inter_dim
         rope_dim = self.model_args.rope_dim
 
         temp_vars: list[torch.Tensor | None] = [None] * TEMP_VARS_SIZE
@@ -497,6 +538,26 @@ class QwenShowHandsLayer:
             skip_keys_per_device: Optional safetensors keys to skip per device.
         """
 
+        # Pre-shard the HF checkpoint once across all devices before spawning
+        # per-device threads.  ``device_sharding`` is CPU-intensive and
+        # Python's GIL prevents true parallelism with threads; doing it once
+        # avoids repeating the work 8 times.
+        hf_precomputed: Any | None = None
+        if model_path is not None and _is_hf_checkpoint(model_path):
+            logger.info("HF-source loader: pre-sharding checkpoint for all devices")
+            precompute_stack = QwenTransformerStack(
+                self.model_args,
+                device_id=0,
+                num_devices=self.num_devices,
+            )
+            hf_precomputed = _precompute_all_device_states(
+                model_path,
+                self.model_args,
+                self.num_devices,
+                precompute_stack,
+            )
+            logger.info("HF-source loader: pre-sharding completed")
+
         def __load_weights(device_id: int, model_path: str | None) -> None:
             intermediates: list[torch.Tensor] = []
             caches: list[torch.Tensor] = []
@@ -511,9 +572,8 @@ class QwenShowHandsLayer:
                         else None
                     )
                     if _is_hf_checkpoint(model_path):
-                        # Load the original HF checkpoint and shard weights in
-                        # memory.  The stack must already be constructed so that
-                        # each layer's ``device_sharding`` can be invoked.
+                        # Use the pre-sharded CPU state; this thread only moves
+                        # the selected device shard to cuda:{device_id}.
                         stack = QwenTransformerStack(
                             self.model_args,
                             device_id,
@@ -525,6 +585,7 @@ class QwenShowHandsLayer:
                             self.num_devices,
                             device_id,
                             stack,
+                            precomputed=hf_precomputed,
                         )
                     else:
                         state_dicts = self.load_device_weights(
@@ -553,6 +614,7 @@ class QwenShowHandsLayer:
                         device_id,
                         self.num_devices,
                         cached_ffn_ops=cached_ffn_ops,
+                        moe_sync_callback=functools.partial(self._moe_sync, device_id),
                     )
                     if model_path is not None:
                         stack.init_tilert_weights(state_dicts)
@@ -566,6 +628,54 @@ class QwenShowHandsLayer:
 
                 params.extend(stack.get_weights_list())
                 caches.extend(stack.get_cache_vars())
+
+                # The converted TileRT checkpoint shards lm_head along the vocab
+                # dimension.  Gather all shards on this device so the golden
+                # reference path can compute full-vocabulary logits without
+                # cross-device communication.  Final norm is replicated per
+                # device, so this device's copy is sufficient.
+                if model_path is not None and not _is_hf_checkpoint(model_path):
+                    head_shard_size = self.model_args.vocab_size // self.num_devices
+                    full_lm_head = torch.empty(
+                        self.model_args.vocab_size,
+                        self.model_args.dim,
+                        dtype=torch.bfloat16,
+                        device=f"cuda:{device_id}",
+                    )
+                    index_path = os.path.join(model_path, "model.safetensors.index.json")
+                    with open(index_path, encoding="utf-8") as f:
+                        weights_index = json.load(f)
+                    weight_file_map = weights_index["weight_map"]
+                    for d in range(self.num_devices):
+                        for shard_key in (
+                            f"layer_{self.model_args.n_layers}_lm_head.weight_dev_{d}",
+                            f"lm_head.weight_dev_{d}",
+                        ):
+                            if shard_key in state_dicts:
+                                break
+                            weight_file = weight_file_map.get(shard_key)
+                            if weight_file is not None:
+                                with safe_open(
+                                    os.path.join(model_path, weight_file),
+                                    framework="pt",
+                                    device=f"cuda:{device_id}",
+                                ) as f:
+                                    state_dicts[shard_key] = f.get_tensor(shard_key)
+                                break
+                        else:
+                            raise RuntimeError(
+                                f"Missing lm_head shard for device {d} "
+                                f"(tried layer_{self.model_args.n_layers}_lm_head.weight_dev_{d} "
+                                f"and lm_head.weight_dev_{d})"
+                            )
+                        full_lm_head[d * head_shard_size : (d + 1) * head_shard_size] = (
+                            state_dicts[shard_key]
+                        )
+                    state_dicts["lm_head.weight"] = full_lm_head
+
+                    norm_key = f"layer_{self.model_args.n_layers}_model.norm.weight_dev_{device_id}"
+                    if norm_key in state_dicts:
+                        state_dicts["model.norm.weight"] = state_dicts[norm_key]
 
                 head_proj = RMSNormHeadProj(
                     model_args=self.model_args,
@@ -596,6 +706,7 @@ class QwenShowHandsLayer:
                     head_proj.init_tilert_weights(head_state)
                 else:
                     head_proj.init_random_weights(device_id=device_id)
+                self._head_proj_objects[device_id] = head_proj
                 params.extend(head_proj.get_weights_list())
 
                 # Embedding table is replicated on all devices.
@@ -691,7 +802,7 @@ class QwenShowHandsLayer:
         # NOTE: DCU backend is unstable when multiple devices initialize weights
         # concurrently (segmentation faults inside torch.cuda / weight dequant).
         # Serialize device initialization for Qwen3.6 to work around this.
-        if False:
+        if True:
             for device_id in range(self.num_devices):
                 try:
                     __load_weights(device_id, model_path)
@@ -718,6 +829,10 @@ class QwenShowHandsLayer:
 
         # Note: no V2 P2P setup for Qwen3.6 (no DSA/MLA).
 
+        # Allocate the TP8 MoE all-reduce buffers now that every device
+        # stack has been constructed.
+        self._init_moe_sync()
+
         # Qwen3.6 backend library does not exist yet, so skip the CUDA-graph
         # prepare step.  Golden forward is always used until kernels are ready.
         if os.environ.get("TILERT_QWEN36_ENABLE_BACKEND_PREPARE", "0") == "1":
@@ -742,12 +857,54 @@ class QwenShowHandsLayer:
                             False,
                         )
 
+    def _init_hf_fallback(self, model_path: str) -> None:
+        """Load a transformers model as a fallback when TileRT kernels are unavailable.
+
+        The fallback model is loaded on cuda:0 with the same balanced 2-GPU
+        memory profile used by the standalone transformers baseline.  All
+        ``forward()`` calls are then delegated to this model so that the
+        generator produces coherent text even though the TileRT golden path
+        lacks tensor-parallel communication.
+        """
+        if not _HAS_TRANSFORMERS:
+            raise RuntimeError(
+                "HF fallback requested but transformers is not installed"
+            )
+        if self._hf_model is not None:
+            return
+        if not _is_hf_checkpoint(model_path):
+            logger.warning(
+                "HF fallback only supports HF-source checkpoints; "
+                "skipping fallback for converted TileRT checkpoint"
+            )
+            return
+
+        logger.info(
+            "HF fallback enabled: loading AutoModelForCausalLM as the reference path"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Match the standalone transformers baseline configuration.
+            self._hf_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                device_map="balanced",
+                max_memory={0: "60GiB", 1: "60GiB", "cpu": "200GiB"},
+                low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
+            )
+        self._hf_model.eval()
+        logger.info("HF fallback model loaded")
+
     def from_pretrained(self, model_path: str) -> None:
         """Load the model weights from the given path."""
         if not os.path.exists(model_path):
             raise ValueError(f"Model weights directory {model_path} does not exist")
         logger.info(f"QwenShowHandsLayer.from_pretrained: {model_path}")
         self._init_weights(model_path)
+        if self._hf_fallback_enabled:
+            self._init_hf_fallback(model_path)
         logger.info("QwenShowHandsLayer.from_pretrained completed")
 
     def from_pretrained_with_cache(
@@ -773,6 +930,93 @@ class QwenShowHandsLayer:
         self._init_weights(None)
         logger.info("QwenShowHandsLayer.init_random_weights completed")
 
+    def _init_moe_sync(self) -> None:
+        """Allocate shared buffers and the barrier used for TP8 MoE all-reduce.
+
+        Must be called after all device stacks have been constructed because
+        each stack holds a bound reference to ``_moe_sync``.
+        """
+        if self.num_devices <= 1:
+            return
+
+        dim = self.model_args.dim
+        max_seq_len = self.forward_max_seq_len
+        self._moe_partial_buf = [
+            torch.zeros(
+                1,
+                max_seq_len,
+                dim,
+                dtype=torch.bfloat16,
+                device=f"cuda:{d}",
+            )
+            for d in range(self.num_devices)
+        ]
+        self._moe_aggregated_buf = [
+            torch.zeros(
+                1,
+                max_seq_len,
+                dim,
+                dtype=torch.bfloat16,
+                device=f"cuda:{d}",
+            )
+            for d in range(self.num_devices)
+        ]
+
+        def _barrier_action() -> None:
+            # Sum partial outputs across all devices.  Move to a CPU accumulator
+            # to avoid cross-device CUDA copies, then copy back to each device.
+            total = self._moe_partial_buf[0].float().cpu()
+            for d in range(1, self.num_devices):
+                total.add_(self._moe_partial_buf[d].float().cpu())
+            total = total.to(torch.bfloat16)
+            for d in range(self.num_devices):
+                self._moe_aggregated_buf[d].copy_(total)
+
+        self._moe_barrier = threading.Barrier(
+            self.num_devices,
+            action=_barrier_action,
+        )
+        logger.info(
+            f"TP8 MoE all-reduce initialized: num_devices={self.num_devices}, "
+            f"buffer_shape=(1, {max_seq_len}, {dim})"
+        )
+
+    def _moe_sync(self, device_id: int, h: torch.Tensor) -> torch.Tensor:
+        """Barrier-based all-reduce for TP8 MoE partial outputs.
+
+        Copies this device's partial output into the shared buffer, waits for
+        all devices at the barrier, then returns the aggregated full output.
+        """
+        if self.num_devices <= 1 or self._moe_barrier is None:
+            return h
+        seq_len = h.size(1)
+        self._moe_partial_buf[device_id][:, :seq_len, :].copy_(h)
+        self._moe_barrier.wait()
+        return self._moe_aggregated_buf[device_id][:, :seq_len, :]
+
+    def _get_full_head_proj(self, device_id: int) -> torch.Tensor:
+        """Return the full vocabulary head projection on the target device.
+
+        The golden reference path replicates the full lm_head on every device,
+        so no all-gather is required.
+        """
+        stack = self._stack_objects[device_id]
+        head_proj = self._head_proj_objects[device_id]
+        if stack is None or head_proj is None:
+            raise RuntimeError(f"Stack/head not initialized on device {device_id}")
+        stack_weight_count = len(stack.get_weights_list())
+        local_head = self._get_device_result(device_id)[2][stack_weight_count + 1]
+        # Full replicated layout: (vocab_size, dim).
+        if local_head.dim() == 2:
+            return local_head
+        if local_head.dim() == 3:
+            # TileRT-swizzled layout: (vocab_size/16, 16, 1024) blocks.
+            if local_head.size(-1) == 1024 and local_head.size(-2) == 16:
+                return local_head.transpose(1, 2).reshape(-1, self.model_args.dim)
+            # Per-device dense vocab shard: reshape only.
+            return local_head.reshape(-1, self.model_args.dim)
+        raise ValueError(f"Unexpected head projection layout: {local_head.shape}")
+
     def _golden_forward_device(
         self,
         device_id: int,
@@ -781,93 +1025,48 @@ class QwenShowHandsLayer:
     ) -> DeviceResult:
         """Reference forward for a single device.
 
-        This is used until the Qwen3.6 CUDA kernels are available.  It mirrors
-        the tensor layout expected by the future kernel so that switching over
-        is a drop-in replacement.
+        Delegates the actual layer math to ``QwenTransformerStack`` and
+        ``RMSNormHeadProj`` so that each op can later switch to its own
+        TileRT kernel via ``flag_enable_tilert``.
         """
         intermediates, caches, params, profile_logs = self._get_device_result(device_id)
         stack = self._stack_objects[device_id]
-        if stack is None:
-            raise RuntimeError(f"QwenTransformerStack not initialized on device {device_id}")
+        head_proj = self._head_proj_objects[device_id]
+        if stack is None or head_proj is None:
+            raise RuntimeError(
+                f"QwenTransformerStack/HeadProj not initialized on device {device_id}"
+            )
 
-        # Locate the final head projection, embedding, and RoPE weights in params.
         stack_weight_count = len(stack.get_weights_list())
-        head_weight_count = 2  # RMSNormHeadProj.get_weights_list().
-        embed_weight = params[stack_weight_count + head_weight_count]
-        freqs_cos_param = params[stack_weight_count + head_weight_count + 1]
-        freqs_sin_param = params[stack_weight_count + head_weight_count + 2]
+        embed_weight = params[stack_weight_count + 2]
+        freqs_cos_param = params[stack_weight_count + 3]
+        freqs_sin_param = params[stack_weight_count + 4]
 
-        # 1. Embedding lookup.  ``token_id`` may be a scalar int32 or a [1]
-        # tensor, so flatten it to a single index before indexing.  Also make sure
-        # the index tensor lives on the same device as the embedding table to
-        # avoid ``indices should be on the same device as the indexed tensor``
-        # errors during multi-device generation.
         idx = token_id.view(-1).to(embed_weight.device)
         x = embed_weight[idx].unsqueeze(0).to(torch.bfloat16)
-        intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id
+        seq_len = x.size(1)
+        if seq_len == 1:
+            intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id.view(-1)[0]
+        else:
+            intermediates[Idx.TOKEN_ID][0, :seq_len, 0] = token_id.view(-1)
         intermediates[Idx.CUR_POS][0] = cur_pos
 
-        # 2. Transformer stack (DeltaNet + Gated Attention layers).
-        # freqs_cos/sin_param have shape (max_seq_len, rope_dim).  Pack them as a
-        # tuple for the M-RoPE path.
-        # IMPORTANT: pass the persistent caches so KV cache and DeltaNet
-        # recurrent state survive across decode steps.
         if self._golden_caches[device_id] is None:
             self._golden_caches[device_id] = stack._init_layer_caches((freqs_cos_param, freqs_sin_param))
-        h, self._golden_caches[device_id] = stack.golden_forward(
+        h, self._golden_caches[device_id] = stack.forward(
             x, cur_pos, (freqs_cos_param, freqs_sin_param), self._golden_caches[device_id]
         )
 
-        # 3. Final RMSNorm + head projection.
-        # Params are TileRT-sharded; head projection weight is split across
-        # devices as (logits_dim/num_devices, dim).  The reference path needs
-        # the full matrix on every device.  If torch.distributed is available
-        # and initialized we all-gather; otherwise fall back to a local copy
-        # (useful for single-device smoke tests and debugging).
-        local_head = params[stack_weight_count + 1]
-        full_head: torch.Tensor
-        if (
-            local_head.dim() == 2
-            and local_head.size(0) * self.num_devices == self.model_args.vocab_size
-        ):
-            full_head = local_head
-            if torch.distributed.is_initialized():
-                head_list = [torch.empty_like(local_head) for _ in range(self.num_devices)]
-                torch.distributed.all_gather(head_list, local_head)
-                full_head = torch.cat(head_list, dim=0)
-        else:
-            # Converted checkpoint stores the head projection in the TileRT
-            # native block layout (logits_shard/16, 16, 1024).  RMSNormHeadProj
-            # already knows how to consume this layout, but for the reference
-            # path we still need the full vocabulary on every device.
-            local_head_2d = local_head.view(-1, self.model_args.dim)
-            full_head = local_head_2d
-            if (
-                torch.distributed.is_initialized()
-                and local_head_2d.size(0) * self.num_devices == self.model_args.vocab_size
-            ):
-                head_list = [torch.empty_like(local_head_2d) for _ in range(self.num_devices)]
-                torch.distributed.all_gather(head_list, local_head_2d)
-                full_head = torch.cat(head_list, dim=0)
-
-        head_proj = RMSNormHeadProj(
-            model_args=self.model_args,
-            device_id=device_id,
-            num_devices=self.num_devices,
-        )
+        full_head = self._get_full_head_proj(device_id)
         head_proj.ref_rmsnorm_gamma = params[stack_weight_count]
         head_proj.ref_head_proj = full_head
         logits = head_proj.golden_forward(h)
-        # Gather produces logits_dim on each device; slice local shard.
-        local_logits_dim = self.model_args.vocab_size // self.num_devices
-        local_logits_start = device_id * local_logits_dim
-        local_logits_end = local_logits_start + local_logits_dim
-        intermediates[Idx.LOGITS_OUT][0, 0, local_logits_start:local_logits_end].copy_(
-            logits[0, 0, local_logits_start:local_logits_end]
-        )
 
-        # 4. Sampling (greedy / top-k / top-p placeholder).
-        token_out = self._sample(logits[0, 0])
+        last_pos = logits.size(1) - 1
+        vocab_shard = logits.size(-1)
+        intermediates[Idx.LOGITS_OUT][0, 0, :vocab_shard].copy_(logits[0, last_pos, :])
+
+        token_out = self._sample(logits[0, last_pos])
         intermediates[Idx.TOKEN_OUT][0, 0, 0] = token_out
 
         return intermediates, caches, params, profile_logs
@@ -878,6 +1077,61 @@ class QwenShowHandsLayer:
             # Placeholder: fall back to greedy for smoke tests.
             return int(logits.argmax().item())
         return int(logits.argmax().item())
+
+    def _hf_forward(self, token_id: torch.Tensor) -> list[DeviceResult]:
+        """Reference forward using a loaded transformers model.
+
+        This path is used as a temporary fallback when the TileRT golden path
+        cannot produce correct results because tensor-parallel weights are not
+        aggregated across devices.  It runs a real transformers model on
+        cuda:0/1 and writes the resulting logits/token into device 0's
+        intermediates so that the rest of the generator logic is unchanged.
+        """
+        assert self._hf_model is not None
+        token_id = token_id.view(-1).to(dtype=torch.long, device=self._hf_model.device)
+        if self._hf_input_ids is None:
+            self._hf_input_ids = token_id.unsqueeze(0)
+        else:
+            self._hf_input_ids = torch.cat(
+                [self._hf_input_ids, token_id.unsqueeze(0)], dim=1
+            )
+
+        with torch.inference_mode():
+            if self._hf_past_key_values is None:
+                outputs = self._hf_model(
+                    self._hf_input_ids,
+                    use_cache=True,
+                )
+                self._hf_past_key_values = outputs.past_key_values
+            else:
+                # Only feed the newest token; the KV cache holds history.
+                outputs = self._hf_model(
+                    token_id.unsqueeze(0),
+                    past_key_values=self._hf_past_key_values,
+                    use_cache=True,
+                )
+                self._hf_past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :].float()
+
+        next_token = int(logits.argmax(dim=-1).item())
+
+        # EP8: full logits are replicated on every device.
+        for device_id in range(self.num_devices):
+            intermediates, caches, params, profile_logs = self._get_device_result(device_id)
+            vocab_shard = logits.size(-1)
+            intermediates[Idx.LOGITS_OUT][0, 0, :vocab_shard].copy_(logits[0, :])
+            intermediates[Idx.TOKEN_OUT][0, 0, 0] = next_token
+            if device_id == 0:
+                first_result = (intermediates, caches, params, profile_logs)
+
+        # Return all device results; each device carries its own logits shard.
+        results: list[DeviceResult] = []
+        for device_id in range(self.num_devices):
+            if device_id == 0:
+                results.append(first_result)
+            else:
+                results.append(self._get_device_result(device_id))
+        return results
 
     def forward(
         self,
@@ -901,13 +1155,48 @@ class QwenShowHandsLayer:
         try:
             qwen36_show_hands(token_id.cpu(), active_mtp)
         except (AttributeError, RuntimeError):
-            # Backend kernels not available; use golden path.
-            return [
-                self._golden_forward_device(device_id, token_id, cur_pos)
-                for device_id in range(self.num_devices)
-            ]
+            # Backend kernels not available; use golden path or HF fallback.
+            if self._hf_model is not None:
+                return self._hf_forward(token_id)
+            return self._golden_forward_all_devices(token_id, cur_pos)
 
         return [self._get_device_result(device_id) for device_id in range(self.num_devices)]
+
+    def _golden_forward_all_devices(
+        self,
+        token_id: torch.Tensor,
+        cur_pos: int,
+    ) -> list[DeviceResult]:
+        """Run the golden forward on all devices in parallel.
+
+        Each device computes its TP8 MoE shard; the barrier inside
+        ``_moe_sync`` aggregates partial outputs after every layer.
+        """
+        results: list[DeviceResult | None] = [None] * self.num_devices
+        exceptions: list[Exception | None] = [None] * self.num_devices
+
+        def _runner(device_id: int) -> None:
+            try:
+                results[device_id] = self._golden_forward_device(device_id, token_id, cur_pos)
+            except Exception as exc:  # pragma: no cover - surfaced after join
+                exceptions[device_id] = exc
+
+        threads = [
+            threading.Thread(target=_runner, args=(device_id,))
+            for device_id in range(self.num_devices)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        for device_id, exc in enumerate(exceptions):
+            if exc is not None:
+                raise RuntimeError(
+                    f"Golden forward failed on device {device_id}: {exc}"
+                ) from exc
+
+        return [results[device_id] for device_id in range(self.num_devices)]
 
     def set_sampling_seed(self, seed: int, with_mtp: bool | None = None) -> None:
         """Set the sampling seed for top-p sampling."""
@@ -929,6 +1218,10 @@ class QwenShowHandsLayer:
         """Reset the decode sequence state."""
         # Drop persistent golden caches so the next generation starts fresh.
         self._golden_caches = [None] * self.num_devices
+        # Also reset the HF fallback state so the next generation starts from
+        # a clean prompt.
+        self._hf_past_key_values = None
+        self._hf_input_ids = None
         try:
             if self.with_mtp:
                 qwen36_show_hands_reset(True)

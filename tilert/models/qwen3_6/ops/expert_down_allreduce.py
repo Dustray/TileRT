@@ -114,10 +114,9 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert weights to general (tilert) format.
 
-        The weight layout is architecture-specific because ``dim_per_sm`` must evenly
-        divide ``dim``. For Qwen3.6 ``dim=2048`` we use 128 SMs -> ``dim_per_sm=16``;
-        the swizzling therefore only processes 16-row tiles. GLM5 ``dim=6144`` keeps
-        the original 48+8 split used by DSv32.
+        EP8: each device keeps the full intermediate dimension for its local
+        experts.  The swizzling therefore processes the full ``inter_dim``
+        rather than ``inter_dim // num_devices``.
         """
         args = self.model_args
         assert args.arch_name in ("qwen3_6", "glm_5")
@@ -126,23 +125,31 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
         num_sms = 128
         dim_per_sm = dim // num_sms
         dim_scale_dim = dim // args.block_size
-        base_inter_dim = getattr(args, "moe_inter_dim", args.inter_dim)
-        expert_dim = base_inter_dim // self.num_devices
+        # TP8: each device owns inter_dim // num_devices.
+        expert_dim = args.inter_dim // self.num_devices
         k_chunks = expert_dim // 32
         scale_cols = expert_dim // args.block_size
+        # TP8 may produce tiny local shards (e.g. inter_dim=512/8=64 < block_size).
+        # The swizzler needs 32-wide chunks; fall back to raw weights + scalar
+        # scale when this condition is not met so random-init sanity tests can run.
+        if expert_dim % 32 != 0:
+            return self._convert_to_general_fallback(weights_list)
 
         with torch.inference_mode():
             mat_in, scale_in = weights_list
             exp_num = mat_in.shape[0]
             mat_in_s = mat_in.reshape(exp_num, num_sms, dim_per_sm, expert_dim)
 
-            # When the per-device expert dimension is smaller than the
-            # quantization block_size, the scale tensor still carries the
-            # original block-wise scale rows.  Collapse them to a single scale
-            # value for this device shard so the downstream SM layout works.
             if scale_cols == 0:
                 scale_cols = 1
-                scale_in = scale_in.mean(dim=-1, keepdim=True)
+                # Scale was generated for full inter_dim and then sharded.
+                # Collapse all scale columns per expert to a single scalar so
+                # the downstream scale grid is valid.
+                scale_in = scale_in.reshape(exp_num, -1).mean(
+                    dim=-1, keepdim=True
+                )
+                if scale_in.dim() < mat_in.dim():
+                    scale_in = scale_in.unsqueeze(-1)
 
             if arch_name == "qwen3_6":
                 assert dim_per_sm == 16, f"Qwen3.6 expects dim_per_sm=16, got {dim_per_sm}"
@@ -172,11 +179,23 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
                 mats_to_cat.append(mat_in_3)
                 mat_in_swizzled = torch.cat(mats_to_cat, dim=2).reshape(exp_num, dim, expert_dim)
 
-            mat_scale_tilert = (
-                scale_in.reshape(exp_num, dim_scale_dim, 1, scale_cols)
-                .repeat(1, 1, dim_per_sm, 1)
-                .reshape(exp_num, num_sms, -1)
-            )
+            if scale_in.numel() == exp_num:
+                # Tiny local shard: one scalar scale per expert.  Replicate
+                # it across all dim blocks and scale columns.
+                mat_scale_tilert = (
+                    scale_in.reshape(exp_num, 1, 1)
+                    .expand(exp_num, dim_scale_dim, scale_cols)
+                    .unsqueeze(2)
+                    .repeat(1, 1, dim_per_sm, 1)
+                    .reshape(exp_num, num_sms, -1)
+                )
+            else:
+                mat_scale_tilert = (
+                    scale_in.reshape(exp_num, dim_scale_dim, scale_cols)
+                    .unsqueeze(2)
+                    .repeat(1, 1, dim_per_sm, 1)
+                    .reshape(exp_num, num_sms, -1)
+                )
             target_cols_per_sm = dim_per_sm * scale_cols
             pad_amount = target_cols_per_sm - mat_scale_tilert.shape[-1]
             if pad_amount > 0:
@@ -197,6 +216,30 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
                 )
                 mat_scale_tilert = mat_scale_tilert.to(torch.float32)
             return mat_in_swizzled.contiguous(), mat_scale_tilert.contiguous()
+
+    def _convert_to_general_fallback(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fallback for tiny TP shards that the swizzler cannot tile.
+
+        Returns the raw FP8 weights and a scalar scale.  The resulting tilert
+        tensors are not layout-swizzled, but they keep ``init_tilert_weights``
+        and the tilert path importable for random-init smoke tests.
+        """
+        mat_in, scale_in = weights_list
+        # Preserve a 3-D scale tensor so the rest of the op can keep using
+        # scale_in as if it came from ``process_down_weights``.
+        exp_num = mat_in.shape[0]
+        if scale_in.numel() == 1:
+            scale_out = scale_in.to(torch.float32).view(exp_num, 1, 1)
+        else:
+            scale_out = (
+                scale_in.reshape(exp_num, -1)
+                .mean(dim=1, keepdim=True)
+                .to(torch.float32)
+                .view(exp_num, 1, 1)
+            )
+        return mat_in.contiguous(), scale_out.contiguous()
 
     def convert_to_bf16mma(
         self, weights_list: list[torch.Tensor]
@@ -322,11 +365,13 @@ class ExpertDownAllReduce(TileRTModule):
         self.n_activated_experts: int = self.model_args.n_activated_experts
         self.n_routed_experts: int = self.model_args.n_routed_experts
         self.n_shared_experts: int = self.model_args.n_shared_experts
-        self.moe_inter_dim = self.model_args.inter_dim
+        # TP8: this op stores the *local* intermediate dimension.
+        self.moe_inter_dim = self.model_args.inter_dim // self.num_devices
         self.block_size = self.model_args.block_size
         self.algorithm = algorithm
 
         self.ref_down: torch.Tensor | None = None
+        self.ref_shared_expert_gate: torch.Tensor | None = None
         self.tilert_weights: torch.Tensor | None = None
         self.tilert_scales: torch.Tensor | None = None
         self.hidden_out: torch.Tensor | None = None
@@ -365,24 +410,45 @@ class ExpertDownAllReduce(TileRTModule):
         weights_hf: dict[str, torch.Tensor],
         num_devices: int,
         is_stacked_experts: bool = False,
+        tp_mode: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract and shard down weights.
+        """Extract and shard down weights for EP8 or TP8.
 
-        For Qwen3.6 routed experts the weight is the stacked tensor
-        ``(n_experts, dim, inter_dim)``.  Shared experts use the conventional
-        ``down_proj.weight`` tensor of shape ``(dim, inter_dim)``.
+        EP8 (``tp_mode=False``): weights are sharded along the expert dimension.
+        Each device owns ``n_routed_experts // num_devices`` routed experts plus
+        one replicated shared expert, while inter_dim stays full on each device.
+
+        TP8 (``tp_mode=True``): every device keeps all experts, but the input
+        intermediate dimension is split across devices.  Each device therefore owns
+        ``inter_dim // num_devices`` columns of every expert's down projection.
+        The partial outputs from each device are all-reduced by the caller.
+
+        Returns down weights/scales of shape
+          EP8: (n_local_experts, num_devices, dim, inter_dim)
+          TP8: (n_experts,       num_devices, dim, inter_dim // num_devices)
+        where n_local_experts = 1 shared + n_routed_experts // num_devices routed.
         """
         if is_stacked_experts:
             down_proj_weight = weights_hf[f"{key_prefix}.down_proj"]
             down_proj_scale = weights_hf.get(
                 f"{key_prefix}.down_proj.weight_scale_inv",
-                ExpertDownAllReduce._fake_ones_scale(down_proj_weight, is_stacked_experts=True),
+                ExpertDownAllReduce._fake_ones_scale(
+                    down_proj_weight,
+                    is_stacked_experts=True,
+                    num_devices=num_devices,
+                    tp_mode=tp_mode,
+                ),
             )
         else:
             down_proj_weight = weights_hf[f"{key_prefix}.down_proj.weight"]
             down_proj_scale = weights_hf.get(
                 f"{key_prefix}.down_proj.weight_scale_inv",
-                ExpertDownAllReduce._fake_ones_scale(down_proj_weight, is_stacked_experts=False),
+                ExpertDownAllReduce._fake_ones_scale(
+                    down_proj_weight,
+                    is_stacked_experts=False,
+                    num_devices=num_devices,
+                    tp_mode=tp_mode,
+                ),
             )
 
         if is_stacked_experts:
@@ -392,62 +458,81 @@ class ExpertDownAllReduce(TileRTModule):
             n_experts = 1
             dim, moe_inter_dim = down_proj_weight.shape
             dim_scale_dim, in_scale_dim = down_proj_scale.shape
-        moe_inter_dim_per_device = moe_inter_dim // num_devices
-        # Same scale-splitting safeguard as gate/up: if there are fewer scale
-        # rows than devices, broadcast the scale across devices.
-        if in_scale_dim >= num_devices and in_scale_dim % num_devices == 0:
-            in_scale_dim_per_device = in_scale_dim // num_devices
+
+        if tp_mode:
+            local_inter_dim = moe_inter_dim // num_devices
+            local_in_scale_dim = max(local_inter_dim // 128, 1)
         else:
-            in_scale_dim_per_device = in_scale_dim
+            local_inter_dim = moe_inter_dim
+            local_in_scale_dim = in_scale_dim
+
+        def _tp_shard_scale(scale: torch.Tensor, n_experts: int) -> torch.Tensor:
+            """Expand/trim full-inter_dim scale columns to per-device shards."""
+            # Scale layout is (n_experts, dim_scale_dim, in_scale_dim) or
+            # (dim_scale_dim, in_scale_dim) for shared experts.  Target layout:
+            # (n_experts, num_devices, dim_scale_dim, local_in_scale_dim).
+            if scale.dim() == 2:
+                scale = scale.unsqueeze(0)
+            cols_needed = num_devices * local_in_scale_dim
+            cols_available = scale.shape[-1]
+            if cols_available < cols_needed:
+                repeat = (cols_needed + cols_available - 1) // cols_available
+                scale = scale.repeat_interleave(repeat, dim=-1)
+            scale = scale[:, :, :cols_needed]
+            return scale.reshape(n_experts, num_devices, local_in_scale_dim, dim_scale_dim).transpose(
+                1, 2
+            )
 
         if is_stacked_experts:
-            down_proj_weight = down_proj_weight.reshape(
-                n_experts, dim, num_devices, moe_inter_dim_per_device
-            )
-            down_proj_weight = down_proj_weight.transpose(1, 2).reshape(
-                n_experts, num_devices, dim, moe_inter_dim_per_device
-            )
-            if in_scale_dim >= num_devices:
-                down_proj_scale = down_proj_scale.reshape(
-                    n_experts, dim_scale_dim, num_devices, in_scale_dim_per_device
+            if tp_mode:
+                down_proj_weight = down_proj_weight.reshape(
+                    n_experts, num_devices, dim, local_inter_dim
                 )
-                down_proj_scale = down_proj_scale.transpose(1, 2).reshape(
-                    n_experts, num_devices, dim_scale_dim, in_scale_dim_per_device
-                )
+                down_proj_scale = _tp_shard_scale(down_proj_scale, n_experts)
             else:
-                # Scale shape is (n_experts, dim_scale_dim, in_scale_dim).  Add
-                # and move the device dimension to match (n_experts, num_devices,
-                # dim_scale_dim, in_scale_dim).
-                down_proj_scale = down_proj_scale[:, :, None, :].expand(
-                    n_experts, dim_scale_dim, num_devices, in_scale_dim
+                assert n_experts % num_devices == 0, (
+                    f"n_routed_experts {n_experts} must be divisible by num_devices {num_devices}"
                 )
-                down_proj_scale = down_proj_scale.transpose(1, 2).contiguous()
+                n_local_experts = n_experts // num_devices
+                down_proj_weight = down_proj_weight.reshape(
+                    num_devices, n_local_experts, dim, local_inter_dim
+                ).transpose(0, 1)
+                down_proj_scale = down_proj_scale.reshape(
+                    num_devices, n_local_experts, dim_scale_dim, local_in_scale_dim
+                ).transpose(0, 1)
         else:
-            down_proj_weight = down_proj_weight.reshape(dim, num_devices, moe_inter_dim_per_device)
-            down_proj_weight = down_proj_weight.transpose(0, 1).reshape(
-                1, num_devices, dim, moe_inter_dim_per_device
-            )
-            if in_scale_dim >= num_devices:
-                down_proj_scale = down_proj_scale.reshape(
-                    dim_scale_dim, num_devices, in_scale_dim_per_device
+            if tp_mode:
+                down_proj_weight = down_proj_weight.reshape(
+                    1, num_devices, dim, local_inter_dim
                 )
-                down_proj_scale = down_proj_scale.transpose(0, 1).reshape(
-                    1, num_devices, dim_scale_dim, in_scale_dim_per_device
-                )
+                down_proj_scale = _tp_shard_scale(down_proj_scale, 1)
             else:
-                down_proj_scale = down_proj_scale[None, None, :, :].expand(
-                    1, num_devices, dim_scale_dim, in_scale_dim
-                )
+                # Shared expert: full inter_dim, replicate across devices.
+                down_proj_weight = down_proj_weight.reshape(1, dim, local_inter_dim)[
+                    None, ...
+                ].repeat(num_devices, 1, 1, 1).transpose(0, 1)
+                down_proj_scale = down_proj_scale.reshape(1, dim_scale_dim, local_in_scale_dim)[
+                    None, ...
+                ].repeat(num_devices, 1, 1, 1).transpose(0, 1)
+
         return down_proj_weight, down_proj_scale
 
     @staticmethod
-    def _fake_ones_scale(weight: torch.Tensor, is_stacked_experts: bool = False) -> torch.Tensor:
+    def _fake_ones_scale(
+        weight: torch.Tensor,
+        is_stacked_experts: bool = False,
+        num_devices: int = 1,
+        tp_mode: bool = False,
+    ) -> torch.Tensor:
         if is_stacked_experts:
             _, dim, inter_dim = weight.shape
         else:
             *_, dim, inter_dim = weight.shape
         block_size = 128
-        shape = (dim // block_size, inter_dim // block_size)
+        # Always generate the full unsharded scale grid; the TP split is done
+        # later in ``process_down_weights`` so fake scales match real checkpoints.
+        local_inter_dim = inter_dim
+        shape = (dim // block_size, max(local_inter_dim // block_size, 1))
         if is_stacked_experts:
             shape = (weight.shape[0],) + shape
         return torch.ones(
@@ -468,21 +553,36 @@ class ExpertDownAllReduce(TileRTModule):
         down_scales_list = []
         exp_prefix = f"{key_prefix}.shared_expert"
         down_weights, down_scales = self.process_down_weights(
-            exp_prefix, weights_dict, self.num_devices, is_stacked_experts=False
+            exp_prefix, weights_dict, self.num_devices, is_stacked_experts=False, tp_mode=True
         )
         down_weights_list.append(down_weights)
         down_scales_list.append(down_scales)
         exp_prefix = f"{key_prefix}.experts"
         down_weights, down_scales = self.process_down_weights(
-            exp_prefix, weights_dict, self.num_devices, is_stacked_experts=True
+            exp_prefix, weights_dict, self.num_devices, is_stacked_experts=True, tp_mode=True
         )
         down_weights_list.append(down_weights)
         down_scales_list.append(down_scales)
-        # Concatenate along the expert dimension (first dim).  Both shared and
-        # routed outputs now have rank 4: (n_experts, num_devices, ...).
+        # Concatenate along the expert dimension (first dim).  Under TP8 both
+        # shared and routed outputs have rank 4: (n_experts, num_devices,
+        # dim, inter_dim // num_devices).
         down_weights = torch.cat(down_weights_list, dim=0)
         down_scales = torch.cat(down_scales_list, dim=0)
         return down_weights.contiguous(), down_scales.contiguous()
+
+    def _dequant_expert_stack(
+        self,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dequantize a stack of expert down weights to bf16."""
+        return torch.stack(
+            [
+                _safe_weight_dequant(weights[i], scales[i]).to(torch.bfloat16)
+                for i in range(weights.shape[0])
+            ],
+            dim=0,
+        )
 
     def init_reference_weights(
         self,
@@ -493,17 +593,24 @@ class ExpertDownAllReduce(TileRTModule):
         logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
+
+        # TP8: keep the full expert count but only the local inter_dim shard
+        # on each device.  Global expert indices select directly into the
+        # local full-expert table.
         sharded_list = self.device_sharding(state_dict, key_prefix)
-        # ``device_sharding`` returns (n_experts, num_devices, ...); select the
-        # requested device across all experts.
         down_weights = sharded_list[0][:, device_id]
         down_scales = sharded_list[1][:, device_id]
+        self.ref_down = self._dequant_expert_stack(down_weights, down_scales)
 
-        down_list = [
-            _safe_weight_dequant(down_weight, down_scale)
-            for down_weight, down_scale in zip(down_weights, down_scales)
-        ]
-        self.ref_down = torch.stack(down_list, dim=0)
+        # Load the shared-expert gate so the golden path can apply it after
+        # the shared expert down-projection, matching HF Qwen3_5MoeSparseMoeBlock.
+        shared_expert_gate = state_dict.get(f"{key_prefix}.shared_expert_gate.weight")
+        if shared_expert_gate is None:
+            shared_expert_gate = state_dict.get("shared_expert_gate")
+        if shared_expert_gate is not None:
+            if shared_expert_gate.dim() == 1:
+                shared_expert_gate = shared_expert_gate.unsqueeze(0)
+            self.ref_shared_expert_gate = shared_expert_gate.to(torch.bfloat16)
 
     def get_tilert_weights_alias(self) -> list[str]:
         """Return the alias list keyed into ``state_dict`` for this op."""
@@ -513,6 +620,18 @@ class ExpertDownAllReduce(TileRTModule):
         logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         weights_list = [state_dict[alias] for alias in self.tensor_alias]
+
+        # TP8: ``device_sharding`` stacks a num_devices dimension where each
+        # slice is a different inter_dim shard.  The converter expects
+        # per-device tensors, so select this device's slice if the extra
+        # dimension is present.
+        def _ensure_per_device(t: torch.Tensor) -> torch.Tensor:
+            if t.dim() >= 3 and t.size(1) == self.num_devices:
+                return t[:, self.device_id]
+            return t
+
+        weights_list = [_ensure_per_device(t) for t in weights_list]
+
         # Real Qwen3.6 converted checkpoints store down weights in bf16.
         # The GENERAL swizzler expects float8_e4m3fn; cast if needed.
         if weights_list[0].dtype != torch.float8_e4m3fn:
@@ -537,25 +656,28 @@ class ExpertDownAllReduce(TileRTModule):
             device_id = 0
         logger.debug(f"{self.op_name}: init_random_weights on cuda:{device_id}")
         dev = f"cuda:{device_id}"
-        # Scale by 1/sqrt(fan_in) for stable 40-layer reference numerics.
+        # TP8: generate *full* down weights; ``process_down_weights`` will
+        # perform the TP8 split along the intermediate dimension.
+        full_inter_dim = self.model_args.inter_dim
         shared_down = (
             torch.randn(
-                self.dim, self.moe_inter_dim, dtype=torch.bfloat16, device=dev
+                self.dim, full_inter_dim, dtype=torch.bfloat16, device=dev
             )
-            / (self.moe_inter_dim ** 0.5)
+            / (full_inter_dim ** 0.5)
         ).to(torch.float8_e4m3fn)
+        # Reference/golden path needs the full set of routed experts.
         routed_down = (
             torch.randn(
                 self.n_routed_experts,
                 self.dim,
-                self.moe_inter_dim,
+                full_inter_dim,
                 dtype=torch.bfloat16,
                 device=dev,
             )
-            / (self.moe_inter_dim ** 0.5)
+            / (full_inter_dim ** 0.5)
         ).to(torch.float8_e4m3fn)
         dim_scale_dim = self.dim // self.block_size
-        moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
+        moe_inter_dim_scale_dim = max(full_inter_dim // self.block_size, 1)
         scale_dtype = torch.float32
         shared_scale = torch.randn(
             dim_scale_dim, moe_inter_dim_scale_dim, dtype=scale_dtype, device=dev
@@ -567,19 +689,24 @@ class ExpertDownAllReduce(TileRTModule):
             dtype=scale_dtype,
             device=dev,
         )
+        shared_expert_gate = (
+            torch.randn(1, self.dim, dtype=torch.bfloat16, device=dev)
+            / (self.dim ** 0.5)
+        )
         state_dict = dict(
             zip(
                 self.ref_weights_alias(),
                 [shared_down, routed_down, shared_scale, routed_scale],
             )
         )
+        state_dict["mlp.shared_expert_gate.weight"] = shared_expert_gate
         self.init_reference_weights(state_dict, "mlp", device_id)
         # Keep reference weights in bf16 to avoid a 4x memory spike from the
         # fp32 dequantization fallback used during random-init sanity tests.
         self.ref_down = self.ref_down.to(torch.bfloat16)
         sharded_list = self.device_sharding(state_dict, "mlp")
-        # ``sharded_list`` has shape (n_experts, num_devices, ...); select all
-        # experts for the requested device.
+        # ``sharded_list`` has shape (n_experts, num_devices, ...); under TP8
+        # each device gets a different inter_dim shard.
         sharded_state_dict = {
             alias: sharded_list[i][:, device_id] for i, alias in enumerate(self.tensor_alias)
         }
@@ -590,6 +717,7 @@ class ExpertDownAllReduce(TileRTModule):
         vec_in: torch.Tensor,
         indices: torch.Tensor,
         scores: torch.Tensor,
+        x_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.ref_down is not None
         assert vec_in.dim() == 4 and vec_in.size(0) == 1
@@ -599,13 +727,25 @@ class ExpertDownAllReduce(TileRTModule):
         if indices.ndim == 2:
             indices = indices.unsqueeze(0)
             scores = scores.unsqueeze(0)
+        # TP8: reference weights contain every expert but only the local
+        # inter_dim shard, so global expert indices index directly into ref_down
+        # (the shared expert lives at index 0).
+        local_indices = indices
         seq_len = vec_in.shape[1]
         hidden_out_list = []
         for s in range(seq_len):
             hidden_out_w2_list = []
             hidden_out_w2_shared = vec_in[0, s, 0].float() @ self.ref_down[0].float().mT
+            # Apply the shared-expert gate in the same place as the HF model:
+            # after the shared expert down-projection and before adding the
+            # routed expert outputs.
+            if x_in is not None:
+                shared_gate = torch.sigmoid(
+                    x_in[0, s].float() @ self.ref_shared_expert_gate.float().mT
+                )
+                hidden_out_w2_shared = hidden_out_w2_shared * shared_gate.squeeze(-1)
             hidden_out_w2_list.append(hidden_out_w2_shared)
-            ref_down_sel = self.ref_down[1:][indices[0, s]]
+            ref_down_sel = self.ref_down[1:][local_indices[0, s]]
             for i in range(self.n_activated_experts):
                 hidden_out_w2_sel = vec_in[0, s, i + 1].float() @ ref_down_sel[i].float().mT
                 hidden_out_w2_list.append(hidden_out_w2_sel * scores[0, s, i])
