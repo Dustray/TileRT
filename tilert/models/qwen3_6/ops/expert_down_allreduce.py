@@ -467,10 +467,15 @@ class ExpertDownAllReduce(TileRTModule):
             local_in_scale_dim = in_scale_dim
 
         def _tp_shard_scale(scale: torch.Tensor, n_experts: int) -> torch.Tensor:
-            """Expand/trim full-inter_dim scale columns to per-device shards."""
-            # Scale layout is (n_experts, dim_scale_dim, in_scale_dim) or
-            # (dim_scale_dim, in_scale_dim) for shared experts.  Target layout:
-            # (n_experts, num_devices, dim_scale_dim, local_in_scale_dim).
+            """Expand/trim full-inter_dim scale columns to per-device shards.
+
+            Input scale layout is (n_experts, dim_scale_dim, in_scale_dim) or
+            (dim_scale_dim, in_scale_dim) for shared experts.  The downstream
+            ``convert_to_general`` consumes per-device scales as
+            ``(n_experts, dim_scale_dim, scale_cols)``, so we return the
+            stacked layout ``(n_experts, num_devices, dim_scale_dim,
+            local_in_scale_dim)``.
+            """
             if scale.dim() == 2:
                 scale = scale.unsqueeze(0)
             cols_needed = num_devices * local_in_scale_dim
@@ -479,9 +484,9 @@ class ExpertDownAllReduce(TileRTModule):
                 repeat = (cols_needed + cols_available - 1) // cols_available
                 scale = scale.repeat_interleave(repeat, dim=-1)
             scale = scale[:, :, :cols_needed]
-            return scale.reshape(n_experts, num_devices, local_in_scale_dim, dim_scale_dim).transpose(
-                1, 2
-            )
+            return scale.reshape(
+                n_experts, num_devices, local_in_scale_dim, dim_scale_dim
+            ).transpose(2, 3)
 
         if is_stacked_experts:
             if tp_mode:
@@ -621,16 +626,11 @@ class ExpertDownAllReduce(TileRTModule):
         assert self.algorithm is not None, "Algorithm is not set"
         weights_list = [state_dict[alias] for alias in self.tensor_alias]
 
-        # TP8: ``device_sharding`` stacks a num_devices dimension where each
-        # slice is a different inter_dim shard.  The converter expects
-        # per-device tensors, so select this device's slice if the extra
-        # dimension is present.
-        def _ensure_per_device(t: torch.Tensor) -> torch.Tensor:
-            if t.dim() >= 3 and t.size(1) == self.num_devices:
-                return t[:, self.device_id]
-            return t
-
-        weights_list = [_ensure_per_device(t) for t in weights_list]
+        # ``init_tilert_weights`` receives already-per-device tensors from
+        # ``init_random_weights`` (or an external loader).  No further
+        # slicing should be performed here, because the per-device scale tensor
+        # may legitimately have a middle dimension equal to ``num_devices``
+        # (e.g. scale_cols=2 under TP2) and an extra slice would corrupt it.
 
         # Real Qwen3.6 converted checkpoints store down weights in bf16.
         # The GENERAL swizzler expects float8_e4m3fn; cast if needed.
