@@ -83,6 +83,8 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.T
 def main():
     torch.set_num_threads(64)
     torch.manual_seed(42)
+    # Allow fragmentation recovery when the two GPUs are nearly full.
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
     logger.info("[1/5] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
@@ -159,7 +161,18 @@ def main():
             x, start_pos=start_pos, caches=caches, mrope_embed=mrope_embed
         )
         hidden_norm = rmsnorm(hidden[:, -1:, :], final_norm_w)
-        logits = (hidden_norm.float() @ lm_head_w.T.float()).squeeze(1)
+        # Chunked matmul for the large lm_head to avoid a single big allocation
+        # when GPU memory is already nearly exhausted.
+        vocab_size = lm_head_w.shape[0]
+        chunk_size = 32768
+        logits_chunks = []
+        for start in range(0, vocab_size, chunk_size):
+            end = min(start + chunk_size, vocab_size)
+            logits_chunks.append(
+                (hidden_norm.float() @ lm_head_w[start:end].T.float())
+            )
+            torch.cuda.synchronize()
+        logits = torch.cat(logits_chunks, dim=-1).squeeze(1)
         next_id = int(logits.argmax(-1).item())
 
         if pos >= len(prompt_tokens):
