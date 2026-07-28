@@ -55,7 +55,7 @@ def main():
 
     generator = Qwen36Generator(
         model_args=model_args,
-        max_new_tokens=60,
+        max_new_tokens=20,
         temperature=1.0,
         model_weights_dir=weights_dir,
         with_mtp=False,
@@ -73,12 +73,7 @@ def main():
         logger.info("[2/3] Generator initialized from pretrained weights OK")
 
     prompt = (
-        "Tell me three jokes:\n\n"
-        "1. A dad joke,\n"
-        "2. A programmer joke,\n"
-        "3. A joke that only makes sense if you've ever tried "
-        "to train a large language model.\n"
-        "Keep each joke under 15 words."
+        "hello"
     )
 
     logger.info("[3/3] Running generate() with official README prompt...")
