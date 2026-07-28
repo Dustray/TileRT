@@ -1,0 +1,20 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Python 调试程序: 当前文件",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/verify_qwen36_generator_official_prompt.py",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "/public/home/dinggy/yiny/projects/TileRT",
+                "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"
+            }
+        }
+    ]
+}
