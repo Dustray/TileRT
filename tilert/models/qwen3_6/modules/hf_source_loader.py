@@ -189,7 +189,12 @@ def _precompute_all_device_states(
     model_args: ModelArgsQwen36,
     num_devices: int,
     stack: QwenTransformerStack,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], list[dict[str, dict[str, torch.Tensor]]]]:
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    list[dict[str, dict[str, torch.Tensor]]],
+    list[dict[str, dict[str, torch.Tensor]]],
+]:
     """Load the HF checkpoint once and shard every layer for all devices.
 
     Returns:
@@ -197,6 +202,8 @@ def _precompute_all_device_states(
       * ``head_state_per_device``: dict mapping device_id -> head state dict.
       * ``per_device_layer_states``: list of length ``n_layers``; each element is
         a dict mapping device_id -> per-device TileRT state dict for that layer.
+      * ``per_device_ref_layer_states``: same layout, but containing raw HF-style
+        reference keys per device suitable for ``init_reference_weights``.
 
     This centralizes the CPU-heavy ``device_sharding`` work so that it runs
     exactly once, regardless of how many devices are being loaded.
@@ -227,9 +234,11 @@ def _precompute_all_device_states(
         }
 
     per_device_layer_states: list[dict[str, dict[str, torch.Tensor]]] = []
+    per_device_ref_layer_states: list[dict[str, dict[str, torch.Tensor]]] = []
     for layer_idx, layer_state in enumerate(per_layer):
         if not layer_state:
             per_device_layer_states.append({str(did): {} for did in range(num_devices)})
+            per_device_ref_layer_states.append({str(did): {} for did in range(num_devices)})
             continue
         stripped = _strip_language_model_prefix(layer_state)
         local_state: dict[str, torch.Tensor] = {}
@@ -251,8 +260,64 @@ def _precompute_all_device_states(
             }
             layer_states[str(did)] = device_state
         per_device_layer_states.append(layer_states)
+        # 新加逻辑：
+        # Build per-device raw reference state dicts.  These keep the
+        # original HF keys (e.g. ``linear_attn.in_proj_qkv.weight``) but with
+        # each tensor already sliced to the target device's local shard so that
+        # ``init_reference_weights`` can be called directly per device.
+        ref_aliases = block.get_ref_weights_alias()
+        ref_layer_states: dict[str, dict[str, torch.Tensor]] = {}
+        for did in range(num_devices):
+            ref_device_state: dict[str, torch.Tensor] = {}
+            for ref_key in ref_aliases:
+                if ref_key not in local_state:
+                    continue
+                tensor = local_state[ref_key]
+                if tensor.dim() == 0:
+                    ref_device_state[ref_key] = tensor
+                elif "mlp.experts.gate_up_proj" in ref_key:
+                    # TP-shard stacked gate/up along the intermediate dimension.
+                    local_inter_dim = (tensor.size(1) // 2) // num_devices
+                    start = did * local_inter_dim
+                    end = start + local_inter_dim
+                    ref_device_state[ref_key] = torch.cat(
+                        [tensor[:, start : start + local_inter_dim, :],
+                         tensor[:, end : end + local_inter_dim, :]],
+                        dim=1,
+                    )
+                elif "mlp.experts.down_proj" in ref_key:
+                    # TP-shard down projection along the intermediate dim.
+                    local_inter_dim = tensor.size(2) // num_devices
+                    start = did * local_inter_dim
+                    end = start + local_inter_dim
+                    ref_device_state[ref_key] = tensor[:, :, start:end]
+                elif tensor.dim() >= 3 and tensor.size(1) == num_devices:
+                    # TP-sharded expert-stacked weights along intermediate dim.
+                    ref_device_state[ref_key] = tensor[:, did]
+                elif tensor.size(0) == num_devices and ref_key.endswith(".weight"):
+                    # Replicated small weights stacked along dim 0 by some
+                    # sharding paths.  Keep this guard in case HF keys are
+                    # stacked by ``device_sharding`` for multi-device layouts.
+                    ref_device_state[ref_key] = tensor[did]
+                elif "mlp.shared_expert.gate_proj.weight" == ref_key or \
+                     "mlp.shared_expert.up_proj.weight" == ref_key:
+                    # Shared expert gate/up are also TP-sharded along inter_dim.
+                    local_inter_dim = tensor.size(0) // num_devices
+                    start = did * local_inter_dim
+                    end = start + local_inter_dim
+                    ref_device_state[ref_key] = tensor[start:end, :]
+                elif "mlp.shared_expert.down_proj.weight" == ref_key:
+                    # Shared expert down is TP-sharded along inter_dim.
+                    local_inter_dim = tensor.size(1) // num_devices
+                    start = did * local_inter_dim
+                    end = start + local_inter_dim
+                    ref_device_state[ref_key] = tensor[:, start:end]
+                else:
+                    ref_device_state[ref_key] = tensor
+            ref_layer_states[str(did)] = ref_device_state
+        per_device_ref_layer_states.append(ref_layer_states)
 
-    return embeddings, head_state_per_device, per_device_layer_states
+    return embeddings, head_state_per_device, per_device_layer_states, per_device_ref_layer_states
 
 
 def load_hf_source_weights(
@@ -264,6 +329,7 @@ def load_hf_source_weights(
     precomputed: tuple[
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
+        list[dict[str, dict[str, torch.Tensor]]],
         list[dict[str, dict[str, torch.Tensor]]],
     ]
     | None = None,
@@ -282,15 +348,20 @@ def load_hf_source_weights(
       * ``layer_{idx}_{alias}_dev_{device_id}`` for every layer tensor
       * ``layer_{n_layers}_model.norm.weight_dev_{device_id}``
       * ``layer_{n_layers}_lm_head.weight_dev_{device_id}``
+
+    Additionally, for each layer the raw reference tensors (HF keys) for this
+    device are stored under ``ref_layer_{idx}_{hf_key}_dev_{device_id}`` so that
+    ``init_reference_weights`` can be called once without triggering lazy random
+    initialization on every forward step.
     """
     dev = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
 
     if precomputed is None:
-        embeddings, head_state_per_device, per_device_layer_states = (
+        embeddings, head_state_per_device, per_device_layer_states, per_device_ref_layer_states = (
             _precompute_all_device_states(model_path, model_args, num_devices, stack)
         )
     else:
-        embeddings, head_state_per_device, per_device_layer_states = precomputed
+        embeddings, head_state_per_device, per_device_layer_states, per_device_ref_layer_states = precomputed
 
     result: dict[str, torch.Tensor] = {}
 
@@ -315,6 +386,13 @@ def load_hf_source_weights(
         device_state = layer_states.get(str(device_id), {})
         for alias, tensor in device_state.items():
             result[alias] = tensor.to(dev)
+
+    # Move per-device reference (raw HF-key) tensors to the target device.
+    # Keys are stored as ``ref_layer_{idx}_{hf_key}_dev_{device_id}``.
+    for layer_idx, ref_layer_states in enumerate(per_device_ref_layer_states):
+        device_state = ref_layer_states.get(str(device_id), {})
+        for ref_key, tensor in device_state.items():
+            result[f"ref_layer_{layer_idx}_{ref_key}_dev_{device_id}"] = tensor.to(dev)
 
     # Move head tensors to target device.
     for alias, tensor in head_state_per_device[str(device_id)].items():

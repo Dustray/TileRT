@@ -712,6 +712,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         """
         ref_alias = self.ref_weights_alias
         key_prefix = ref_alias.key_prefix
+        
+        # Log input weights
+        logger.info(f"[device_sharding] key_prefix: {key_prefix}, input weights keys: {list(weights_map.keys())}")
 
         bias_key = f"{key_prefix}.gate.e_score_correction_bias"
         bias = weights_map.get(
@@ -766,6 +769,15 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         shared_expert_gate = shared_expert_gate[None, :, :].repeat(self.num_devices, 1, 1)
 
         tilert_alias = self.tilert_weights_alias
+        
+        # Log sharding details for each key
+        logger.info(f"[device_sharding] key: {tilert_alias.exp_bias}, shape: {bias.shape}, dtype: {bias.dtype}")
+        logger.info(f"[device_sharding] key: {tilert_alias.exp_gate_weights}, shape: {gate_weights.shape}, dtype: {gate_weights.dtype}")
+        logger.info(f"[device_sharding] key: {tilert_alias.exp_gate_scales}, shape: {gate_scales.shape}, dtype: {gate_scales.dtype}")
+        logger.info(f"[device_sharding] key: {tilert_alias.exp_up_weights}, shape: {up_weights.shape}, dtype: {up_weights.dtype}")
+        logger.info(f"[device_sharding] key: {tilert_alias.exp_up_scales}, shape: {up_scales.shape}, dtype: {up_scales.dtype}")
+        logger.info(f"[device_sharding] key: shared_expert_gate, shape: {shared_expert_gate.shape}, dtype: {shared_expert_gate.dtype}")
+        
         return {
             tilert_alias.exp_bias: bias,
             tilert_alias.exp_gate_weights: gate_weights,
@@ -834,6 +846,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             if shared_expert_gate.dim() == 1:
                 shared_expert_gate = shared_expert_gate.unsqueeze(0)
             self.ref_shared_expert_gate = shared_expert_gate.to(torch.bfloat16).to(f"cuda:{did}")
+
+        self.is_ref_weights_init = True
 
     def get_tilert_weights_alias(self) -> list[str]:
         """Return the alias list keyed into ``state_dict`` for this op."""

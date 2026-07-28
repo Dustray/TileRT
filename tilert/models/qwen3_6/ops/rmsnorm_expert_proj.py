@@ -104,18 +104,36 @@ class RMSNormExpertProj(TileRTModule):
     def device_sharding(
         self, rms_norm_weight: torch.Tensor, proj_weight: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return rms_norm_weight.float().contiguous(), proj_weight.contiguous()
+        logger.info(f"[device_sharding] RMSNormExpertProj, num_devices: {self.num_devices}")
+        
+        original_rms_shape = rms_norm_weight.shape
+        original_proj_shape = proj_weight.shape
+        
+        result_rms = rms_norm_weight.float().contiguous()
+        result_proj = proj_weight.contiguous()
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: post_attention_layernorm.weight, original shape: {original_rms_shape}, sharded shape: {result_rms.shape}, dtype: {result_rms.dtype}")
+        logger.info(f"[device_sharding] key: mlp.gate.weight, original shape: {original_proj_shape}, sharded shape: {result_proj.shape}, dtype: {result_proj.dtype}")
+        
+        return result_rms, result_proj
 
     def init_reference_weights(
         self, state_dict: dict[str, torch.Tensor], device_id: int | None = None
     ) -> None:
         del device_id
         logger.debug(f"{self.op_name}: init_reference_weights")
+        rms_w = state_dict[self.ref_weights_alias.post_attention_layernorm_weight]
+        gate_w = state_dict[self.ref_weights_alias.mlp_gate_weight]
+        # Move to compute device if still on CPU; RMSNorm expects a float32
+        # weight tensor on the target device.
+        if rms_w.device.type != "meta":
+            rms_w = rms_w.to(f"cuda:{self.device_id}")
+        if gate_w.device.type != "meta":
+            gate_w = gate_w.to(f"cuda:{self.device_id}")
         self.ref_rmsnorm = RMSNorm(self.dim, self.eps)
-        self.ref_rmsnorm.weight.data = state_dict[
-            self.ref_weights_alias.post_attention_layernorm_weight
-        ]
-        self.ref_proj_weight = state_dict[self.ref_weights_alias.mlp_gate_weight]
+        self.ref_rmsnorm.weight.data = rms_w
+        self.ref_proj_weight = gate_w
         self.is_ref_weights_init = True
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:

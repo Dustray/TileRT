@@ -177,6 +177,7 @@ class Rotate(TileRTModule):
         return []
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        logger.info(f"[device_sharding] Rotate, no weights to shard")
         del weights_map
         return {}
 

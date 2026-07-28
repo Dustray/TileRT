@@ -606,8 +606,12 @@ class QwenShowHandsLayer:
                 )
                 if model_path is not None and _is_hf_checkpoint(model_path):
                     # Stack was already created above so device_sharding could
-                    # be called; just keep the reference.
-                    pass
+                    # be called; just keep the reference.、
+                    # 新加逻辑
+                    # Also initialize reference weights once so the golden path
+                    # does not lazily allocate random weights on every step.
+                    stack.init_tilert_weights(state_dicts)
+                    stack.init_reference_weights(state_dicts)
                 else:
                     stack = QwenTransformerStack(
                         self.model_args,

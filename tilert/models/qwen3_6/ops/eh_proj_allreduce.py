@@ -171,16 +171,24 @@ class EHProjAllReduce(TileRTModule):
         Returns:
             Tuple of weights.
         """
+        logger.info(f"[device_sharding] key_prefix: {key_prefix}, num_devices: {self.num_devices}")
+        
         eh_proj_key = "eh_proj.weight"
         if key_prefix is not None:
             eh_proj_key = f"{key_prefix}.eh_proj.weight"
 
         eh_proj_weight = weights_dict[eh_proj_key]
+        original_eh_proj_shape = eh_proj_weight.shape
+        
         in_dim = eh_proj_weight.shape[1]
         out_dim = eh_proj_weight.shape[0]
         in_dim_per_device = in_dim // self.num_devices
         eh_proj_weight = eh_proj_weight.reshape(out_dim, self.num_devices, in_dim_per_device)
         eh_proj_weight = eh_proj_weight.transpose(0, 1)
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {eh_proj_key}, original shape: {original_eh_proj_shape}, sharded shape: {eh_proj_weight.shape}, dtype: {eh_proj_weight.dtype}")
+        
         return (eh_proj_weight.contiguous(),)
 
     def init_reference_weights(

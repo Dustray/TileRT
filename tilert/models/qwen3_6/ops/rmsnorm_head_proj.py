@@ -172,16 +172,23 @@ class RMSNormHeadProj(TileRTModule):
         Returns:
             Tuple of weights.
         """
+        logger.info(f"[device_sharding] RMSNormHeadProj, num_devices: {self.num_devices}")
+        
         rmsnorm_gamma_key = "model.norm.weight"
         head_proj_key = "lm_head.weight"
         # Qwen3.6 checkpoint stores final norm under model.language_model.norm.weight.
         qwen36_norm_key = "model.language_model.norm.weight"
         if qwen36_norm_key in weights_dict:
             rmsnorm_gamma = weights_dict[qwen36_norm_key][None, ...]
+            original_rmsnorm_shape = weights_dict[qwen36_norm_key].shape
+            rmsnorm_gamma_key_used = qwen36_norm_key
         else:
             rmsnorm_gamma = weights_dict[rmsnorm_gamma_key][None, ...]
+            original_rmsnorm_shape = weights_dict[rmsnorm_gamma_key].shape
+            rmsnorm_gamma_key_used = rmsnorm_gamma_key
         rmsnorm_gamma = rmsnorm_gamma.repeat(self.num_devices, 1)
         head_proj = weights_dict[head_proj_key]
+        original_head_proj_shape = head_proj.shape
 
         # Detect already-sharded TileRT checkpoint: each device already owns a
         # vocab shard of shape (vocab_shard, dim).  Stack them; otherwise
@@ -194,6 +201,11 @@ class RMSNormHeadProj(TileRTModule):
         else:
             # EP8 / replicated full vocab layout.
             head_proj = head_proj[None, ...].repeat(self.num_devices, 1, 1)
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {rmsnorm_gamma_key_used}, original shape: {original_rmsnorm_shape}, sharded shape: {rmsnorm_gamma.shape}, dtype: {rmsnorm_gamma.dtype}")
+        logger.info(f"[device_sharding] key: {head_proj_key}, original shape: {original_head_proj_shape}, sharded shape: {head_proj.shape}, dtype: {head_proj.dtype}")
+        
         return rmsnorm_gamma.contiguous(), head_proj.contiguous()
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:

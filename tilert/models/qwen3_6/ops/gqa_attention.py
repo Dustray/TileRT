@@ -206,6 +206,8 @@ class GQAAttention(TileRTModule):
         ``init_reference_weights`` can simply index ``[device_id]``.
         """
         prefix = self.ref_weights_alias.key_prefix
+        logger.info(f"[device_sharding] key_prefix: {prefix}, num_devices: {self.num_devices}")
+        
         q_w = weights_map[f"{prefix}.q_proj.weight"]
         k_w = weights_map[f"{prefix}.k_proj.weight"]
         v_w = weights_map[f"{prefix}.v_proj.weight"]
@@ -215,7 +217,7 @@ class GQAAttention(TileRTModule):
 
         qkv_proj_weights = torch.cat([q_w, k_w, v_w], dim=0)
 
-        return {
+        result = {
             self.tilert_weights_alias.qkv_proj_weights: torch.stack(
                 [qkv_proj_weights for _ in range(self.num_devices)], dim=0
             ).contiguous(),
@@ -229,6 +231,14 @@ class GQAAttention(TileRTModule):
                 [k_norm_w for _ in range(self.num_devices)], dim=0
             ).contiguous(),
         }
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {prefix}.q_proj.weight, original shape: {q_w.shape}, sharded shape: {result[self.tilert_weights_alias.qkv_proj_weights].shape}, dtype: {result[self.tilert_weights_alias.qkv_proj_weights].dtype}")
+        logger.info(f"[device_sharding] key: {prefix}.o_proj.weight, original shape: {o_w.shape}, sharded shape: {result[self.tilert_weights_alias.o_proj_weights].shape}, dtype: {result[self.tilert_weights_alias.o_proj_weights].dtype}")
+        logger.info(f"[device_sharding] key: {prefix}.q_norm.weight, original shape: {q_norm_w.shape}, sharded shape: {result[self.tilert_weights_alias.q_norm_weights].shape}, dtype: {result[self.tilert_weights_alias.q_norm_weights].dtype}")
+        logger.info(f"[device_sharding] key: {prefix}.k_norm.weight, original shape: {k_norm_w.shape}, sharded shape: {result[self.tilert_weights_alias.k_norm_weights].shape}, dtype: {result[self.tilert_weights_alias.k_norm_weights].dtype}")
+        
+        return result
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
@@ -238,6 +248,7 @@ class GQAAttention(TileRTModule):
         self.o_proj_weights = sharded[self.tilert_weights_alias.o_proj_weights][did]
         self.q_norm_weights = sharded[self.tilert_weights_alias.q_norm_weights][did]
         self.k_norm_weights = sharded[self.tilert_weights_alias.k_norm_weights][did]
+        self.is_ref_weights_init = True
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")

@@ -448,9 +448,24 @@ class SerializableTileRTModule(TileRTModule):
             f"{type(self).__name__}.init_reference_weights: "
             f"{len(self.exec_seq)} sub-op(s), state_dict has {len(state_dict)} entries"
         )
-        for op in self.exec_seq:
+        for op, prefix, suffix in zip(
+            self.exec_seq, self.prefix_seq, self.suffix_seq
+        ):
             logger.debug(f"Initializing reference weights for {op.op_name}")
-            op.init_reference_weights(state_dict)
+            op_state_dict: dict[str, torch.Tensor] = {}
+            for ref_key in op.get_ref_weights_alias():
+                original_key = f"{prefix}{ref_key}{suffix}"
+                if original_key in state_dict:
+                    op_state_dict[ref_key] = state_dict[original_key]
+                    continue
+                # Fallback: ``load_hf_source_weights`` stores reference tensors
+                # under a dedicated ``ref_layer_{idx}_`` prefix to avoid
+                # colliding with tilert keys that use the same alias names.
+                ref_prefixed_key = f"{prefix}ref_{ref_key}{suffix}"
+                if ref_prefixed_key in state_dict:
+                    op_state_dict[ref_key] = state_dict[ref_prefixed_key]
+            if op_state_dict:
+                op.init_reference_weights(op_state_dict)
         logger.info(f"{type(self).__name__}.init_reference_weights completed")
 
     def init_random_weights(self) -> None:

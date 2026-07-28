@@ -553,6 +553,9 @@ class ExpertDownAllReduce(TileRTModule):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
+        
+        logger.info(f"[device_sharding] key_prefix: {key_prefix}, num_devices: {self.num_devices}")
+        
         assert self.n_shared_experts == 1, "Only one shared expert is supported"
         down_weights_list = []
         down_scales_list = []
@@ -568,11 +571,20 @@ class ExpertDownAllReduce(TileRTModule):
         )
         down_weights_list.append(down_weights)
         down_scales_list.append(down_scales)
+        
+        original_down_weights_shape = down_weights_list[0].shape
+        original_down_scales_shape = down_scales_list[0].shape
+        
         # Concatenate along the expert dimension (first dim).  Under TP8 both
         # shared and routed outputs have rank 4: (n_experts, num_devices,
         # dim, inter_dim // num_devices).
         down_weights = torch.cat(down_weights_list, dim=0)
         down_scales = torch.cat(down_scales_list, dim=0)
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {key_prefix}.shared_expert.down_proj + {key_prefix}.experts.down_proj, original shapes: {original_down_weights_shape}, {down_weights_list[1].shape}, sharded down_weights shape: {down_weights.shape}, dtype: {down_weights.dtype}")
+        logger.info(f"[device_sharding] key: down_scales, original shapes: {original_down_scales_shape}, {down_scales_list[1].shape}, sharded down_scales shape: {down_scales.shape}, dtype: {down_scales.dtype}")
+        
         return down_weights.contiguous(), down_scales.contiguous()
 
     def _dequant_expert_stack(
@@ -616,6 +628,8 @@ class ExpertDownAllReduce(TileRTModule):
             if shared_expert_gate.dim() == 1:
                 shared_expert_gate = shared_expert_gate.unsqueeze(0)
             self.ref_shared_expert_gate = shared_expert_gate.to(torch.bfloat16)
+
+        self.is_ref_weights_init = True
 
     def get_tilert_weights_alias(self) -> list[str]:
         """Return the alias list keyed into ``state_dict`` for this op."""

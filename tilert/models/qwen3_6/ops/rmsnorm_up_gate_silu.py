@@ -174,6 +174,8 @@ class RMSNormUpGateSiLU(TileRTModule):
         Returns:
             Tuple of weights.
         """
+        logger.info(f"[device_sharding] key_prefix: {key_prefix}")
+        
         rmsnorm_gamma_key = f"{key_prefix}.post_attention_layernorm.weight"
         if ".mlp" in key_prefix:
             key_prefix_without_mlp = key_prefix.replace(".mlp", "")
@@ -181,6 +183,7 @@ class RMSNormUpGateSiLU(TileRTModule):
         elif key_prefix == "mlp":
             rmsnorm_gamma_key = "post_attention_layernorm.weight"
         rmsnorm_gamma = weights_dict[rmsnorm_gamma_key]
+        original_rmsnorm_shape = rmsnorm_gamma.shape
         rmsnorm_gamma = rmsnorm_gamma[None, :].repeat(self.num_devices, 1)
 
         gate_weights, gate_scales, up_weights, up_scales = (
@@ -191,6 +194,9 @@ class RMSNormUpGateSiLU(TileRTModule):
                 self.inter_dim,
             )
         )
+        original_gate_shape = gate_weights.shape
+        original_up_shape = up_weights.shape
+        
         gate_weights = gate_weights.reshape(self.n_experts, self.num_devices, -1, self.dim)
         gate_weights = gate_weights.transpose(0, 1)
         gate_scales = gate_scales.reshape(
@@ -203,6 +209,14 @@ class RMSNormUpGateSiLU(TileRTModule):
             self.n_experts, self.num_devices, -1, self.dim // self.block_size
         )
         up_scales = up_scales.transpose(0, 1)
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {rmsnorm_gamma_key}, original shape: {original_rmsnorm_shape}, sharded shape: {rmsnorm_gamma.shape}, dtype: {rmsnorm_gamma.dtype}")
+        logger.info(f"[device_sharding] key: gate_weights, original shape: {original_gate_shape}, sharded shape: {gate_weights.shape}, dtype: {gate_weights.dtype}")
+        logger.info(f"[device_sharding] key: gate_scales, original shape: {gate_scales.shape}, sharded shape: {gate_scales.shape}, dtype: {gate_scales.dtype}")
+        logger.info(f"[device_sharding] key: up_weights, original shape: {original_up_shape}, sharded shape: {up_weights.shape}, dtype: {up_weights.dtype}")
+        logger.info(f"[device_sharding] key: up_scales, original shape: {up_scales.shape}, sharded shape: {up_scales.shape}, dtype: {up_scales.dtype}")
+        
         return (
             rmsnorm_gamma.contiguous(),
             gate_weights.contiguous(),

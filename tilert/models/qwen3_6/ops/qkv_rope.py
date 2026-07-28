@@ -116,6 +116,7 @@ class QKVRoPE(TileRTModule):
         return []
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        logger.info(f"[device_sharding] QKVRoPE, no weights to shard")
         del weights_map
         return {}
 

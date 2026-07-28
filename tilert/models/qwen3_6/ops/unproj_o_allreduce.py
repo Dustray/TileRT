@@ -339,6 +339,8 @@ class UnProjOAllReduce(TileRTModule):
         Returns:
             Map from tilert weight alias to (num_devices, ...) tensors.
         """
+        logger.info(f"[device_sharding] UnprojOAllreduce, num_devices: {self.num_devices}")
+        
         unproj_o_weight = weights_map[self.ref_weights_alias.o_proj_weight]
         # Real Qwen3.6 checkpoints do not include FP8 scales for o_proj.
         # Synthesize an all-ones scale so the existing dequant/converter paths
@@ -356,7 +358,7 @@ class UnProjOAllReduce(TileRTModule):
             )
 
         # EP8: replicate the full o_proj weight/scale on every device.
-        return {
+        result = {
             self.tilert_weights_alias.unproj_weights: torch.stack(
                 [unproj_o_weight for _ in range(self.num_devices)], dim=0
             ).contiguous(),
@@ -364,6 +366,12 @@ class UnProjOAllReduce(TileRTModule):
                 [unproj_o_scale for _ in range(self.num_devices)], dim=0
             ).contiguous(),
         }
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {self.ref_weights_alias.o_proj_weight}, original shape: {unproj_o_weight.shape}, sharded shape: {result[self.tilert_weights_alias.unproj_weights].shape}, dtype: {result[self.tilert_weights_alias.unproj_weights].dtype}")
+        logger.info(f"[device_sharding] key: o_proj_scale_inv, original shape: {unproj_o_scale.shape}, sharded shape: {result[self.tilert_weights_alias.unproj_scales].shape}, dtype: {result[self.tilert_weights_alias.unproj_scales].dtype}")
+        
+        return result
 
     def init_reference_weights(
         self,

@@ -257,13 +257,22 @@ class DeltaNetOp(TileRTModule):
         """
         prefix = self.ref_weights_alias.key_prefix
         aliases = self.ref_weights_alias.ref_tensor_alias
+        
+        logger.info(f"[device_sharding] DeltaNet, key_prefix: {prefix}, num_devices: {self.num_devices}")
 
-        return {
+        result = {
             alias: torch.stack(
                 [weights_map[ref_alias] for _ in range(self.num_devices)], dim=0
             ).contiguous()
             for alias, ref_alias in zip(self.tilert_weights_alias(), aliases)
         }
+        
+        # Log sharding details for each key
+        for alias, ref_alias in zip(self.tilert_weights_alias(), aliases):
+            original_shape = weights_map[ref_alias].shape
+            logger.info(f"[device_sharding] key: {ref_alias}, original shape: {original_shape}, sharded shape: {result[alias].shape}, dtype: {result[alias].dtype}")
+        
+        return result
 
     def _get_local_out_slices(self) -> list[list[slice]]:
         """Unused under EP8; kept for backward compatibility only."""
@@ -282,6 +291,7 @@ class DeltaNetOp(TileRTModule):
         self.dt_bias = sharded[self.tilert_weights_alias.dt_bias][did]
         self.norm_weights = sharded[self.tilert_weights_alias.norm_weights][did]
         self.out_proj_weights = sharded[self.tilert_weights_alias.out_proj_weights][did]
+        self.is_ref_weights_init = True
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")

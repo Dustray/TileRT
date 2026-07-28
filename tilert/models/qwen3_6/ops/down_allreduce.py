@@ -176,10 +176,16 @@ class DownAllReduce(TileRTModule):
         Returns:
             Tuple of weights.
         """
+        logger.info(f"[device_sharding] key_prefix: {key_prefix}, num_devices: {self.num_devices}")
+        
         down_proj_weight_key = f"{key_prefix}.down_proj.weight"
         down_proj_scale_key = f"{key_prefix}.down_proj.weight_scale_inv"
         down_proj_weight = weights_dict[down_proj_weight_key]
         down_proj_scale = weights_dict[down_proj_scale_key]
+        
+        original_down_weight_shape = down_proj_weight.shape
+        original_down_scale_shape = down_proj_scale.shape
+        
         down_proj_weight = down_proj_weight.reshape(
             self.dim, self.n_experts, self.num_devices, self.moe_inter_dim_per_device
         )
@@ -209,6 +215,11 @@ class DownAllReduce(TileRTModule):
         ]
         down_weights = torch.stack(down_proj_weight_splited, dim=0)
         down_scales = torch.stack(down_proj_scale_splited, dim=0)
+        
+        # Log sharding details
+        logger.info(f"[device_sharding] key: {down_proj_weight_key}, original shape: {original_down_weight_shape}, sharded shape: {down_weights.shape}, dtype: {down_weights.dtype}")
+        logger.info(f"[device_sharding] key: {down_proj_scale_key}, original shape: {original_down_scale_shape}, sharded shape: {down_scales.shape}, dtype: {down_scales.dtype}")
+        
         return down_weights.contiguous(), down_scales.contiguous()
 
     def init_reference_weights(
