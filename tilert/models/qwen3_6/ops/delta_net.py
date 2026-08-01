@@ -357,7 +357,7 @@ class DeltaNetOp(TileRTModule):
         ) / (args.delta_conv_kernel_dim ** 0.5)
         A_log = torch.randn(args.delta_a_dim, dtype=torch.float32, device=device)
         dt_bias = torch.randn(args.delta_b_dim, dtype=torch.float32, device=device)
-        norm = torch.randn(args.delta_value_head_dim, dtype=torch.float32, device=device)
+        norm = torch.ones(args.delta_value_head_dim, dtype=torch.float32, device=device)
         out_proj = torch.randn(
             args.dim, args.delta_v_dim, dtype=torch.bfloat16, device=device
         ) / (args.delta_v_dim ** 0.5)
@@ -642,6 +642,8 @@ class DeltaNetOp(TileRTModule):
         ``(bsz, conv_dim, kernel_size)`` and ``recurrent_state`` has shape
         ``(bsz, num_heads, k_head_dim, v_head_dim)``.
         """
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, has_state={state is not None}")
+        
         del start_pos
         assert self.in_proj_qkv_weights is not None
         assert self.in_proj_z_weights is not None
@@ -657,23 +659,29 @@ class DeltaNetOp(TileRTModule):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         bsz, seq_len, dim = x.shape
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Input: bsz={bsz}, seq_len={seq_len}, dim={dim}")
 
         # Unpack persistent state.
         conv_state, recurrent_state = state if state is not None else (None, None)
 
         # Projections.
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step1: QKV/Z/B/A projections")
         mixed_qkv = x @ self.in_proj_qkv_weights.T
         z = x @ self.in_proj_z_weights.T
         b = x @ self.in_proj_b_weights.T
         a = x @ self.in_proj_a_weights.T
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   mixed_qkv.shape={mixed_qkv.shape}, z.shape={z.shape}")
 
         # Causal depthwise conv1d (groups = conv_dim) with cross-step state.
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step2: Causal conv1d")
         mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, conv_dim, seq_len)
         conv_weight = self.conv1d_weights.squeeze(1)  # (conv_dim, kernel_size)
         mixed_qkv, conv_state = self._causal_conv1d_update(mixed_qkv, conv_state, conv_weight)
         mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, seq_len, conv_dim)
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   After conv1d: mixed_qkv.shape={mixed_qkv.shape}")
 
         # Split into q/k/v.
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step3: Split Q/K/V")
         q, k, v = torch.split(
             mixed_qkv,
             [
@@ -683,22 +691,32 @@ class DeltaNetOp(TileRTModule):
             ],
             dim=-1,
         )
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
 
         # Decay gate g and beta.
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step4: Compute beta and g (gating)")
         beta = torch.sigmoid(b)
         # A is stored as log(A); official uses -exp(A_log) * softplus(a + dt_bias).
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   beta.shape={beta.shape}, g.shape={g.shape}")
 
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step5: Gated delta attention")
         attn_out, recurrent_state = self._gated_delta_attention(q, k, v, beta, g, recurrent_state)
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   attn_out.shape={attn_out.shape}")
 
         # Gated RMSNorm.
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step6: Gated RMSNorm")
         attn_out = attn_out.reshape(-1, self.value_head_dim)
         z_gate = z.reshape(-1, self.value_head_dim)
         attn_out = self._rmsnorm_gated(attn_out, z_gate, self.norm_weights)
         attn_out = attn_out.reshape(bsz, seq_len, -1)
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   After RMSNorm: attn_out.shape={attn_out.shape}")
 
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step7: Output projection")
         out = attn_out @ self.out_proj_weights.T
         out = out.view(original_shape)
+        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] EXIT: out.shape={out.shape}")
+        
         return out, (conv_state, recurrent_state)
 
     def tilert_forward(
@@ -708,10 +726,14 @@ class DeltaNetOp(TileRTModule):
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Optimized forward placeholder."""
+        logger.info(f"[DeltaNetOp.tilert_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, has_state={state is not None}")
+        
         assert self.is_init
         assert self.hidden_out is not None
         assert self.state_out is not None
         assert self.profile_logs is not None
+        
+        logger.info(f"[DeltaNetOp.tilert_forward_{self.device_id}] Calling CUDA kernel delta_net")
         delta_net(
             x,
             state if state is not None else torch.zeros_like(self.state_out),
@@ -721,6 +743,8 @@ class DeltaNetOp(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[DeltaNetOp.tilert_forward_{self.device_id}] CUDA kernel returned, hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out, self.state_out
 
     def forward(

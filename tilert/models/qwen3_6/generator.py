@@ -257,36 +257,52 @@ class Qwen36Generator:
             f"first_20_tokens={prompt_tokens[:20]}"
         )
 
+        logger.info(f"[GENERATOR] Allocating tokens tensor: batch_size={self.batch_size}, total_len={total_len}, device={self.default_device}")
         tokens = torch.full(
             (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
         )
+        logger.info(f"[GENERATOR] Filling prompt tokens into tokens tensor, prompt_len={prompt_len}")
         tokens[0, :prompt_len] = torch.tensor(
             prompt_tokens, dtype=torch.long, device=self.default_device
         )
         prompt_mask = tokens != -1
 
         prev_pos = 0
+        logger.info(f"[GENERATOR] Initializing finished flag: device={self.default_device}")
         finished = torch.tensor(
             [False] * self.batch_size, dtype=torch.bool, device=self.default_device
         )
 
         time_list = []
+        logger.info(f"[GENERATOR] Starting decode loop: range(1, {total_len})")
         for cur_pos_val in range(1, total_len):
+            logger.info(f"[GENERATOR] === Step {cur_pos_val}/{total_len-1} ===")
+            logger.info(f"[GENERATOR] prev_pos={prev_pos}, calling decode_layer.forward(tokens[0, {prev_pos}]={tokens[0, prev_pos].item()}, with_mtp={with_mtp})")
+            
             start_time = time.time()
             multi_devices_results = self.decode_layer.forward(
                 tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos
             )
             end_time = time.time()
-            time_list.append(end_time - start_time)
-
+            elapsed = end_time - start_time
+            time_list.append(elapsed)
+            
+            logger.info(f"[GENERATOR] forward() completed in {elapsed*1000:.4f}ms, got {len(multi_devices_results)} device results")
+            
             intermediates, *_ = multi_devices_results[0]
             next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
+            logger.info(f"[GENERATOR] Got next_token={next_token.item()} from intermediates[Idx.TOKEN_OUT]")
 
+            logger.info(f"[GENERATOR] Checking prompt_mask at cur_pos_val={cur_pos_val}: prompt_mask[0, {cur_pos_val}]={prompt_mask[0, cur_pos_val].item()}")
             next_token = torch.where(
                 prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token
             )
+            logger.info(f"[GENERATOR] After prompt_mask check, next_token={next_token.item()}")
             tokens[0, cur_pos_val] = next_token
-            finished |= torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
+            is_eos = (next_token == self.eos_id).item()
+            is_generating = (~prompt_mask[0, cur_pos_val]).item()
+            finished = finished | torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
+            logger.info(f"[GENERATOR] Updated tokens[{cur_pos_val}]={next_token.item()}, is_eos={is_eos}, is_generating={is_generating}")
             prev_pos = cur_pos_val
             if cur_pos_val >= prompt_len:
                 decoded_tokens = self.tokenizer.decode(
@@ -299,7 +315,12 @@ class Qwen36Generator:
                     print(f"(prompt pos {cur_pos_val})", end="", flush=True)
 
             if finished.all():
+                logger.info(f"[GENERATOR] All sequences finished at step {cur_pos_val}, breaking loop")
                 break
+            
+            # Log progress every 10 tokens
+            if cur_pos_val % 10 == 0:
+                logger.info(f"[GENERATOR] Progress: {cur_pos_val}/{total_len-1} steps, finished={finished.any().item()}")
 
         if print_log:
             print("\n")

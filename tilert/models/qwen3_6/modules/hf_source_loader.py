@@ -277,12 +277,16 @@ def _precompute_all_device_states(
                     ref_device_state[ref_key] = tensor
                 elif "mlp.experts.gate_up_proj" in ref_key:
                     # TP-shard stacked gate/up along the intermediate dimension.
-                    local_inter_dim = (tensor.size(1) // 2) // num_devices
+                    # The tensor is (n_routed_experts, 2*inter_dim, dim); split
+                    # into gate (first inter_dim rows) and up (remaining rows),
+                    # then take the same TP rank chunk from each half.
+                    full_inter_dim = tensor.size(1) // 2
+                    local_inter_dim = full_inter_dim // num_devices
                     start = did * local_inter_dim
                     end = start + local_inter_dim
                     ref_device_state[ref_key] = torch.cat(
-                        [tensor[:, start : start + local_inter_dim, :],
-                         tensor[:, end : end + local_inter_dim, :]],
+                        [tensor[:, start:end, :],
+                         tensor[:, full_inter_dim + start : full_inter_dim + end, :]],
                         dim=1,
                     )
                 elif "mlp.experts.down_proj" in ref_key:

@@ -3,7 +3,8 @@
 请及时回顾此文档
 
 > 从 `docs/qwen36_integration_plan.md` 精简而来。根据本地 vLLM 实测数据，纯 EP 综合性能劣于纯 TP（首次执行 TTFT 差距约 10 倍），因此**当前主路线切换为 TP8（Tensor Parallelism 8）**。本计划保留后续可能复用的 EP 混合路线要点，但优先按 TP8 推进。
-> 最近更新：2026-07-24。
+> 目标：让scripts/verify_qwen36_generator_official_prompt.py输出正确token
+> 最近更新：2026-07-30。
 
 ## 0. 环境与目标
 
@@ -13,6 +14,11 @@
   - 原始 checkpoint key 前缀：`model.language_model.*`
   - 26 个 safetensors shard，总大小约 71.9 GB（文本部分）。
 - **测试环境**：只能在`tilert-qwen3.6` docker容器内部，不要用宿主机虚拟环境：`docker exec -it tilert-qwen3.6 bash`
+- **最新状态（2026-07-30）**：
+  - `QwenShowHandsLayer.forward` 的 per-token ~1.3 GB CUDA 显存泄漏已修复。
+  - 根因：`_golden_forward_all_devices` 使用 `threading.Thread` 派发 per-device forward，PyTorch 的 `torch.no_grad()` / `torch.inference_mode()` 上下文不会跨线程继承，worker 线程默认 `grad_enabled=True`，导致 golden 路径保留 autograd 计算图。
+  - 修复：在 `_runner` 内部用 `with torch.inference_mode():` 包裹 `self._golden_forward_device(...)` 调用。
+  - 验证：连续 20 步 forward，第一步后显存稳定在 ~24.5 GB，后续每步增量 0 MB。
 
 ```bash
 export LD_LIBRARY_PATH=/opt/dtk-26.04/lib:/opt/dtk-26.04/hip/lib:/opt/dtk-26.04/.hyhal/rocm_smi/lib
@@ -168,6 +174,7 @@ TP8 目标：
 
 - `tilert/models/qwen3_6/modules/hf_source_loader.py`：预切分逻辑从 EP8 4D stacked 改为 TP8 3D split。
 - `tilert/models/qwen3_6/modules/end2end.py`：多设备加载、temp_vars、golden forward 路径需要适配 TP8 的 allreduce 输出。
+  - **已修复（2026-07-30）**：golden forward 路径在多线程 worker 中未禁用 autograd，导致每 token 泄漏 ~1.3 GB。修复方式见第 6.6 节。
 
 ## 6. 已完成的修复（仍可复用）
 
@@ -203,6 +210,50 @@ TP8 目标：
 - `_ensure_per_device` 切片逻辑（`expert_down_allreduce.py`、`expert_sel_up_gate_silu.py`）用于处理 EP8 的 4D stacked 张量；切到 TP8 后 MoE 权重形状会恢复为 3D per-device，该 workaround 可保留但不再关键。
 - EP8 相关的 `local_indices = indices % n_local_routed` 在 TP8 中不再需要（所有 device 看到同样的完整 expert 集合的 1/8 slice）。
 
+### 6.6 显存泄漏修复（2026-07-30）
+
+**问题现象**
+
+- `QwenShowHandsLayer.forward` 每生成一个 token，CUDA 显存增长约 1.3 GB。
+- 单独测试 `QwenTransformerStack.golden_forward` 并包裹 `torch.inference_mode()` 时无泄漏；但端到端路径始终泄漏。
+
+**根因分析**
+
+- `end2end.py` 的 `forward` 已整体包裹 `with torch.inference_mode():`，无效。
+- 全局 `torch.no_grad()` 也无效。
+- 在 `_golden_forward_device` 入口插桩发现：所有 8 个 worker 线程内 `torch.is_grad_enabled() == True`。
+- 结论：`threading.Thread` 启动的 worker 不会继承调用者的 autograd 上下文，线程默认启用梯度，golden 路径保留计算图。
+
+**修复内容**
+
+- 文件：`tilert/models/qwen3_6/modules/end2end.py`
+- 位置：`_golden_forward_all_devices` 内部的 `_runner` 函数。
+- 改动：将 `self._golden_forward_device(device_id, token_id, cur_pos)` 调用包裹在 `with torch.inference_mode():` 中：
+
+```python
+with torch.inference_mode():
+    results[device_id] = self._golden_forward_device(device_id, token_id, cur_pos)
+```
+
+**验证结果**
+
+- 20 步连续 decode，第 0 步后显存稳定在 `24508.97 MB`：
+
+```text
+step 0  delta -6548.80 MB  total 24508.97 MB
+step 1  delta 0.00 MB      total 24508.97 MB
+step 2  delta 0.00 MB      total 24508.97 MB
+...
+step 19 delta 0.00 MB      total 24508.97 MB
+```
+
+- 泄漏消除，后续每步增量均为 0 MB。
+
+**经验**
+
+- PyTorch 的 autograd 上下文不会跨线程继承；任何使用 `threading.Thread` 的多设备 forward 都应在 worker 内部显式启用 `torch.inference_mode()`（或 `torch.no_grad()`）。
+- 泄漏张量形状约为 `[2048, 8192]` 和 `[2048, 9216]`，与保留的 matmul 中间激活一致。
+
 ## 7. 已知问题与风险
 
 | 问题 | 影响 | 应对 |
@@ -221,8 +272,9 @@ TP8 目标：
 | 2 | `scripts/verify_qwen36_random_init_forward.py` | TP8 40 层 forward finite、形状正确、next token 合法 | ⏳ 待实现 |
 | 3 | `scripts/verify_qwen36_real_weights_forward.py` | 真实 HF 权重加载成功、8 卡内存均衡、连续 4 个 token 有效 | ⏳ 待执行 |
 | 4 | `scripts/verify_qwen36_generator_official_prompt.py` | 官方 prompt 生成非空、可读文本 | ⏳ 待执行 |
-| 5 | 与 HF `AutoModelForCausalLM` 对比 logits | 相同 prompt top-1 token 一致或误差 < 1e-2 | ⏳ 待执行 |
-| 6 | CUDA kernel | `libtilert_qwen36.so`：gqa_attention_op、delta_net_op、qwen36_show_hands* | ⏳ 待实现 |
+| 5 | 端到端显存泄漏 | 连续 20 token 显存无增长（每步 delta ≈ 0 MB） | ✅ 已修复 |
+| 6 | 与 HF `AutoModelForCausalLM` 对比 logits | 相同 prompt top-1 token 一致或误差 < 1e-2 | ⏳ 待执行 |
+| 7 | CUDA kernel | `libtilert_qwen36.so`：gqa_attention_op、delta_net_op、qwen36_show_hands* | ⏳ 待实现 |
 
 ## 9. 后续工作优先级（TP8，按推理流程自底向上）
 
@@ -236,9 +288,10 @@ TP8 目标：
 6. **P0 - LM Head**：完整复制，确认 logits 输出聚合方式。
 7. **P0**：适配 `hf_source_loader.py` 和 `end2end.py`，支持从原始 HF checkpoint 直接产出 TP8 权重。
 8. **P0**：更新并运行 `scripts/verify_qwen36_random_init_forward.py` 与 `verify_qwen36_real_weights_forward.py`。
-9. **P1**：与 HF `AutoModelForCausalLM` 对比 logits。
-10. **P2**：构建 `libtilert_qwen36.so` CUDA kernels。
-11. **P3**：长序列 prefill、KV cache 复用、top-p/top-k 采样完整实现。
+9. **P0**：重新运行多 token 连续 forward / generator 官方 prompt 验证，确认泄漏修复后长序列不再 OOM。
+10. **P1**：与 HF `AutoModelForCausalLM` 对比 logits。
+11. **P2**：构建 `libtilert_qwen36.so` CUDA kernels。
+12. **P3**：长序列 prefill、KV cache 复用、top-p/top-k 采样完整实现。
 
 ## 10. 附：vLLM 基准测试洞察（切换 TP8 的依据）
 
@@ -271,11 +324,5 @@ TileRT 当前 EP8 方案等价于 **TP1-EP8**（attention/DeltaNet/O-proj 全部
 2. 首次启动没有 EP 的 communicator/weight dispatch 预热惩罚。
 3. 与现有 `UnProjOAllReduce`、`PaddedAllReduceAdd` 等基础设施直接复用。
 
-### 如果未来重新评估 EP
 
-EP 并非完全不可用，但需要满足：
-- all-to-all 有充分 warmup；
-- buffer 按 `max_batch * topk * hidden` 静态预分配；
-- 上线指标拆成 `first TTFT`、`warmup TTFT`、`stable TTFT` 分别报告；
-- 优先尝试 **TP+EP 混合**（如 TP2-EP4、TP4-EP2），不要锁死纯 EP。
 

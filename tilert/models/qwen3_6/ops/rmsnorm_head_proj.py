@@ -299,6 +299,8 @@ class RMSNormHeadProj(TileRTModule):
         Returns:
             Output tensor.
         """
+        logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] ENTRY: hidden_in.shape={hidden_in.shape}")
+        
         assert self.ref_rmsnorm_gamma is not None
         assert self.ref_head_proj is not None
         bsz = hidden_in.shape[0]
@@ -306,6 +308,7 @@ class RMSNormHeadProj(TileRTModule):
         hidden_in_float = hidden_in.float().detach()
         gamma = self.ref_rmsnorm_gamma.float().detach()
         # Qwen3.5-MoE/Qwen3.6 use the (1 + weight) RMSNorm convention.
+        logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] Applying RMSNorm with (1+gamma) scaling")
         hidden_rmsnorm = hidden_in_float * torch.rsqrt(
             hidden_in_float.pow(2).mean(dim=-1, keepdim=True) + self.eps
         )
@@ -317,17 +320,36 @@ class RMSNormHeadProj(TileRTModule):
             if head_proj.size(-1) == 1024 and head_proj.size(-2) == 16:
                 # TileRT-swizzled layout: (logits_shard, 16, 1024) blocks.
                 head_proj = head_proj.transpose(1, 2).reshape(-1, self.dim)
+                logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] Transposed swizzled head_proj to 2D")
             else:
                 # Already dense per-device vocab shard.
                 head_proj = head_proj.reshape(-1, self.dim)
-        return hidden_rmsnorm.float() @ head_proj.T.float()
+                logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] Reshaped head_proj to 2D")
+        
+        # Compute logits in chunks to keep peak memory low: each chunk does a
+        # bf16 matmul (hidden_rmsnorm @ head_chunk.T) and immediately converts
+        # the small result to float32, avoiding a full (1, vocab) float32 temp.
+        head_proj_bf16 = head_proj.to(torch.bfloat16)
+        chunk_size = 65536
+        vocab_size = head_proj.shape[0]
+        chunks = []
+        for start in range(0, vocab_size, chunk_size):
+            end = min(start + chunk_size, vocab_size)
+            chunk_logits = hidden_rmsnorm.to(torch.bfloat16) @ head_proj_bf16[start:end, :].T
+            chunks.append(chunk_logits.float())
+        result = torch.cat(chunks, dim=-1)
+        logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+
+        return result
 
     def tilert_forward(
         self,
         hidden_in: torch.Tensor,
     ) -> torch.Tensor:
+        logger.info(f"[RMSNormHeadProjOp.tilert_forward_{self.device_id}] ENTRY: hidden_in.shape={hidden_in.shape}")
+        
         assert self.hidden_out is not None
-
+        logger.info(f"[RMSNormHeadProjOp.tilert_forward_{self.device_id}] Calling CUDA kernel rmsnorm_head_proj")
         rmsnorm_head_proj(
             hidden_in,
             self.tilert_rmsnorm_gamma,
@@ -337,6 +359,8 @@ class RMSNormHeadProj(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[RMSNormHeadProjOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out
 
     def __call__(

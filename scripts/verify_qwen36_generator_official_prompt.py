@@ -22,6 +22,7 @@ import torch
 import faulthandler
 faulthandler.enable()
 from tilert import logger
+import torch.autograd.profiler as profiler
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -90,7 +91,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        with torch.autograd.profiler.profile(enabled=False, use_device="cuda", record_shapes=False, profile_memory=False) as prof:
+            main()
+        if prof is not None:
+            print(prof.table())
+            prof.export_chrome_trace('./official_test.json')
     except Exception as exc:
         logger.exception("\n=== FAILED: %s ===", exc)
         raise

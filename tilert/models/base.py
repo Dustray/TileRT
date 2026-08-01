@@ -461,7 +461,7 @@ class SerializableTileRTModule(TileRTModule):
                 # Fallback: ``load_hf_source_weights`` stores reference tensors
                 # under a dedicated ``ref_layer_{idx}_`` prefix to avoid
                 # colliding with tilert keys that use the same alias names.
-                ref_prefixed_key = f"{prefix}ref_{ref_key}{suffix}"
+                ref_prefixed_key = f"ref_{prefix}{ref_key}{suffix}"
                 if ref_prefixed_key in state_dict:
                     op_state_dict[ref_key] = state_dict[ref_prefixed_key]
             if op_state_dict:

@@ -508,12 +508,20 @@ class UnProjOAllReduce(TileRTModule):
         Returns:
             Output tensor.
         """
+        logger.info(f"[UnprojOAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}")
+        
         assert self.ref_unproj_o is not None
         bsz = vec_in.shape[0]
         seq_len = vec_in.shape[1]
         assert bsz == 1
+        
+        logger.info(f"[UnprojOAllReduceOp.golden_forward_{self.device_id}] Computing output projection: vec_in.float() @ ref_unproj_o.T.float()")
         res = vec_in.reshape(bsz, seq_len, -1).float() @ self.ref_unproj_o.T.float()
-        return res.to(torch.bfloat16)
+        result = res.to(torch.bfloat16)
+        
+        logger.info(f"[UnprojOAllReduceOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        
+        return result
 
     def tilert_forward(
         self,
@@ -521,9 +529,12 @@ class UnProjOAllReduce(TileRTModule):
         x_in: torch.Tensor,
         flag: int,
     ) -> torch.Tensor:
+        logger.info(f"[UnprojOAllReduceOp.tilert_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}, x_in.shape={x_in.shape}, flag={flag}")
+        
         assert self.hidden_out is not None
         assert self.profile_logs is not None
         assert self.algorithm is not None
+        logger.info(f"[UnprojOAllReduceOp.tilert_forward_{self.device_id}] Calling CUDA kernel unproj_o_allreduce")
         unproj_o_allreduce(
             vec_in,
             self.tilert_weights,
@@ -535,6 +546,8 @@ class UnProjOAllReduce(TileRTModule):
             model_arch=self.model_args.arch_name,
             compute_kernel_type=self.algorithm.value,
         )
+        logger.info(f"[UnprojOAllReduceOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out
 
     def __call__(

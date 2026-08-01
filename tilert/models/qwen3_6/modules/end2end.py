@@ -232,6 +232,10 @@ class QwenShowHandsLayer:
         # individual blocks can update their own state.
         self._golden_caches: list[dict[str, Any] | None] = [None] * self.num_devices
 
+        # Cache the full replicated lm_head matrix per device so we only pay
+        # the reshape/allocation cost once across decode steps.
+        self._full_head_proj_cache: list[torch.Tensor | None] = [None] * self.num_devices
+
         # TP8 MoE all-reduce state.  Because the Qwen3.6 backend does not yet
         # provide a C++ all-reduce, we implement it in the golden path with a
         # threading.Barrier and per-device shared buffers.
@@ -578,6 +582,7 @@ class QwenShowHandsLayer:
                             self.model_args,
                             device_id,
                             self.num_devices,
+                            moe_sync_callback=functools.partial(self._moe_sync, device_id),
                         )
                         state_dicts = load_hf_source_weights(
                             model_path,
@@ -806,7 +811,7 @@ class QwenShowHandsLayer:
         # NOTE: DCU backend is unstable when multiple devices initialize weights
         # concurrently (segmentation faults inside torch.cuda / weight dequant).
         # Serialize device initialization for Qwen3.6 to work around this.
-        if True:
+        if False:
             for device_id in range(self.num_devices):
                 try:
                     __load_weights(device_id, model_path)
@@ -994,32 +999,56 @@ class QwenShowHandsLayer:
         if self.num_devices <= 1 or self._moe_barrier is None:
             return h
         seq_len = h.size(1)
-        self._moe_partial_buf[device_id][:, :seq_len, :].copy_(h)
+        # Synchronous copy so the barrier action sees fully written buffers.
+        self._moe_partial_buf[device_id][:, :seq_len, :].copy_(h, non_blocking=False)
+        torch.cuda.synchronize(device_id)
         self._moe_barrier.wait()
+        torch.cuda.synchronize(device_id)
         return self._moe_aggregated_buf[device_id][:, :seq_len, :]
 
     def _get_full_head_proj(self, device_id: int) -> torch.Tensor:
         """Return the full vocabulary head projection on the target device.
 
         The golden reference path replicates the full lm_head on every device,
-        so no all-gather is required.
+        so no all-gather is required.  The result is cached per device.
         """
+        cached = self._full_head_proj_cache[device_id]
+        if cached is not None:
+            logger.warning(
+                f"[QwenShowHandsLayer._get_full_head_proj_{device_id}] CACHE HIT "
+                f"shape={cached.shape} dtype={cached.dtype} ptr={cached.data_ptr()}"
+            )
+            return cached
+
         stack = self._stack_objects[device_id]
         head_proj = self._head_proj_objects[device_id]
         if stack is None or head_proj is None:
             raise RuntimeError(f"Stack/head not initialized on device {device_id}")
         stack_weight_count = len(stack.get_weights_list())
         local_head = self._get_device_result(device_id)[2][stack_weight_count + 1]
+        logger.warning(
+            f"[QwenShowHandsLayer._get_full_head_proj_{device_id}] CACHE MISS "
+            f"local_head.shape={local_head.shape} dtype={local_head.dtype} ptr={local_head.data_ptr()}"
+        )
         # Full replicated layout: (vocab_size, dim).
         if local_head.dim() == 2:
-            return local_head
-        if local_head.dim() == 3:
+            full_head = local_head
+        elif local_head.dim() == 3:
             # TileRT-swizzled layout: (vocab_size/16, 16, 1024) blocks.
             if local_head.size(-1) == 1024 and local_head.size(-2) == 16:
-                return local_head.transpose(1, 2).reshape(-1, self.model_args.dim)
-            # Per-device dense vocab shard: reshape only.
-            return local_head.reshape(-1, self.model_args.dim)
-        raise ValueError(f"Unexpected head projection layout: {local_head.shape}")
+                full_head = local_head.transpose(1, 2).reshape(-1, self.model_args.dim)
+            else:
+                # Per-device dense vocab shard: reshape only.
+                full_head = local_head.reshape(-1, self.model_args.dim)
+        else:
+            raise ValueError(f"Unexpected head projection layout: {local_head.shape}")
+
+        logger.warning(
+            f"[QwenShowHandsLayer._get_full_head_proj_{device_id}] CACHING "
+            f"full_head.shape={full_head.shape} ptr={full_head.data_ptr()}"
+        )
+        self._full_head_proj_cache[device_id] = full_head
+        return full_head
 
     def _golden_forward_device(
         self,
@@ -1033,6 +1062,9 @@ class QwenShowHandsLayer:
         ``RMSNormHeadProj`` so that each op can later switch to its own
         TileRT kernel via ``flag_enable_tilert``.
         """
+        token_val = token_id.view(-1).tolist() if token_id.numel() > 1 else token_id.item()
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] ENTRY: token_id={token_val}, cur_pos={cur_pos}")
+        
         intermediates, caches, params, profile_logs = self._get_device_result(device_id)
         stack = self._stack_objects[device_id]
         head_proj = self._head_proj_objects[device_id]
@@ -1045,33 +1077,74 @@ class QwenShowHandsLayer:
         embed_weight = params[stack_weight_count + 2]
         freqs_cos_param = params[stack_weight_count + 3]
         freqs_sin_param = params[stack_weight_count + 4]
-
+        
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] params info:")
+        logger.info(f"  - stack_weight_count={stack_weight_count}")
+        logger.info(f"  - embed_weight: shape={embed_weight.shape}, dtype={embed_weight.dtype}, device={embed_weight.device}")
+        logger.info(f"  - freqs_cos_param: shape={freqs_cos_param.shape}, dtype={freqs_cos_param.dtype}, device={freqs_cos_param.device}")
+        logger.info(f"  - freqs_sin_param: shape={freqs_sin_param.shape}, dtype={freqs_sin_param.dtype}, device={freqs_sin_param.device}")
+        
+        # Log stack weights info
+        stack_weights = stack.get_weights_list()
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] stack has {len(stack_weights)} weights")
+        for i, w in enumerate(stack_weights[:5]):  # Log first 5 weights
+            logger.info(f"  - stack_weights[{i}]: shape={w.shape}, dtype={w.dtype}, device={w.device}")
+        if len(stack_weights) > 5:
+            logger.info(f"  - ... and {len(stack_weights) - 5} more weights")
+        
+        # Get embedding for token (token_id may be a scalar or a [seq_len] vector).
         idx = token_id.view(-1).to(embed_weight.device)
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Lookup embedding: idx.shape={idx.shape}, embed_weight.shape={embed_weight.shape}")
+
         x = embed_weight[idx].unsqueeze(0).to(torch.bfloat16)
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] x after embedding: shape={x.shape}, dtype={x.dtype}, device={x.device}")
+
         seq_len = x.size(1)
         if seq_len == 1:
             intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id.view(-1)[0]
         else:
             intermediates[Idx.TOKEN_ID][0, :seq_len, 0] = token_id.view(-1)
         intermediates[Idx.CUR_POS][0] = cur_pos
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Set TOKEN_ID and CUR_POS={cur_pos}")
 
+        # Initialize caches if needed
         if self._golden_caches[device_id] is None:
+            logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Initializing layer caches")
             self._golden_caches[device_id] = stack._init_layer_caches((freqs_cos_param, freqs_sin_param))
+            logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Layer caches initialized")
+        
+        # Stack forward pass
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Calling stack.forward, input shape={x.shape}")
         h, self._golden_caches[device_id] = stack.forward(
             x, cur_pos, (freqs_cos_param, freqs_sin_param), self._golden_caches[device_id]
         )
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] stack.forward output: h.shape={h.shape}, dtype={h.dtype}, device={h.device}")
 
+        # Get full head projection
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Getting full head projection")
         full_head = self._get_full_head_proj(device_id)
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] full_head: shape={full_head.shape}, dtype={full_head.dtype}, device={full_head.device}")
+        
+        # Set head projection params
         head_proj.ref_rmsnorm_gamma = params[stack_weight_count]
         head_proj.ref_head_proj = full_head
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] head_proj.ref_rmsnorm_gamma: shape={head_proj.ref_rmsnorm_gamma.shape}")
+        
+        # Run head projection forward
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Calling head_proj.golden_forward, input h.shape={h.shape}")
         logits = head_proj.golden_forward(h)
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] logits after head_proj: shape={logits.shape}, dtype={logits.dtype}")
 
         last_pos = logits.size(1) - 1
         vocab_shard = logits.size(-1)
         intermediates[Idx.LOGITS_OUT][0, 0, :vocab_shard].copy_(logits[0, last_pos, :])
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Copied logits to intermediates, vocab_shard={vocab_shard}")
 
+        # Sample next token
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] Sampling from logits at position {last_pos}")
         token_out = self._sample(logits[0, last_pos])
         intermediates[Idx.TOKEN_OUT][0, 0, 0] = token_out
+        logger.info(f"[QwenShowHandsLayer._golden_forward_device_{device_id}] EXIT: token_out={token_out}")
 
         return intermediates, caches, params, profile_logs
 
@@ -1154,17 +1227,39 @@ class QwenShowHandsLayer:
             List of per-device ``DeviceResult`` tuples.
         """
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
+        token_val = token_id.view(-1).tolist() if token_id.numel() > 1 else token_id.item()
 
-        # CUDA graph path placeholder.
-        try:
-            qwen36_show_hands(token_id.cpu(), active_mtp)
-        except (AttributeError, RuntimeError):
-            # Backend kernels not available; use golden path or HF fallback.
-            if self._hf_model is not None:
-                return self._hf_forward(token_id)
-            return self._golden_forward_all_devices(token_id, cur_pos)
+        logger.info(f"[QwenShowHandsLayer.forward] ENTRY: token_id={token_val}, active_mtp={active_mtp}, cur_pos={cur_pos}, num_devices={self.num_devices}")
 
-        return [self._get_device_result(device_id) for device_id in range(self.num_devices)]
+        # Disable autograd for the entire decode step.  The fallback golden/HF
+        # paths perform a lot of matmuls; without this PyTorch retains a graph
+        # that leaks ~1.3 GB per generated token.  The placeholder CUDA path
+        # also has no need for gradients during inference.
+        with torch.inference_mode():
+            # CUDA graph path placeholder.
+            try:
+                logger.info(f"[QwenShowHandsLayer.forward] Trying CUDA kernel path (qwen36_show_hands)")
+                qwen36_show_hands(token_id.cpu(), active_mtp)
+                logger.info(f"[QwenShowHandsLayer.forward] CUDA kernel path SUCCESS")
+            except (AttributeError, RuntimeError) as e:
+                logger.info(f"[QwenShowHandsLayer.forward] CUDA kernel path FAILED ({type(e).__name__}), falling back to golden/HF path")
+                # Backend kernels not available; use golden path or HF fallback.
+                if self._hf_model is not None:
+                    logger.info(f"[QwenShowHandsLayer.forward] Using HF fallback path")
+                    return self._hf_forward(token_id)
+                logger.info(f"[QwenShowHandsLayer.forward] Using golden forward path on all {self.num_devices} devices")
+                return self._golden_forward_all_devices(token_id, cur_pos)
+
+            logger.info(f"[QwenShowHandsLayer.forward] Collecting device results for {self.num_devices} devices")
+            results = [self._get_device_result(device_id) for device_id in range(self.num_devices)]
+            
+            # Log first device's output for verification
+            if results:
+                intermediates, caches, params, profile_logs = results[0]
+                token_out = intermediates[Idx.TOKEN_OUT][0, 0, 0].item()
+                logger.info(f"[QwenShowHandsLayer.forward] EXIT: device_0 token_out={token_out}")
+            
+            return results
 
     def _golden_forward_all_devices(
         self,
@@ -1176,23 +1271,36 @@ class QwenShowHandsLayer:
         Each device computes its TP8 MoE shard; the barrier inside
         ``_moe_sync`` aggregates partial outputs after every layer.
         """
+        token_val = token_id.view(-1).tolist() if token_id.numel() > 1 else token_id.item()
+        logger.info(f"[QwenShowHandsLayer._golden_forward_all_devices] ENTRY: token_id={token_val}, cur_pos={cur_pos}, num_devices={self.num_devices}")
+        
         results: list[DeviceResult | None] = [None] * self.num_devices
         exceptions: list[Exception | None] = [None] * self.num_devices
 
         def _runner(device_id: int) -> None:
             try:
-                results[device_id] = self._golden_forward_device(device_id, token_id, cur_pos)
+                logger.info(f"[QwenShowHandsLayer._golden_forward_all_devices] Starting thread for device {device_id}")
+                # Each worker thread starts with autograd enabled by default,
+                # even if the caller disabled it.  Running the golden path
+                # under ``torch.inference_mode()`` prevents PyTorch from
+                # retaining computation graphs and stops the ~1.3 GB/token leak.
+                with torch.inference_mode():
+                    results[device_id] = self._golden_forward_device(device_id, token_id, cur_pos)
+                logger.info(f"[QwenShowHandsLayer._golden_forward_all_devices] Thread for device {device_id} completed")
             except Exception as exc:  # pragma: no cover - surfaced after join
                 exceptions[device_id] = exc
+                logger.error(f"[QwenShowHandsLayer._golden_forward_all_devices] Thread for device {device_id} FAILED: {exc}")
 
         threads = [
             threading.Thread(target=_runner, args=(device_id,))
             for device_id in range(self.num_devices)
         ]
+        logger.info(f"[QwenShowHandsLayer._golden_forward_all_devices] Starting {len(threads)} threads")
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
+        logger.info(f"[QwenShowHandsLayer._golden_forward_all_devices] All threads joined")
 
         for device_id, exc in enumerate(exceptions):
             if exc is not None:
@@ -1200,6 +1308,19 @@ class QwenShowHandsLayer:
                     f"Golden forward failed on device {device_id}: {exc}"
                 ) from exc
 
+        # Log summary of all device results
+        for device_id in range(self.num_devices):
+            intermediates, caches, params, profile_logs = results[device_id]
+            token_out = intermediates[Idx.TOKEN_OUT][0, 0, 0].item()
+            logits_out = intermediates[Idx.LOGITS_OUT][0, 0, :]
+            argmax_token = int(logits_out.argmax().item())
+            logger.info(
+                f"[QwenShowHandsLayer._golden_forward_all_devices] device_{device_id} "
+                f"token_out={token_out} argmax={argmax_token} "
+                f"logits_top5={logits_out.topk(5).indices.tolist()}"
+            )
+
+        logger.info(f"[QwenShowHandsLayer._golden_forward_all_devices] EXIT: returning {len(results)} device results")
         return [results[device_id] for device_id in range(self.num_devices)]
 
     def set_sampling_seed(self, seed: int, with_mtp: bool | None = None) -> None:
@@ -1236,8 +1357,9 @@ class QwenShowHandsLayer:
             pass
 
     def cleanup(self) -> None:
-        """Release CUDA graphs."""
+        """Release CUDA graphs and cached reference tensors."""
         self._golden_caches = [None] * self.num_devices
+        self._full_head_proj_cache = [None] * self.num_devices
         try:
             if self.with_mtp:
                 qwen36_show_hands_go_home(True)

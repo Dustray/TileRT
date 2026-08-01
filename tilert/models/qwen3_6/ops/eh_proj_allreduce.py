@@ -277,16 +277,23 @@ class EHProjAllReduce(TileRTModule):
         Returns:
             Output tensor.
         """
+        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in_enorm.shape={vec_in_enorm.shape}, vec_in_hnorm.shape={vec_in_hnorm.shape}, device_id={device_id}")
+        
         assert self.ref_proj is not None
         bsz = vec_in_enorm.shape[0]
         assert bsz == 1
 
+        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] Concatenating vec_in_enorm and vec_in_hnorm")
         vec_in_concat = torch.cat([vec_in_enorm, vec_in_hnorm], dim=-1)
         dim_per_device = (self.dim * 2) // self.num_devices
+        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] Slicing: dim_per_device={dim_per_device}, start={dim_per_device * device_id}")
         vec_in_slice = vec_in_concat[
             ..., dim_per_device * device_id : dim_per_device * device_id + dim_per_device
         ]
-        return vec_in_slice @ self.ref_proj.T
+        result = vec_in_slice @ self.ref_proj.T
+        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        
+        return result
 
     def tilert_forward(
         self,
@@ -294,7 +301,10 @@ class EHProjAllReduce(TileRTModule):
         vec_in_hnorm: torch.Tensor,
         flag: int,
     ) -> torch.Tensor:
+        logger.info(f"[EHProjAllReduceOp.tilert_forward_{self.device_id}] ENTRY: vec_in_enorm.shape={vec_in_enorm.shape}, vec_in_hnorm.shape={vec_in_hnorm.shape}, flag={flag}")
+        
         assert self.hidden_out is not None
+        logger.info(f"[EHProjAllReduceOp.tilert_forward_{self.device_id}] Calling CUDA kernel eh_proj_allreduce")
         eh_proj_allreduce(
             vec_in_enorm,
             vec_in_hnorm,
@@ -304,4 +314,6 @@ class EHProjAllReduce(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[EHProjAllReduceOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out

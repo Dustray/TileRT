@@ -111,7 +111,12 @@ class PaddedAllReduceAdd(TileRTModule):
         Returns:
             Output tensor (copy of x_in).
         """
-        return x_in.clone()
+        logger.info(f"[PaddedAllReduceAddOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}")
+        
+        result = x_in.clone()
+        logger.info(f"[PaddedAllReduceAddOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        
+        return result
 
     def tilert_forward(
         self,
@@ -127,9 +132,12 @@ class PaddedAllReduceAdd(TileRTModule):
         Returns:
             Output tensor [1, L, hidden_dim].
         """
+        logger.info(f"[PaddedAllReduceAddOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, flag={flag}")
+        
         assert self.hidden_out is not None
         assert self.partial_buf is not None
         assert self.profile_logs is not None
+        logger.info(f"[PaddedAllReduceAddOp.tilert_forward_{self.device_id}] Calling CUDA kernel padded_allreduce_add")
         padded_allreduce_add(
             self.partial_buf,
             x_in,
@@ -138,6 +146,8 @@ class PaddedAllReduceAdd(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[PaddedAllReduceAddOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out
 
     def __call__(

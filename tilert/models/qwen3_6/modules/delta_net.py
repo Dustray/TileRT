@@ -188,6 +188,20 @@ class DeltaNet(SerializableTileRTModule):
         """Load reference weights and also set the RMSNorm module weights."""
         logger.debug(f"{self.op_name}: loading reference weights + layernorms")
         super().init_reference_weights(state_dict)
+        # ``DeltaNetOp`` currently only loads tilert-layout weights.  The
+        # reference holder already received the HF reference tensors; copy
+        # them into the op so golden_forward does not need lazy random init.
+        if self.delta_ref.in_proj_qkv_weight is not None:
+            self.attn.in_proj_qkv_weights = self.delta_ref.in_proj_qkv_weight
+            self.attn.in_proj_z_weights = self.delta_ref.in_proj_z_weight
+            self.attn.in_proj_a_weights = self.delta_ref.in_proj_a_weight
+            self.attn.in_proj_b_weights = self.delta_ref.in_proj_b_weight
+            self.attn.conv1d_weights = self.delta_ref.conv1d_weight
+            self.attn.A_log = self.delta_ref.A_log
+            self.attn.dt_bias = self.delta_ref.dt_bias
+            self.attn.norm_weights = self.delta_ref.norm_weight
+            self.attn.out_proj_weights = self.delta_ref.out_proj_weight
+            self.attn.is_ref_weights_init = True
         self._load_layernorm_weights(state_dict)
 
     def _load_layernorm_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -210,24 +224,48 @@ class DeltaNet(SerializableTileRTModule):
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         """Reference forward: full DeltaNet layer with residuals and layer norms."""
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, has_state={state is not None}")
+        
         self._ensure_weights(x)
         prev_state = state.get("delta_state") if state is not None else None
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] prev_state: {type(prev_state)}")
 
         # Pre-attention norm + attention + residual.
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step1: input_layernorm, input shape={x.shape}")
         norm_x = self.input_layernorm(x)
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step2: attention (attn.golden_forward)")
         attn_out, new_state = self.attn.golden_forward(norm_x, start_pos, prev_state)
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] attn_out: shape={attn_out.shape}, new_state type={type(new_state)}")
+        
         h = x + attn_out
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] After residual: h.shape={h.shape}")
 
         # Post-attention norm + MoE FFN (partial TP8 sum) + all-reduce.
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step3: post_attention_layernorm")
         norm_h = self.post_attention_layernorm(h)
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step4: MoE FFN (ffn.golden_forward)")
+        
         ffn_partial = self.ffn.golden_forward(norm_h)
+        logger.info(
+            f"[DeltaNet.golden_forward_{self.device_id}] ffn_partial: "
+            f"shape={ffn_partial.shape} mean={ffn_partial.float().mean().item():.6f} "
+            f"std={ffn_partial.float().std().item():.6f}"
+        )
+
         if self.moe_sync_callback is not None:
+            logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step5: MoE sync (all-reduce)")
             ffn_full = self.moe_sync_callback(ffn_partial)
+            logger.info(
+                f"[DeltaNet.golden_forward_{self.device_id}] ffn_full after sync: "
+                f"shape={ffn_full.shape} mean={ffn_full.float().mean().item():.6f} "
+                f"std={ffn_full.float().std().item():.6f}"
+            )
         else:
             ffn_full = ffn_partial
 
         # Final residual uses the all-reduced (full) FFN output.
         out = h + ffn_full
+        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Final output: shape={out.shape}, mean={out.float().mean().item():.4f}")
 
         # ``new_state`` is a tuple ``(conv_state, recurrent_state)`` produced by
         # ``DeltaNetOp.golden_forward`` to keep both the causal convolution and

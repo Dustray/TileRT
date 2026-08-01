@@ -832,12 +832,39 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         # TP8: keep the full expert count but only the local inter_dim shard on
         # each device.  Global expert indices select directly into the local
         # full-expert table, so no modulo remapping is needed.
-        sharded = self.device_sharding(state_dict)
-        tilert_alias = self.tilert_weights_alias
-        gate_weights = sharded[tilert_alias.exp_gate_weights][:, did]
-        gate_scales = sharded[tilert_alias.exp_gate_scales][:, did]
-        up_weights = sharded[tilert_alias.exp_up_weights][:, did]
-        up_scales = sharded[tilert_alias.exp_up_scales][:, did]
+        local_inter_dim = self.moe_inter_dim // self.num_devices
+        gate_up_proj = state_dict[f"{key_prefix}.experts.gate_up_proj"]
+        shared_gate = state_dict[f"{key_prefix}.shared_expert.gate_proj.weight"]
+        shared_up = state_dict[f"{key_prefix}.shared_expert.up_proj.weight"]
+
+        # ``load_hf_source_weights`` already TP-shards the reference MoE
+        # weights per device.  Detect that and skip the unsharded
+        # ``device_sharding`` path to avoid double-sharding.
+        if gate_up_proj.size(1) == 2 * local_inter_dim:
+            half = gate_up_proj.size(1) // 2
+            routed_gate = gate_up_proj[:, :half, :]
+            routed_up = gate_up_proj[:, half:, :]
+            gate_weights = torch.cat([shared_gate.unsqueeze(0), routed_gate], dim=0)
+            up_weights = torch.cat([shared_up.unsqueeze(0), routed_up], dim=0)
+            scale_dtype = (
+                torch.float32 if self.arch_name in ("glm_5", "qwen3_6") else torch.bfloat16
+            )
+            gate_scales = torch.ones(
+                gate_weights.shape[0],
+                max(gate_weights.shape[1] // self.block_size, 1),
+                gate_weights.shape[2] // self.block_size,
+                dtype=scale_dtype,
+                device=gate_weights.device,
+            )
+            up_scales = gate_scales.clone()
+        else:
+            sharded = self.device_sharding(state_dict)
+            tilert_alias = self.tilert_weights_alias
+            gate_weights = sharded[tilert_alias.exp_gate_weights][:, did]
+            gate_scales = sharded[tilert_alias.exp_gate_scales][:, did]
+            up_weights = sharded[tilert_alias.exp_up_weights][:, did]
+            up_scales = sharded[tilert_alias.exp_up_scales][:, did]
+
         self.ref_gate = self._dequant_expert_stack(gate_weights, gate_scales)
         self.ref_up = self._dequant_expert_stack(up_weights, up_scales)
 
@@ -1035,30 +1062,41 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         x_in: torch.Tensor,
         scores: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, scores.shape={scores.shape}")
+        
         assert self.ref_gate is not None
         assert self.ref_up is not None
         bsz = x_in.shape[0]
         seq_len = x_in.shape[1]
         assert bsz == 1
+        
+        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Running expert selection for arch={self.arch_name}")
         if self.arch_name == "qwen3_6":
             weights, indices = self._ref_expert_select_qwen36(scores)
         elif self.arch_name == "glm_5":
             weights, indices = self._ref_expert_select_glm5(scores)
         else:
             raise ValueError(f"Unsupported architecture: {self.arch_name}")
+        
+        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Expert selection done: indices.shape={indices.shape}, weights.shape={weights.shape}")
+        
         # ``rmsnorm_expert_proj`` flattens the batch dimension, so scores can be
         # 2-D here.  Restore the batch dimension for token-wise indexing.
         if indices.ndim == 2:
             indices = indices.unsqueeze(0)
             weights = weights.unsqueeze(0)
+            logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Promoted indices/weights from 2D to 3D")
         # TP8: reference weights contain every expert but only the local
         # inter_dim shard, so global expert IDs index directly into ref_gate/ref_up
         # (the shared expert lives at index 0).
         local_indices = indices
+        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Processing {seq_len} tokens, n_activated_experts={self.n_activated_experts}")
+        
         hidden_out_list = []
         for s in range(seq_len):
             hidden_out_w1_list = []
             hidden_out_w3_list = []
+            logger.debug(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Token {s}: computing shared expert gate/up")
             hidden_out_w1_shared = x_in[0, s].float() @ self.ref_gate[0].float().mT
             hidden_out_w3_shared = x_in[0, s].float() @ self.ref_up[0].float().mT
             hidden_out_w1_list.append(hidden_out_w1_shared)
@@ -1077,6 +1115,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             hidden_out_list.append(hidden_out)
         hidden_out = torch.stack(hidden_out_list, dim=0)
         hidden_out = hidden_out[None, ...]
+        
+        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] EXIT: hidden_out.shape={hidden_out.shape}, weights.shape={weights.shape}, indices.shape={indices.shape}")
+        
         return hidden_out, weights, indices
 
     def tilert_forward(
@@ -1085,7 +1126,10 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         scores: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the kernel."""
+        logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, scores.shape={scores.shape}")
+        
         assert self.algorithm is not None, "Algorithm is not set"
+        logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] Calling CUDA kernel expert_select_up_gate_silu")
         expert_select_up_gate_silu(
             x_in,
             scores,
@@ -1098,4 +1142,6 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             self.algorithm.value,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}, expert_probs.shape={self.expert_probs.shape}, expert_indices.shape={self.expert_indices.shape}")
+        
         return self.hidden_out, self.expert_probs, self.expert_indices

@@ -318,6 +318,7 @@ class DownAllReduce(TileRTModule):
         Returns:
             Output tensor.
         """
+        logger.info(f"[DownAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}")
         assert self.ref_down is not None
         bsz = vec_in.shape[0]
         assert bsz == 1
@@ -331,7 +332,9 @@ class DownAllReduce(TileRTModule):
             hidden_out_w2 = torch.stack(hidden_out_w2_list, dim=0).to(torch.bfloat16)
             hidden_out_w2 = torch.sum(hidden_out_w2, dim=0)
             hidden_out_list.append(hidden_out_w2)
-        return torch.stack(hidden_out_list, dim=0)[None, ...]
+        result = torch.stack(hidden_out_list, dim=0)[None, ...]
+        logger.info(f"[DownAllReduceOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        return result
 
     def tilert_forward(
         self,
@@ -339,7 +342,10 @@ class DownAllReduce(TileRTModule):
         x_in: torch.Tensor,
         flag: int,
     ) -> torch.Tensor:
+        logger.info(f"[DownAllReduceOp.tilert_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}, x_in.shape={x_in.shape}, flag={flag}")
+        
         assert self.hidden_out is not None
+        logger.info(f"[DownAllReduceOp.tilert_forward_{self.device_id}] Calling CUDA kernel down_allreduce")
         down_allreduce(
             vec_in,
             self.tilert_weights,
@@ -351,6 +357,8 @@ class DownAllReduce(TileRTModule):
             self.model_arch,
             self.compute_kernel_type,
         )
+        logger.info(f"[DownAllReduceOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out
 
     def __call__(

@@ -147,13 +147,19 @@ class QKVRoPE(TileRTModule):
         bsz: int,
         seqlen: int,
     ) -> torch.Tensor:
+        logger.info(f"[QKVRopeOp.golden_forward_{self.device_id}] ENTRY: q_pe.shape={q_pe.shape}, pe_cache.shape={pe_cache.shape}, start_pos={start_pos}, bsz={bsz}, seqlen={seqlen}")
+        
         end_pos = start_pos + seqlen
 
+        logger.info(f"[QKVRopeOp.golden_forward_{self.device_id}] Applying RoPE to K: pe_cache slice [:{bsz}, {start_pos}:{end_pos}]")
         k_pe = pe_cache[:bsz, start_pos:end_pos]
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
 
-        return apply_rotary_emb(q_pe, freqs_cis)
+        result = apply_rotary_emb(q_pe, freqs_cis)
+        logger.info(f"[QKVRopeOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        
+        return result
 
     def tilert_forward(
         self,
@@ -164,6 +170,8 @@ class QKVRoPE(TileRTModule):
         bsz: int,
         seqlen: int,
     ) -> torch.Tensor:
+        logger.info(f"[QKVRopeOp.tilert_forward_{self.device_id}] ENTRY: q_pe.shape={q_pe.shape}, pe_cache.shape={pe_cache.shape}, start_pos={start_pos}, bsz={bsz}, seqlen={seqlen}")
+        
         assert self.profile_logs is not None
         end_pos = start_pos + seqlen
 
@@ -171,6 +179,7 @@ class QKVRoPE(TileRTModule):
         rope_freqs = torch.view_as_real(freqs_cis).reshape(*freqs_cis.shape[:-1], -1)
         cur_pos = torch.tensor([start_pos], dtype=torch.int32)
 
+        logger.info(f"[QKVRopeOp.tilert_forward_{self.device_id}] Calling CUDA kernel qkv_rope")
         qkv_rope(
             q_pe_rope,
             pe_cache[:bsz, start_pos:end_pos],
@@ -179,7 +188,8 @@ class QKVRoPE(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
-
+        logger.info(f"[QKVRopeOp.tilert_forward_{self.device_id}] EXIT: q_pe_rope.shape={q_pe_rope.shape}")
+        
         return q_pe_rope
 
     def __call__(

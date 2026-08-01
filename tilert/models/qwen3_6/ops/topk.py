@@ -139,8 +139,14 @@ class TopK(nn.Module):
         Returns:
             Indices of top-k values along the last dimension.
         """
+        logger.info(f"[TopKOp.golden_forward] ENTRY: logits.shape={logits.shape}, topk={topk}")
+        
         seq_len = logits.shape[-1]
-        return logits.topk(min(topk, seq_len), dim=-1)[1]
+        result = logits.topk(min(topk, seq_len), dim=-1)[1]
+        
+        logger.info(f"[TopKOp.golden_forward] EXIT: result.shape={result.shape}")
+        
+        return result
 
     def tilert_forward(
         self,
@@ -156,16 +162,26 @@ class TopK(nn.Module):
         Returns:
             Indices tensor of shape (batch, num_samples, topk).
         """
+        logger.info(f"[TopKOp.tilert_forward] ENTRY: logits.shape={logits.shape}, topk={topk}, use_approximate={self.use_approximate}")
+        
         profile_logs = get_profile_log_tensor(device=logits.device)
         cache_len = logits.shape[-1]
+        
         if self.use_approximate:
+            logger.info(f"[TopKOp.tilert_forward] Calling CUDA kernel topk_approximate")
             indices = topk_approximate(
                 logits, cache_len, topk, profile_logs, model_arch=self.model_args.arch_name
             )
         else:
+            logger.info(f"[TopKOp.tilert_forward] Calling CUDA kernel topk_accurate")
             indices = topk_accurate(
                 logits, cache_len, topk, profile_logs, model_arch=self.model_args.arch_name
             )
+        
         if indices.dim() == 2:
-            return indices.unsqueeze(0)
+            indices = indices.unsqueeze(0)
+            logger.info(f"[TopKOp.tilert_forward] Unsqueezed indices to 3D")
+        
+        logger.info(f"[TopKOp.tilert_forward] EXIT: indices.shape={indices.shape}")
+        
         return indices

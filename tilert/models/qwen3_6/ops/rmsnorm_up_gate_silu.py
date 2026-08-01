@@ -338,18 +338,24 @@ class RMSNormUpGateSiLU(TileRTModule):
         self,
         x_in: torch.Tensor,
     ) -> torch.Tensor:
+        logger.info(f"[RMSNormUpGateSiluOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}")
+        
         assert self.ref_gate is not None
         assert self.ref_up is not None
         bsz = x_in.shape[0]
         seq_len = x_in.shape[1]
         assert bsz == 1
         if self.ref_norm_gamma.device != x_in.device:
+            logger.info(f"[RMSNormUpGateSiluOp.golden_forward_{self.device_id}] Moving weights to device {x_in.device}")
             self.ref_norm_gamma = self.ref_norm_gamma.to(x_in.device)
             self.ref_gate = self.ref_gate.to(x_in.device)
             self.ref_up = self.ref_up.to(x_in.device)
+        
+        logger.info(f"[RMSNormUpGateSiluOp.golden_forward_{self.device_id}] Applying RMSNorm")
         x_in_rmsnorm = torch.nn.functional.rms_norm(
             x_in.float(), [x_in.size(-1)], self.ref_norm_gamma, self.eps
         )
+        
         hidden_out_list = []
         for s in range(seq_len):
             hidden_out_w1_list = []
@@ -367,14 +373,20 @@ class RMSNormUpGateSiLU(TileRTModule):
             hidden_out_list.append(hidden_out)
         hidden_out = torch.stack(hidden_out_list, dim=0)
         hidden_out = hidden_out[None, ...]
+        
+        logger.info(f"[RMSNormUpGateSiluOp.golden_forward_{self.device_id}] EXIT: hidden_out.shape={hidden_out.shape}")
+        
         return hidden_out
 
     def tilert_forward(
         self,
         x_in: torch.Tensor,
     ) -> torch.Tensor:
+        logger.info(f"[RMSNormUpGateSiluOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}")
+        
         assert self.rmsnorm_up_gate_silu_func is not None
         assert self.algorithm is not None, "Algorithm is not set"
+        logger.info(f"[RMSNormUpGateSiluOp.tilert_forward_{self.device_id}] Calling CUDA kernel rmsnorm_up_gate_silu")
         self.rmsnorm_up_gate_silu_func(
             x_in,
             self.tilert_norm_gamma,
@@ -384,6 +396,8 @@ class RMSNormUpGateSiLU(TileRTModule):
             model_arch=self.model_args.arch_name,
             compute_kernel_type=self.algorithm.value,
         )
+        logger.info(f"[RMSNormUpGateSiluOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        
         return self.hidden_out
 
     def __call__(

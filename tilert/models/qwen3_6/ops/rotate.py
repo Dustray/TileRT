@@ -208,19 +208,31 @@ class Rotate(TileRTModule):
         idx_q: torch.Tensor,
         freqs_cis: torch.Tensor,
     ) -> torch.Tensor:
+        logger.info(f"[RotateOp.golden_forward_{self.device_id}] ENTRY: idx_q.shape={idx_q.shape}, freqs_cis.shape={freqs_cis.shape}")
+        
         q_pe_idx, q_nope_idx = torch.split(
             idx_q,
             [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
+        logger.info(f"[RotateOp.golden_forward_{self.device_id}] Split: q_pe_idx.shape={q_pe_idx.shape}, q_nope_idx.shape={q_nope_idx.shape}")
+        
         q_pe_idx = apply_rotary_emb(q_pe_idx, freqs_cis, interleaved=False)
         idx_q = torch.cat([q_pe_idx, q_nope_idx], dim=-1)
-        return rotate_activation(idx_q)
+        logger.info(f"[RotateOp.golden_forward_{self.device_id}] Concatenated idx_q.shape={idx_q.shape}")
+        
+        result = rotate_activation(idx_q)
+        logger.info(f"[RotateOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        
+        return result
 
     def tilert_forward(self, idx_q: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        logger.info(f"[RotateOp.tilert_forward_{self.device_id}] ENTRY: idx_q.shape={idx_q.shape}, freqs_cis.shape={freqs_cis.shape}")
+        
         assert self.output is not None
         assert self.profile_logs is not None
         freqs_cis_real = torch.view_as_real(freqs_cis).reshape(*freqs_cis.shape[:-1], -1)
+        logger.info(f"[RotateOp.tilert_forward_{self.device_id}] Calling CUDA kernel rotate")
         rotate(
             idx_q,
             self.output,
@@ -228,4 +240,6 @@ class Rotate(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[RotateOp.tilert_forward_{self.device_id}] EXIT: output.shape={self.output.shape}")
+        
         return self.output

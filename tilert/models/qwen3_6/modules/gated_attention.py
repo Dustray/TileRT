@@ -259,6 +259,18 @@ class GatedAttention(SerializableTileRTModule):
         """Load reference weights and also set the RMSNorm module weights."""
         logger.debug(f"{self.op_name}: loading reference weights + layernorms")
         super().init_reference_weights(state_dict)
+        # The GQA attention op currently only loads tilert-layout weights; it
+        # needs the same reference weights as the reference holder so that
+        # golden_forward can run without lazy random initialization.  Copy
+        # them from the reference holder if it was populated.
+        if self.attn_ref.q_proj_weight is not None:
+            self.attn.qkv_proj_weights = torch.cat(
+                [self.attn_ref.q_proj_weight, self.attn_ref.k_proj_weight, self.attn_ref.v_proj_weight], dim=0
+            )
+            self.attn.o_proj_weights = self.attn_ref.o_proj_weight
+            self.attn.q_norm_weights = self.attn_ref.q_norm_weight
+            self.attn.k_norm_weights = self.attn_ref.k_norm_weight
+            self.attn.is_ref_weights_init = True
         self._load_layernorm_weights(state_dict)
 
     def _load_layernorm_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -278,25 +290,48 @@ class GatedAttention(SerializableTileRTModule):
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reference GQA forward with residuals, norms, and MoE FFN."""
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
+        
         self._ensure_weights(x)
 
         # Pre-attention norm + GQA (o_proj applied internally) + residual.
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step1: input_layernorm")
         norm_x = self.input_layernorm(x)
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step2: GQA attention (attn.golden_forward)")
         attn_out, k_cache, v_cache = self.attn.golden_forward(
             norm_x, start_pos, mrope_embed, k_cache, v_cache, mask
         )
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] attn_out: shape={attn_out.shape}, k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
+        
         h = x + attn_out
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] After residual: h.shape={h.shape}")
 
         # Post-attention norm + MoE FFN (partial TP8 sum) + all-reduce.
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step3: post_attention_layernorm")
         norm_h = self.post_attention_layernorm(h)
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step4: MoE FFN (ffn.golden_forward)")
+        
         ffn_partial = self.ffn.golden_forward(norm_h)
+        logger.info(
+            f"[GatedAttention.golden_forward_{self.device_id}] ffn_partial: "
+            f"shape={ffn_partial.shape} mean={ffn_partial.float().mean().item():.6f} "
+            f"std={ffn_partial.float().std().item():.6f}"
+        )
+
         if self.moe_sync_callback is not None:
+            logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step5: MoE sync (all-reduce)")
             ffn_full = self.moe_sync_callback(ffn_partial)
+            logger.info(
+                f"[GatedAttention.golden_forward_{self.device_id}] ffn_full after sync: "
+                f"shape={ffn_full.shape} mean={ffn_full.float().mean().item():.6f} "
+                f"std={ffn_full.float().std().item():.6f}"
+            )
         else:
             ffn_full = ffn_partial
 
         # Final residual uses the all-reduced (full) FFN output.
         out = h + ffn_full
+        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] EXIT: out.shape={out.shape}, mean={out.float().mean().item():.4f}")
 
         return out, k_cache, v_cache
 

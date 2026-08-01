@@ -6,7 +6,7 @@
     "configurations": [
         
         {
-            "name": "Python 调试程序: 当前文件",
+            "name": "Python 调试程序: official",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/verify_qwen36_generator_official_prompt.py",
@@ -14,7 +14,20 @@
             "env": {
                 "PYTHONPATH": "/public/home/dinggy/yiny/projects/TileRT",
                 "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"
-            }
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "Python 调试程序: 当前文件",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "/public/home/dinggy/yiny/projects/TileRT",
+                "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"
+            },
+            "justMyCode": false
         }
     ]
 }

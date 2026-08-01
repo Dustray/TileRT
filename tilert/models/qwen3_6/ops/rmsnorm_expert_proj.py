@@ -165,13 +165,23 @@ class RMSNormExpertProj(TileRTModule):
     def golden_forward(
         self, x_in: torch.Tensor, residual: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, residual={residual is not None}")
+        
         assert self.is_ref_weights_init, "Reference weights must be initialized before forward pass"
         assert self.ref_rmsnorm is not None and self.ref_proj_weight is not None
+        
+        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Applying RMSNorm")
         norm_x = self.ref_rmsnorm(x_in, residual)
+        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Computing scores via linear projection")
         scores = linear(norm_x.view(-1, self.dim).float(), self.ref_proj_weight.float())
+        
+        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] EXIT: norm_x.shape={norm_x.shape}, scores.shape={scores.shape}")
+        
         return norm_x, scores
 
     def tilert_forward(self, x_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"[RMSNormExpertProjOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}")
+        
         assert self.is_tilert_weights_init, "Tilert weights must be initialized before forward pass"
         assert self.tilert_rms_norm_weight is not None and self.tilert_proj_weight is not None
         x_in = x_in.to(torch.bfloat16)
@@ -179,6 +189,7 @@ class RMSNormExpertProj(TileRTModule):
         scores_out = torch.zeros(
             (x_in.shape[0], x_in.shape[1], self.n_routed_experts), dtype=torch.float32
         )
+        logger.info(f"[RMSNormExpertProjOp.tilert_forward_{self.device_id}] Calling CUDA kernel rmsnorm_expert_proj_op")
         torch.ops.tilert.rmsnorm_expert_proj_op(
             x_in,
             self.tilert_rms_norm_weight,
@@ -189,6 +200,8 @@ class RMSNormExpertProj(TileRTModule):
             "bf16",
             self.profile_logs,
         )
+        logger.info(f"[RMSNormExpertProjOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={hidden_out.shape}, scores_out.shape={scores_out.shape}")
+        
         return hidden_out, scores_out
 
     def __call__(self, x_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

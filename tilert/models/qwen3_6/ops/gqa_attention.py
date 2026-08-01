@@ -340,15 +340,23 @@ class GQAAttention(TileRTModule):
 
         This is a fallback used until the CUDA kernel is available.
         """
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, k_cache.shape={k_cache.shape}")
+        
         import torch.nn.functional as F
 
         assert self.qkv_proj_weights is not None
         assert self.o_proj_weights is not None
         bsz, seq_len, _ = x.shape
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Input: bsz={bsz}, seq_len={seq_len}, dim={x.shape[-1]}")
 
+        # QKV projection
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step1: QKV projection")
         qkv = x @ self.qkv_proj_weights.T
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   qkv.shape={qkv.shape}")
+        
         # Qwen3.5-MoE full attention: q-projection is doubled; the second half is
         # the per-head gating signal.  Sizes now reflect the local shard.
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step2: Split Q/K/V and gate")
         q_gate, k, v = torch.split(
             qkv,
             [
@@ -359,20 +367,27 @@ class GQAAttention(TileRTModule):
             dim=-1,
         )
         q, gate = torch.chunk(q_gate, 2, dim=-1)
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
 
         # Keep (bsz, seq_len, n_local_heads, head_dim) for apply_rotary_emb.
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step3: Reshape for multi-head")
         q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim)
         k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim)
         v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim)
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   q.view={q.shape}, k.view={k.shape}, v.view={v.shape}")
 
         # Apply per-head RMSNorm on q/k.  q_norm/k_norm weights have shape
         # (head_dim,) and are broadcast across all heads.  Qwen3.5-MoE uses the
         # (1 + weight) convention.
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step4: RMSNorm on Q/K")
         q_norm_w = self.q_norm_weights.view(1, 1, 1, self.head_dim)
         k_norm_w = self.k_norm_weights.view(1, 1, 1, self.v_head_dim)
         q = q * torch.rsqrt(q.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6) * (1.0 + q_norm_w)
         k = k * torch.rsqrt(k.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6) * (1.0 + k_norm_w)
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   After RMSNorm")
 
+        # RoPE
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step5: RoPE embedding")
         rope_dim = self.rope_dim
         no_pe_dim = self.head_dim - rope_dim
         q_pe, q_no_pe = torch.split(q, [rope_dim, no_pe_dim], dim=-1)
@@ -381,15 +396,17 @@ class GQAAttention(TileRTModule):
         from tilert.models.utils import apply_mrope_embed
 
         freqs_cos, freqs_sin = mrope_embed
-        freqs_cos = freqs_cos[start_pos : start_pos + seq_len].unsqueeze(0)
-        freqs_sin = freqs_sin[start_pos : start_pos + seq_len].unsqueeze(0)
+        freqs_cos = freqs_cos[start_pos : start_pos + seq_len, :rope_dim]
+        freqs_sin = freqs_sin[start_pos : start_pos + seq_len, :rope_dim]
         q_pe, k_pe = apply_mrope_embed(
-            q_pe, k_pe, freqs_cos, freqs_sin, unsqueeze_dim=2
+            q_pe, k_pe, freqs_cos, freqs_sin, unsqueeze_dim=1
         )
         q = torch.cat([q_pe, q_no_pe], dim=-1)
         k = torch.cat([k_pe, k_no_pe], dim=-1)
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   After RoPE: q.shape={q.shape}")
 
         # Permute to (bsz, n_heads, seq_len, head_dim) for attention math.
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step6: Permute and cache")
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -405,20 +422,26 @@ class GQAAttention(TileRTModule):
             reps = self.num_local_heads // self.num_local_kv_heads
             k_full = k_full.repeat_interleave(reps, dim=1)
             v_full = v_full.repeat_interleave(reps, dim=1)
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   k_full.shape={k_full.shape}, v_full.shape={v_full.shape}")
 
+        # Attention computation
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step7: Attention scores and softmax")
         scores = torch.matmul(q.float(), k_full.transpose(-2, -1).float()) / (self.head_dim**0.5)
         if mask is not None:
             scores = scores + mask
-        attn = F.softmax(scores, dim=-1)
+        attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         o = torch.matmul(attn, v_full.float())
         o = o.transpose(1, 2).contiguous()
+        
         # Apply the per-head gate to the projected output.  The gate has the
         # same shape as the query (bsz, seq_len, n_local_heads, head_dim);
         # apply it element-wise (Qwen3.5-MoE attention gate).
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step8: Apply gate and output projection")
         gate = gate.view(bsz, seq_len, self.num_local_heads, self.head_dim)
         out = o * torch.sigmoid(gate)
         out = out.view(bsz, seq_len, -1).to(x.dtype)
         out = out @ self.o_proj_weights.T
+        logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] EXIT: out.shape={out.shape}, k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
 
         # EP8: attention weights are replicated, so no all-reduce is needed.
         return out, k_cache, v_cache
@@ -433,10 +456,14 @@ class GQAAttention(TileRTModule):
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Optimized forward placeholder."""
+        logger.info(f"[GQAAttentionOp.tilert_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}")
+        
         del mrope_embed, mask
         assert self.is_init
         assert self.out is not None
         assert self.profile_logs is not None
+        
+        logger.info(f"[GQAAttentionOp.tilert_forward_{self.device_id}] Calling CUDA kernel gqa_attention")
         gqa_attention(
             x,
             k_cache,
@@ -446,6 +473,8 @@ class GQAAttention(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
+        logger.info(f"[GQAAttentionOp.tilert_forward_{self.device_id}] EXIT: out.shape={self.out.shape}, k_cache.shape={k_cache.shape}")
+        
         return self.out, k_cache, v_cache
 
     def forward(
