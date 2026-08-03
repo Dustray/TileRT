@@ -10,7 +10,7 @@
 
 - **项目**：以TileRT Deepseek模块框架为模板，使Qwen模块（走golden forward流程，非c++闭源库）完成推理目标。
 - **目标**：基于原始 HuggingFace checkpoint，在 8 张 DCU 上以 **TP8（Tensor Parallelism 8，无 Expert Parallelism）** 跑通 `QwenShowHandsLayer.golden_forward`，并通过 `scripts/verify_qwen36_generator_official_prompt.py` 生成可读文本。
-- **源模型**：`/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
+- **源模型**：`/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
   - 原始 checkpoint key 前缀：`model.language_model.*`
   - 26 个 safetensors shard，总大小约 71.9 GB（文本部分）。
 - **测试环境**：只能在`tilert-qwen3.6` docker容器内部，不要用宿主机虚拟环境：`docker exec -it tilert-qwen3.6 bash`
@@ -22,7 +22,7 @@
 
 ```bash
 export LD_LIBRARY_PATH=/opt/dtk-26.04/lib:/opt/dtk-26.04/hip/lib:/opt/dtk-26.04/.hyhal/rocm_smi/lib
-export PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT:$PYTHONPATH
+export PYTHONPATH=/public/home/panyq/yiny/projects/TileRT:$PYTHONPATH
 ```
 
 ## 1. 关键参数 (ModelArgsQwen36)
@@ -301,13 +301,13 @@ step 19 delta 0.00 MB      total 24508.97 MB
 
 模型配置文件：
 
-/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/config.json
+/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/config.json
 
-/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model.safetensors.index.json
+/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model.safetensors.index.json
 
 Huggingface对此模型的官方算子：
 
-/public/home/dinggy/yiny/projects/TileRT/docs/modeling_qwen3_5_moe.py
+/public/home/panyq/yiny/projects/TileRT/docs/modeling_qwen3_5_moe.py
 
 ### 关键结论
 

@@ -16,7 +16,7 @@ logging.basicConfig(
 def main():
     torch.set_num_threads(64)
 
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    weights_dir = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
     if not os.path.isdir(weights_dir):
         raise FileNotFoundError(f"Weights directory not found: {weights_dir}")
 

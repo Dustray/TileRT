@@ -9,7 +9,7 @@ logging.basicConfig(
     format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
 )
 
-path = '/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model-00002-of-00026.safetensors'
+path = '/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model-00002-of-00026.safetensors'
 weights = load_file(path, device='cpu')
 keys = [
     'model.language_model.layers.0.mlp.experts.down_proj',

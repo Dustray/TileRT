@@ -5,7 +5,7 @@ import torch.autograd.profiler as profiler
  
 def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
-    model_path = '/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master'
+    model_path = '/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master'
 
     print('Loading tokenizer...')
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)

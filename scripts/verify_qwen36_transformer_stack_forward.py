@@ -5,8 +5,8 @@ embed -> 40 层异构 TransformerStack -> final RMSNorm -> lm_head，
 用 greedy decode 输出可读的生成文本，以验证 golden_forward 端到端可用。
 
 执行：
-    cd /public/home/dinggy/yiny/projects/TileRT
-    PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_transformer_stack_forward.py
+    cd /public/home/panyq/yiny/projects/TileRT
+    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_transformer_stack_forward.py
 """
 import json
 import logging
@@ -27,7 +27,7 @@ logging.basicConfig(
     format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
 )
 
-MODEL_DIR = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+MODEL_DIR = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 PROMPT = "How many r's are in the word strawberry? Think step by step."
 MAX_NEW_TOKENS = 20
 DEVICE_ID = 0

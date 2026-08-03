@@ -5,8 +5,8 @@
 2. 无 import 级语法错误。
 
 执行：
-    cd /public/home/dinggy/yiny/projects/TileRT
-    PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_ast_syntax.py
+    cd /public/home/panyq/yiny/projects/TileRT
+    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_ast_syntax.py
 """
 import ast
 import logging
@@ -22,7 +22,7 @@ logging.basicConfig(
 
 
 def main():
-    root = "/public/home/dinggy/yiny/projects/TileRT/tilert/models/qwen3_6"
+    root = "/public/home/panyq/yiny/projects/TileRT/tilert/models/qwen3_6"
     failed = []
     passed = []
     for dirpath, _dirnames, filenames in os.walk(root):

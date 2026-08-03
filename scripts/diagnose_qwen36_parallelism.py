@@ -29,7 +29,7 @@ from tilert import logger
 def main():
     torch.set_num_threads(64)
     use_random_weights = True  # Random is faster to load and shows the same path.
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    weights_dir = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 
     from tilert.models.qwen3_6.model_args import ModelArgsQwen36
     from tilert.models.qwen3_6.generator import Qwen36Generator

@@ -11,8 +11,8 @@
 - 若未执行 weight conversion，请先运行 weight_converter.py 生成 TileRT weights。
 
 执行：
-    cd /public/home/dinggy/yiny/projects/TileRT
-    PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_real_weights_forward.py
+    cd /public/home/panyq/yiny/projects/TileRT
+    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_real_weights_forward.py
 """
 import logging
 import os
@@ -31,7 +31,7 @@ logging.basicConfig(
 def main():
     torch.set_num_threads(64)
 
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
+    weights_dir = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
     if not os.path.isdir(weights_dir):
         raise FileNotFoundError(f"Weights directory not found: {weights_dir}")
     index_file = os.path.join(weights_dir, "model.safetensors.index.json")

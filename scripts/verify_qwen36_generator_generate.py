@@ -10,8 +10,8 @@
 - 若 tokenizer 不存在，可用 prompt_tokens 参数绕过 tokenization。
 
 执行：
-    cd /public/home/dinggy/yiny/projects/TileRT
-    PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_generate.py
+    cd /public/home/panyq/yiny/projects/TileRT
+    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_generate.py
 """
 import logging
 import os
@@ -32,8 +32,8 @@ def main():
 
     # The converted TileRT checkpoint currently does not include tokenizer files.
     # Fall back to the original HF model directory for tokenizer only.
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
-    tokenizer_dir = weights_dir#"/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    weights_dir = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B--TileRT/snapshots/master"
+    tokenizer_dir = weights_dir#"/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
     # Verify tokenizer files are present in the original model directory.
     for tok_file in ("tokenizer_config.json", "tokenizer.json", "vocab.json"):
         if os.path.isfile(os.path.join(tokenizer_dir, tok_file)):

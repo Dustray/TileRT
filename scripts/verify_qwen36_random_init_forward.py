@@ -7,8 +7,8 @@
 4. 采样得到的 next token 为合法 int。
 
 执行：
-    cd /public/home/dinggy/yiny/projects/TileRT
-    PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_random_init_forward.py
+    cd /public/home/panyq/yiny/projects/TileRT
+    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_random_init_forward.py
 """
 import logging
 import sys

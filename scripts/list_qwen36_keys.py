@@ -8,7 +8,7 @@ logging.basicConfig(
     format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
 )
 
-with open('/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model.safetensors.index.json') as f:
+with open('/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model.safetensors.index.json') as f:
     wm = json.load(f)['weight_map']
 keys = [k for k in wm if 'layers.0.mlp.experts' in k]
 for k in keys:

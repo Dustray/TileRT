@@ -11,10 +11,10 @@ logging.basicConfig(
     format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
 )
 
-idx_path = '/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model.safetensors.index.json'
+idx_path = '/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/model.safetensors.index.json'
 with open(idx_path) as f:
     wm = json.load(f)['weight_map']
-base = '/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/'
+base = '/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master/'
 keys = ['model.language_model.layers.0.mlp.experts.gate_up_proj']
 files = set(wm[k] for k in keys)
 weights = {}

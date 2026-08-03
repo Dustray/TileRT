@@ -8,7 +8,7 @@
 
 ```bash
 export LD_LIBRARY_PATH=/opt/dtk-26.04/lib:/opt/dtk-26.04/hip/lib:/opt/dtk-26.04/.hyhal/rocm_smi/lib
-export PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT:$PYTHONPATH
+export PYTHONPATH=/public/home/panyq/yiny/projects/TileRT:$PYTHONPATH
 ```
 
 ## 0. 背景术语说明
@@ -87,7 +87,7 @@ export PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT:$PYTHONPATH
 
 **不再修复/使用 HF → TileRT 权重转换脚本，直接基于原始 HuggingFace checkpoint 跑通 golden/reference forward。**
 
-- 源模型路径：`/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
+- 源模型路径：`/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
 - 原始 checkpoint key 前缀为 `model.language_model.*`（文本部分）
 - `QwenShowHandsLayer` 需要新增从原始 HF checkpoint 直接加载 reference weights 的能力：
   1. 读取 `model.safetensors.index.json`，按 layer 加载所需 safetensors shard。
@@ -993,7 +993,7 @@ for layer_idx, layer_type in enumerate(self.layer_types):
 
 用户要求**不再运行 HF → TileRT 权重转换**，直接拿原始 HuggingFace checkpoint 跑 golden forward，并通过 `scripts/verify_qwen36_generator_official_prompt.py`。
 
-- 源路径：`/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
+- 源路径：`/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master`
 - 原始 checkpoint 使用 `model.safetensors.index.json`，26 个 shard，总大小约 71.9 GB，文本权重 key 前缀为 `model.language_model.*`。
 - 需要让 `QwenShowHandsLayer.from_pretrained()` 检测 HF-source checkpoint，并直接调用各 op 的 `init_reference_weights()`。
 

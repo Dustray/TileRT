@@ -11,8 +11,8 @@
   ``weights_dir`` 指向转换后的 TileRT checkpoint 目录。
 
 执行：
-    cd /public/home/dinggy/yiny/projects/TileRT
-    PYTHONPATH=/public/home/dinggy/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_official_prompt.py
+    cd /public/home/panyq/yiny/projects/TileRT
+    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_official_prompt.py
 """
 import logging
 import os
@@ -34,7 +34,7 @@ def main():
     torch.set_num_threads(64)
 
     use_random_weights = False
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    weights_dir = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 
     # Sanity check for tokenizer files (copied by weight_converter now).
     required_tok_files = ("tokenizer_config.json", "tokenizer.json", "vocab.json")

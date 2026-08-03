@@ -20,7 +20,7 @@ logging.basicConfig(
     format="%(name)s:%(lineno)d [%(levelname)s]: %(message)s",
 )
 
-MODEL_DIR = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+MODEL_DIR = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 PROMPT = "How many r's are in the word strawberry? Think step by step."
 
 # Recorded HF first-token logits (transformers 5.5.0, bf16, sdpa).

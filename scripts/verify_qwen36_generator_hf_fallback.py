@@ -29,7 +29,7 @@ os.environ["TILERT_QWEN36_FORWARD_MAX_SEQ_LEN"] = "1"
 def main():
     torch.set_num_threads(64)
 
-    weights_dir = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    weights_dir = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 
     logger.info("[1/3] Importing Qwen36Generator...")
     from tilert.models.qwen3_6.model_args import ModelArgsQwen36

@@ -17,8 +17,8 @@ def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     torch.set_num_threads(64)
 
-    model_path = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
-    sys.path.insert(0, "/public/home/dinggy/yiny/projects/TileRT")
+    model_path = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+    sys.path.insert(0, "/public/home/panyq/yiny/projects/TileRT")
 
     from tilert.models.qwen3_6.model_args import ModelArgsQwen36
     from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack

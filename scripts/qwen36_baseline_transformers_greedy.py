@@ -11,7 +11,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_DIR = "/public/home/dinggy/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
+MODEL_DIR = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.6-35B-A3B/snapshots/master"
 MAX_NEW_TOKENS = 20
 PROMPT = (
     "Tell me three jokes:\\n\\n"
