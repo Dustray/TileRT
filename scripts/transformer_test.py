@@ -42,7 +42,7 @@ def main():
     print('HF output:', tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 
-with torch.autograd.profiler.profile(enabled=True, use_device="cuda", record_shapes=False, profile_memory=False) as prof:
+with torch.autograd.profiler.profile(enabled=False, use_device="cuda", record_shapes=False, profile_memory=False) as prof:
     main()
 print(prof.table())
 prof.export_chrome_trace('./resnet_profile.json')

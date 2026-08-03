@@ -16,6 +16,16 @@
                 "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"
             },
             "justMyCode": true
+        },{
+            "name": "Python 调试程序: transformers",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/transformer_test.py",
+            "console": "integratedTerminal",
+            "env": {
+                "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"
+            },
+            "justMyCode": false
         },
         {
             "name": "Python 调试程序: 当前文件",
