@@ -171,7 +171,7 @@ class EHProjAllReduce(TileRTModule):
         Returns:
             Tuple of weights.
         """
-        logger.info(f"[device_sharding] key_prefix: {key_prefix}, num_devices: {self.num_devices}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key_prefix: {key_prefix}，num_devices: {self.num_devices}")
         
         eh_proj_key = "eh_proj.weight"
         if key_prefix is not None:
@@ -187,7 +187,7 @@ class EHProjAllReduce(TileRTModule):
         eh_proj_weight = eh_proj_weight.transpose(0, 1)
         
         # Log sharding details
-        logger.info(f"[device_sharding] key: {eh_proj_key}, original shape: {original_eh_proj_shape}, sharded shape: {eh_proj_weight.shape}, dtype: {eh_proj_weight.dtype}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key: {eh_proj_key}，原始形状: {original_eh_proj_shape}，分片形状: {eh_proj_weight.shape}，数据类型: {eh_proj_weight.dtype}")
         
         return (eh_proj_weight.contiguous(),)
 
@@ -204,7 +204,7 @@ class EHProjAllReduce(TileRTModule):
             state_dict: State dictionary.
             device_id: Device ID.
         """
-        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
+        logger.debug(f"[dev={device_id}] {self.op_name}: 在设备上初始化参考权重 {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         eh_proj_weight = sharded_list[0][device_id]
@@ -218,7 +218,7 @@ class EHProjAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary.
         """
-        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
+        logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化TileRT权重 {self.device_id}")
         assert self.algorithm is not None
         (self.tilert_proj,) = EHProjAllReduceWeightsConverter(
             self.model_args, self.num_devices
@@ -244,7 +244,7 @@ class EHProjAllReduce(TileRTModule):
         """Initialize the random weights."""
         if device_id is None:
             device_id = self.device_id
-        logger.debug(f"{self.op_name}: init_random_weights on device {device_id}")
+        logger.debug(f"[dev={device_id}] {self.op_name}: 初始化随机权重，设备为 {device_id}")
         proj_weights = torch.randn(
             self.dim, self.dim * 2, dtype=torch.bfloat16, device=f"cuda:{device_id}"
         )
@@ -277,21 +277,21 @@ class EHProjAllReduce(TileRTModule):
         Returns:
             Output tensor.
         """
-        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in_enorm.shape={vec_in_enorm.shape}, vec_in_hnorm.shape={vec_in_hnorm.shape}, device_id={device_id}")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.golden_forward_{self.device_id}] 入口: vec_in_enorm.shape={vec_in_enorm.shape}，vec_in_hnorm.shape={vec_in_hnorm.shape}，device_id={device_id}")
         
         assert self.ref_proj is not None
         bsz = vec_in_enorm.shape[0]
         assert bsz == 1
 
-        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] Concatenating vec_in_enorm and vec_in_hnorm")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.golden_forward_{self.device_id}] 拼接 vec_in_enorm 和 vec_in_hnorm")
         vec_in_concat = torch.cat([vec_in_enorm, vec_in_hnorm], dim=-1)
         dim_per_device = (self.dim * 2) // self.num_devices
-        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] Slicing: dim_per_device={dim_per_device}, start={dim_per_device * device_id}")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.golden_forward_{self.device_id}] 切片: dim_per_device={dim_per_device}，start={dim_per_device * device_id}")
         vec_in_slice = vec_in_concat[
             ..., dim_per_device * device_id : dim_per_device * device_id + dim_per_device
         ]
         result = vec_in_slice @ self.ref_proj.T
-        logger.info(f"[EHProjAllReduceOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.golden_forward_{self.device_id}] 出口: result.shape={result.shape}")
         
         return result
 
@@ -301,10 +301,10 @@ class EHProjAllReduce(TileRTModule):
         vec_in_hnorm: torch.Tensor,
         flag: int,
     ) -> torch.Tensor:
-        logger.info(f"[EHProjAllReduceOp.tilert_forward_{self.device_id}] ENTRY: vec_in_enorm.shape={vec_in_enorm.shape}, vec_in_hnorm.shape={vec_in_hnorm.shape}, flag={flag}")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.tilert_forward_{self.device_id}] 入口: vec_in_enorm.shape={vec_in_enorm.shape}，vec_in_hnorm.shape={vec_in_hnorm.shape}，flag={flag}")
         
         assert self.hidden_out is not None
-        logger.info(f"[EHProjAllReduceOp.tilert_forward_{self.device_id}] Calling CUDA kernel eh_proj_allreduce")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.tilert_forward_{self.device_id}] 调用CUDA内核 eh_proj_allreduce")
         eh_proj_allreduce(
             vec_in_enorm,
             vec_in_hnorm,
@@ -314,6 +314,6 @@ class EHProjAllReduce(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
-        logger.info(f"[EHProjAllReduceOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.tilert_forward_{self.device_id}] 出口: hidden_out.shape={self.hidden_out.shape}")
         
         return self.hidden_out

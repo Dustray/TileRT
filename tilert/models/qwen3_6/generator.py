@@ -1,37 +1,24 @@
 """Qwen3.6-35B-A3B generator module."""
-
 import math
 import time
-
 import torch
 from transformers import AutoTokenizer
-
 from tilert import logger
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
-from tilert.models.qwen3_6.modules.end2end import (
-    QwenShowHandsLayer,
-    _extract_ffn_ops,
-    _get_moe_weight_keys,
-)
+from tilert.models.qwen3_6.modules.end2end import QwenShowHandsLayer, _extract_ffn_ops, _get_moe_weight_keys
 from tilert.models.qwen3_6.temp_var_indices import Idx
 from tilert.tilert_init import tilert_init
-
-__all__ = [
-    "Qwen36Generator",
-    "stats_time",
-]
-
+__all__ = ['Qwen36Generator', 'stats_time']
 
 def stats_time(time_list: list[float], title: str) -> None:
     """Print timing statistics."""
     if len(time_list) > 0:
         avg_time = sum(time_list) / len(time_list)
-        std_dev = math.sqrt(sum((x - avg_time) ** 2 for x in time_list) / len(time_list))
-        logger.info(title)
-        logger.info(f"--Average time taken to generate token: {avg_time * 1000:.4f} ms")
-        logger.info(f"--Standard deviation of time: {std_dev * 1000:.4f} ms")
-        logger.info(f"--Effective tokens per second: {1 / avg_time:.4f}")
-
+        std_dev = math.sqrt(sum(((x - avg_time) ** 2 for x in time_list)) / len(time_list))
+        logger.info(f'[GENERATOR] {title}')
+        logger.info(f'[GENERATOR] -- 平均生成单个 token 耗时: {avg_time * 1000:.4f} ms')
+        logger.info(f'[GENERATOR] -- 耗时标准差: {std_dev * 1000:.4f} ms')
+        logger.info(f'[GENERATOR] -- 等效吞吐: {1 / avg_time:.4f} tokens/s')
 
 class Qwen36Generator:
     """Generator for Qwen3.6-35B-A3B.
@@ -42,20 +29,7 @@ class Qwen36Generator:
     tests and architecture alignment.
     """
 
-    def __init__(
-        self,
-        model_args: ModelArgsQwen36,
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        model_weights_dir: str = "",
-        with_mtp: bool = False,
-        use_topp: bool = False,
-        top_p: float = 0.9,
-        top_k: int = 256,
-        sampling_seed: int = 42,
-        enable_thinking: bool = False,
-        tokenizer_dir: str | None = None,
-    ):
+    def __init__(self, model_args: ModelArgsQwen36, max_new_tokens: int=100, temperature: float=1.0, model_weights_dir: str='', with_mtp: bool=False, use_topp: bool=False, top_p: float=0.9, top_k: int=256, sampling_seed: int=42, enable_thinking: bool=False, tokenizer_dir: str | None=None):
         """Initialize the Qwen36Generator.
 
         Args:
@@ -76,7 +50,6 @@ class Qwen36Generator:
         torch.set_num_threads(64)
         self.model_weights_dir = model_weights_dir
         self.tokenizer_dir = tokenizer_dir if tokenizer_dir is not None else model_weights_dir
-
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.with_mtp = with_mtp
@@ -85,59 +58,38 @@ class Qwen36Generator:
         self.top_k = top_k
         self.sampling_seed = sampling_seed
         self.enable_thinking = enable_thinking
-
         self.config = model_args
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.tokenizer_dir, trust_remote_code=True
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir, trust_remote_code=True)
         self.eos_id = self.tokenizer.eos_token_id
         self.batch_size = 1
-
-        self.default_device = torch.device("cuda:0")
-
-        logger.info(
-            f"Constructing QwenShowHandsLayer: model_path={self.model_weights_dir}, "
-            f"with_mtp={with_mtp}, num_devices inferred from cuda count"
-        )
-        self.decode_layer = QwenShowHandsLayer(
-            model_args=self.config,
-            model_path=self.model_weights_dir,
-            with_mtp=with_mtp,
-            use_topp=use_topp,
-            top_p=top_p,
-            top_k=top_k,
-        )
-
+        self.default_device = torch.device('cuda:0')
+        logger.info(f'[GENERATOR] 构造 QwenShowHandsLayer: model_path={self.model_weights_dir}, with_mtp={with_mtp}, 设备数由 cuda 可见数量决定')
+        self.decode_layer = QwenShowHandsLayer(model_args=self.config, model_path=self.model_weights_dir, with_mtp=with_mtp, use_topp=use_topp, top_p=top_p, top_k=top_k)
         self.mtp_seq_len = 4 if with_mtp else 1
-
-        logger.info(
-            f"Qwen36Generator initialized: max_new_tokens={max_new_tokens}, "
-            f"temperature={temperature}, with_mtp={with_mtp}, "
-            f"tokenizer_dir={self.tokenizer_dir}"
-        )
+        logger.info(f'[GENERATOR] Qwen36Generator 初始化完成: max_new_tokens={max_new_tokens}, temperature={temperature}, with_mtp={with_mtp}, tokenizer_dir={self.tokenizer_dir}')
 
     def init(self) -> None:
         """Initialize the TileRT backend."""
         tilert_init()
-        logger.info("TileRT backend initialized for Qwen3.6")
+        logger.info('[GENERATOR] TileRT 后端已为 Qwen3.6 初始化')
 
     def cleanup(self) -> None:
         """Cleanup resources."""
         if self.decode_layer is not None:
             self.decode_layer.cleanup()
-        logger.info("Qwen36Generator cleanup completed")
+        logger.info('[GENERATOR] Qwen36Generator 清理完成')
 
     def init_random_weights(self) -> None:
         """Initialize weights randomly (for testing)."""
-        logger.info("Initializing random weights for Qwen36Generator")
+        logger.info('[GENERATOR] 正在初始化 Qwen36Generator 的随机权重')
         self.decode_layer.init_random_weights()
-        logger.info("Random weights initialization completed")
+        logger.info('[GENERATOR] 随机权重初始化完成')
 
     def from_pretrained(self) -> None:
         """Load the model weights from the given path."""
-        logger.info(f"Loading weights from: {self.model_weights_dir}")
+        logger.info(f'[GENERATOR] 开始从 {self.model_weights_dir} 加载权重')
         self.decode_layer.from_pretrained(self.model_weights_dir)
-        logger.info(f"Finished loading weights from: {self.model_weights_dir}")
+        logger.info(f'[GENERATOR] 完成从 {self.model_weights_dir} 加载权重')
 
     def extract_ffn_cache(self) -> tuple[dict[int, list], dict[int, set[str]]]:
         """Extract MOE/MLP op objects and skip keys from current loaded weights.
@@ -150,56 +102,32 @@ class Qwen36Generator:
         for device_id in range(self.decode_layer.num_devices):
             stack = self.decode_layer._stack_objects[device_id]
             if stack is None:
-                raise RuntimeError(
-                    f"Device {device_id} QwenTransformerStack not available for cache extraction"
-                )
+                raise RuntimeError(f'Device {device_id} QwenTransformerStack not available for cache extraction')
             cached_ffn_ops[device_id] = _extract_ffn_ops(stack)
             skip_keys[device_id] = _get_moe_weight_keys(stack)
-        return cached_ffn_ops, skip_keys
+        return (cached_ffn_ops, skip_keys)
 
-    def from_pretrained_with_cache(
-        self,
-        cached_ffn_ops_per_device: dict[int, list],
-        skip_keys_per_device: dict[int, set[str]],
-    ) -> None:
+    def from_pretrained_with_cache(self, cached_ffn_ops_per_device: dict[int, list], skip_keys_per_device: dict[int, set[str]]) -> None:
         """Load weights reusing cached MOE/MLP ops."""
-        logger.info(
-            f"Loading weights with cached FFN ops from: {self.model_weights_dir}"
-        )
-        self.decode_layer.from_pretrained_with_cache(
-            self.model_weights_dir, cached_ffn_ops_per_device, skip_keys_per_device
-        )
-        logger.info("Finished loading weights with cached FFN ops")
+        logger.info(f'[GENERATOR] 使用 FFN 缓存算子从 {self.model_weights_dir} 加载权重')
+        self.decode_layer.from_pretrained_with_cache(self.model_weights_dir, cached_ffn_ops_per_device, skip_keys_per_device)
+        logger.info('[GENERATOR] 完成加载带 FFN 缓存算子的权重')
 
-    def update_sampling_params(
-        self,
-        temperature: float = 1.0,
-        top_p: float = 0.95,
-        top_k: int = 256,
-        use_topp: bool = True,
-    ) -> None:
+    def update_sampling_params(self, temperature: float=1.0, top_p: float=0.95, top_k: int=256, use_topp: bool=True) -> None:
         """Update sampling parameters for the next generation."""
         self.temperature = temperature
         self.use_topp = use_topp
         self.top_p = top_p
         self.top_k = top_k
-        self.decode_layer.update_sampling_config(
-            temperature=temperature, top_p=top_p, top_k=top_k, use_topp=use_topp
-        )
+        self.decode_layer.update_sampling_config(temperature=temperature, top_p=top_p, top_k=top_k, use_topp=use_topp)
 
-    def set_cur_pos(self, cur_pos: int, with_mtp: bool | None = None) -> None:
+    def set_cur_pos(self, cur_pos: int, with_mtp: bool | None=None) -> None:
         """Set the current decode position for RoPE."""
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         self.decode_layer.set_cur_pos(cur_pos, with_mtp=active_mtp)
 
     @torch.inference_mode()
-    def generate(
-        self,
-        prompt: str,
-        print_log: bool = True,
-        with_mtp: bool | None = None,
-        prompt_tokens: list[int] | None = None,
-    ) -> tuple[str, list[float], list[int], int]:
+    def generate(self, prompt: str, print_log: bool=True, with_mtp: bool | None=None, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], list[int], int]:
         """Main function to perform single sequence generation.
 
         Args:
@@ -215,284 +143,175 @@ class Qwen36Generator:
             accepted_counts is empty for non-MTP mode.
         """
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
-        if active_mtp and not self.with_mtp:
-            raise ValueError("Cannot use MTP mode: MTP weights were not loaded")
+        if active_mtp and (not self.with_mtp):
+            raise ValueError('Cannot use MTP mode: MTP weights were not loaded')
         self.decode_layer.set_sampling_seed(self.sampling_seed, with_mtp=active_mtp)
         if active_mtp:
             return self._generate_with_mtp(prompt, print_log, prompt_tokens=prompt_tokens)
-        result, time_list, prompt_len = self._generate_without_mtp(
-            prompt, print_log, with_mtp=active_mtp, prompt_tokens=prompt_tokens
-        )
-        return result, time_list, [], prompt_len
+        (result, time_list, prompt_len) = self._generate_without_mtp(prompt, print_log, with_mtp=active_mtp, prompt_tokens=prompt_tokens)
+        return (result, time_list, [], prompt_len)
 
-    def _generate_without_mtp(
-        self,
-        prompt: str,
-        print_log: bool = True,
-        with_mtp: bool = False,
-        prompt_tokens: list[int] | None = None,
-    ) -> tuple[str, list[float], int]:
+    def _generate_without_mtp(self, prompt: str, print_log: bool=True, with_mtp: bool=False, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], int]:
         """Standard generation without MTP."""
         if prompt_tokens is None:
-            chat_output = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                thinking=self.enable_thinking,
-            )
-            # Qwen3.6 tokenizer returns a BatchEncoding / dict with
-            # 'input_ids' and 'attention_mask'; older tokenizers return a plain
-            # list. Normalize to a list of token ids.
-            if hasattr(chat_output, "input_ids"):
-                prompt_tokens = list(chat_output["input_ids"])
+            chat_output = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
+            if hasattr(chat_output, 'input_ids'):
+                prompt_tokens = list(chat_output['input_ids'])
             else:
                 prompt_tokens = list(chat_output)
-
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
-
-        logger.info(
-            f"_generate_without_mtp: prompt_len={prompt_len}, "
-            f"max_new_tokens={self.max_new_tokens}, total_len={total_len}, "
-            f"first_20_tokens={prompt_tokens[:20]}"
-        )
-
-        logger.info(f"[GENERATOR] Allocating tokens tensor: batch_size={self.batch_size}, total_len={total_len}, device={self.default_device}")
-        tokens = torch.full(
-            (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
-        )
-        logger.info(f"[GENERATOR] Filling prompt tokens into tokens tensor, prompt_len={prompt_len}")
-        tokens[0, :prompt_len] = torch.tensor(
-            prompt_tokens, dtype=torch.long, device=self.default_device
-        )
+        logger.info(f'[GENERATOR] _generate_without_mtp: prompt_len={prompt_len}, max_new_tokens={self.max_new_tokens}, total_len={total_len}, 前 20 个 token={prompt_tokens[:20]}')
+        logger.info(f'[GENERATOR] 分配 tokens 张量: batch_size={self.batch_size}, total_len={total_len}, device={self.default_device}')
+        tokens = torch.full((self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device)
+        logger.info(f'[GENERATOR] 将 prompt tokens 填入张量, prompt_len={prompt_len}')
+        tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device=self.default_device)
         prompt_mask = tokens != -1
-
         prev_pos = 0
-        logger.info(f"[GENERATOR] Initializing finished flag: device={self.default_device}")
-        finished = torch.tensor(
-            [False] * self.batch_size, dtype=torch.bool, device=self.default_device
-        )
-
+        logger.info(f'[GENERATOR] 初始化 finished 标志: device={self.default_device}')
+        finished = torch.tensor([False] * self.batch_size, dtype=torch.bool, device=self.default_device)
         time_list = []
-        logger.info(f"[GENERATOR] Starting decode loop: range(1, {total_len})")
+        logger.info(f'[GENERATOR] 启动 decode 循环: range(1, {total_len})')
         for cur_pos_val in range(1, total_len):
-            logger.info(f"[GENERATOR] === Step {cur_pos_val}/{total_len-1} ===")
-            logger.info(f"[GENERATOR] prev_pos={prev_pos}, calling decode_layer.forward(tokens[0, {prev_pos}]={tokens[0, prev_pos].item()}, with_mtp={with_mtp})")
-            
+            logger.info(f'[GENERATOR] === 第 {cur_pos_val}/{total_len - 1} 步 ===')
+            logger.info(f'[GENERATOR] prev_pos={prev_pos}, 调用 decode_layer.forward(tokens[0, {prev_pos}]={tokens[0, prev_pos].item()}, with_mtp={with_mtp})')
             start_time = time.time()
-            multi_devices_results = self.decode_layer.forward(
-                tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos
-            )
+            multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
             end_time = time.time()
             elapsed = end_time - start_time
             time_list.append(elapsed)
-            
-            logger.info(f"[GENERATOR] forward() completed in {elapsed*1000:.4f}ms, got {len(multi_devices_results)} device results")
-            
-            intermediates, *_ = multi_devices_results[0]
+            logger.info(f'[GENERATOR] forward() 耗时 {elapsed * 1000:.4f}ms, 获得 {len(multi_devices_results)} 个设备结果')
+            (intermediates, *_) = multi_devices_results[0]
             next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
-            logger.info(f"[GENERATOR] Got next_token={next_token.item()} from intermediates[Idx.TOKEN_OUT]")
-
-            logger.info(f"[GENERATOR] Checking prompt_mask at cur_pos_val={cur_pos_val}: prompt_mask[0, {cur_pos_val}]={prompt_mask[0, cur_pos_val].item()}")
-            next_token = torch.where(
-                prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token
-            )
-            logger.info(f"[GENERATOR] After prompt_mask check, next_token={next_token.item()}")
+            logger.info(f'[GENERATOR] 从 intermediates[Idx.TOKEN_OUT] 得到 next_token={next_token.item()}')
+            logger.info(f'[GENERATOR] 检查 cur_pos_val={cur_pos_val} 处的 prompt_mask: prompt_mask[0, {cur_pos_val}]={prompt_mask[0, cur_pos_val].item()}')
+            next_token = torch.where(prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token)
+            logger.info(f'[GENERATOR] prompt_mask 检查后 next_token={next_token.item()}')
             tokens[0, cur_pos_val] = next_token
             is_eos = (next_token == self.eos_id).item()
             is_generating = (~prompt_mask[0, cur_pos_val]).item()
             finished = finished | torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
-            logger.info(f"[GENERATOR] Updated tokens[{cur_pos_val}]={next_token.item()}, is_eos={is_eos}, is_generating={is_generating}")
+            logger.info(f'[GENERATOR] 更新 tokens[{cur_pos_val}]={next_token.item()}, is_eos={is_eos}, is_generating={is_generating}')
             prev_pos = cur_pos_val
             if cur_pos_val >= prompt_len:
-                decoded_tokens = self.tokenizer.decode(
-                    [next_token.item()], skip_special_tokens=True
-                )
+                decoded_tokens = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
                 if print_log:
-                    print(f"[{next_token.item()}:{decoded_tokens!r}]", end="", flush=True)
-            else:
-                if print_log:
-                    print(f"(prompt pos {cur_pos_val})", end="", flush=True)
-
+                    print(f'[{next_token.item()}:{decoded_tokens!r}]', end='', flush=True)
+            elif print_log:
+                print(f'(prompt pos {cur_pos_val})', end='', flush=True)
             if finished.all():
-                logger.info(f"[GENERATOR] All sequences finished at step {cur_pos_val}, breaking loop")
+                logger.info(f'[GENERATOR] 所有序列在第 {cur_pos_val} 步结束，跳出循环')
                 break
-            
-            # Log progress every 10 tokens
             if cur_pos_val % 10 == 0:
-                logger.info(f"[GENERATOR] Progress: {cur_pos_val}/{total_len-1} steps, finished={finished.any().item()}")
-
+                logger.info(f'[GENERATOR] 进度: {cur_pos_val}/{total_len - 1} 步, finished={finished.any().item()}')
         if print_log:
-            print("\n")
-            logger.info(f"--Number of tokens generated: {len(time_list)}")
-
-            stats_time(time_list, "==== Performance ====")
-            print("\n")
-
+            print('\n')
+            logger.info(f'[GENERATOR] -- 生成 token 总数: {len(time_list)}')
+            stats_time(time_list, '==== 性能统计 ====')
+            print('\n')
         self.decode_layer.reset_sequence()
-
         completion_tokens = []
-        for _, toks in enumerate(tokens.tolist()):
-            toks = toks[prompt_len : prompt_len + self.max_new_tokens]
+        for (_, toks) in enumerate(tokens.tolist()):
+            toks = toks[prompt_len:prompt_len + self.max_new_tokens]
             if self.eos_id in toks:
-                toks = toks[: toks.index(self.eos_id)]
+                toks = toks[:toks.index(self.eos_id)]
             completion_tokens.append(toks)
-
         decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
+        return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', time_list, prompt_len)
 
-        return f"{decoded_tokens[0]}\n" if decoded_tokens else "", time_list, prompt_len
-
-    def _generate_with_mtp(
-        self,
-        prompt: str,
-        print_log: bool = True,
-        prompt_tokens: list[int] | None = None,
-    ) -> tuple[str, list[float], list[int], int]:
+    def _generate_with_mtp(self, prompt: str, print_log: bool=True, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], list[int], int]:
         """Generation with MTP (Multi-Token Prediction) speculative decoding."""
         if prompt_tokens is None:
-            prompt_tokens = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                thinking=self.enable_thinking,
-            )
-
+            prompt_tokens = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
-
-        tokens = torch.full(
-            (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
-        )
-        tokens[0, :prompt_len] = torch.tensor(
-            prompt_tokens, dtype=torch.long, device=self.default_device
-        )
-
+        tokens = torch.full((self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device)
+        tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device=self.default_device)
         prefill_time_list = []
         decode_time_list = []
         decode_accepted_counts = []
         cur_pos = 0
-
         while cur_pos < prompt_len - 1:
             draft_end = min(cur_pos + self.mtp_seq_len, prompt_len)
             draft_tokens = tokens[0, cur_pos:draft_end].clone()
             actual_token_count = draft_tokens.shape[0]
-
             if actual_token_count < self.mtp_seq_len:
                 pad_token = draft_tokens[-1].item()
-                padding = torch.full(
-                    (self.mtp_seq_len - actual_token_count,),
-                    pad_token,
-                    dtype=torch.long,
-                    device=self.default_device,
-                )
+                padding = torch.full((self.mtp_seq_len - actual_token_count,), pad_token, dtype=torch.long, device=self.default_device)
                 draft_tokens = torch.cat([draft_tokens, padding])
-
             draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
-
             mtp_extra_pos = cur_pos + self.mtp_seq_len
             if mtp_extra_pos < prompt_len:
                 mtp_extra_token = int(tokens[0, mtp_extra_pos].item())
             else:
                 mtp_extra_token = int(tokens[0, draft_end - 1].item())
             self.decode_layer.set_prefill_mtp_extra_token(mtp_extra_token)
-
             self.decode_layer.set_prefill_valid_tokens(actual_token_count)
-
             start_time = time.time()
             self.decode_layer.forward(draft_tokens, with_mtp=True, cur_pos=cur_pos)
             end_time = time.time()
             prefill_time_list.append(end_time - start_time)
-
             cur_pos += actual_token_count
-
         cur_pos = prompt_len - 1
         self.set_cur_pos(prompt_len - 1)
-
         self.decode_layer.set_prefill_valid_tokens(0)
-
         finished = False
-        while cur_pos < total_len - 1 and not finished:
+        while cur_pos < total_len - 1 and (not finished):
             if cur_pos == prompt_len - 1:
                 last_token = tokens[0, prompt_len - 1].item()
-                draft_tokens = torch.full(
-                    (self.mtp_seq_len,),
-                    last_token,
-                    dtype=torch.long,
-                    device=self.default_device,
-                )
+                draft_tokens = torch.full((self.mtp_seq_len,), last_token, dtype=torch.long, device=self.default_device)
                 draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
             else:
-                draft_tokens = self.decode_layer.get_next_draft_tokens(0).reshape(
-                    1, self.mtp_seq_len
-                )
-
+                draft_tokens = self.decode_layer.get_next_draft_tokens(0).reshape(1, self.mtp_seq_len)
             start_time = time.time()
             self.decode_layer.forward(draft_tokens, with_mtp=True, cur_pos=cur_pos)
             end_time = time.time()
             decode_time_list.append(end_time - start_time)
-
             num_accepted = self.decode_layer.get_num_accepted(0)
             predicted_tokens = self.decode_layer.get_predicted_tokens(0).flatten()
             decode_accepted_counts.append(num_accepted)
-
             num_output_tokens = num_accepted
             for i in range(num_output_tokens):
                 if cur_pos + 1 + i >= total_len:
                     break
                 new_token = int(predicted_tokens[i].item())
                 tokens[0, cur_pos + 1 + i] = new_token
-
                 if cur_pos + 1 + i >= prompt_len and print_log:
                     decoded_text = self.tokenizer.decode([new_token], skip_special_tokens=True)
-                    print(decoded_text, end="", flush=True)
-
+                    print(decoded_text, end='', flush=True)
                 if new_token == self.eos_id:
                     finished = True
                     break
-
             cur_pos += num_accepted
-
         if print_log:
-            print("\n")
+            print('\n')
             total_tokens = sum(decode_accepted_counts)
-            logger.info(f"--Number of forward calls (decode): {len(decode_accepted_counts)}")
-            logger.info(f"--Total tokens generated: {total_tokens}")
+            logger.info(f'[GENERATOR] -- decode 前向调用次数: {len(decode_accepted_counts)}')
+            logger.info(f'[GENERATOR] -- 生成 token 总数: {total_tokens}')
             if len(decode_accepted_counts) > 0:
                 avg_accepted = sum(decode_accepted_counts) / len(decode_accepted_counts)
                 min_accepted = min(decode_accepted_counts)
                 max_accepted = max(decode_accepted_counts)
-                logger.info(
-                    f"--Accepted tokens per call: mean={avg_accepted:.2f}, "
-                    f"min={min_accepted}, max={max_accepted}"
-                )
-
+                logger.info(f'[GENERATOR] -- 每次调用接受 token 数: 均值={avg_accepted:.2f}, 最小={min_accepted}, 最大={max_accepted}')
             if decode_time_list:
                 total_decode_time = sum(decode_time_list)
                 effective_tps = total_tokens / total_decode_time if total_decode_time > 0 else 0
                 avg_time_ms = total_decode_time / len(decode_time_list) * 1000
-                logger.info(f"--Avg forward time: {avg_time_ms:.2f}ms")
-                logger.info(f"--Effective TPS (with MTP): {effective_tps:.2f} tokens/s")
-
-            print("\n")
-
+                logger.info(f'[GENERATOR] -- 平均前向耗时: {avg_time_ms:.2f}ms')
+                logger.info(f'[GENERATOR] -- MTP 等效吞吐: {effective_tps:.2f} tokens/s')
+            print('\n')
         self.decode_layer.reset_sequence()
-
         completion_tokens = []
-        for _, toks in enumerate(tokens.tolist()):
-            toks = toks[prompt_len : prompt_len + self.max_new_tokens]
+        for (_, toks) in enumerate(tokens.tolist()):
+            toks = toks[prompt_len:prompt_len + self.max_new_tokens]
             toks = [t for t in toks if t != -1]
             if self.eos_id in toks:
-                toks = toks[: toks.index(self.eos_id)]
+                toks = toks[:toks.index(self.eos_id)]
             completion_tokens.append(toks)
-
         decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
-
-        return (
-            f"{decoded_tokens[0]}\n" if decoded_tokens else "",
-            decode_time_list,
-            decode_accepted_counts,
-            prompt_len,
-        )
+        return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', decode_time_list, decode_accepted_counts, prompt_len)
 
     def generate_streaming(self, prompt: str):
         """Generate text with streaming output.
@@ -500,6 +319,6 @@ class Qwen36Generator:
         Note: Streaming generation is not yet supported.  This method yields
         the final output once generation completes.
         """
-        logger.warning("generate_streaming: Qwen3.6 streaming not yet implemented")
-        result, *_ = self.generate(prompt)
+        logger.warning('[GENERATOR] generate_streaming: Qwen3.6 流式生成尚未实现')
+        (result, *_) = self.generate(prompt)
         yield result

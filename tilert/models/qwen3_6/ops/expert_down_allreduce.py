@@ -554,7 +554,7 @@ class ExpertDownAllReduce(TileRTModule):
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
         
-        logger.info(f"[device_sharding] key_prefix: {key_prefix}, num_devices: {self.num_devices}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key_prefix: {key_prefix}，num_devices: {self.num_devices}")
         
         assert self.n_shared_experts == 1, "Only one shared expert is supported"
         down_weights_list = []
@@ -582,8 +582,8 @@ class ExpertDownAllReduce(TileRTModule):
         down_scales = torch.cat(down_scales_list, dim=0)
         
         # Log sharding details
-        logger.info(f"[device_sharding] key: {key_prefix}.shared_expert.down_proj + {key_prefix}.experts.down_proj, original shapes: {original_down_weights_shape}, {down_weights_list[1].shape}, sharded down_weights shape: {down_weights.shape}, dtype: {down_weights.dtype}")
-        logger.info(f"[device_sharding] key: down_scales, original shapes: {original_down_scales_shape}, {down_scales_list[1].shape}, sharded down_scales shape: {down_scales.shape}, dtype: {down_scales.dtype}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key: {key_prefix}.shared_expert.down_proj + {key_prefix}.experts.down_proj，原始形状: {original_down_weights_shape}，{down_weights_list[1].shape}，分片 down_weights 形状: {down_weights.shape}，数据类型: {down_weights.dtype}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key: down_scales，原始形状: {original_down_scales_shape}，{down_scales_list[1].shape}，分片 down_scales 形状: {down_scales.shape}，数据类型: {down_scales.dtype}")
         
         return down_weights.contiguous(), down_scales.contiguous()
 
@@ -607,7 +607,7 @@ class ExpertDownAllReduce(TileRTModule):
         key_prefix: str | None = None,
         device_id: int = 0,
     ) -> None:
-        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
+        logger.debug(f"[dev={device_id}] {self.op_name}: 在设备上初始化参考权重 {device_id}")
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
 
@@ -656,7 +656,7 @@ class ExpertDownAllReduce(TileRTModule):
         return list(self.tilert_weights_alias())
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
+        logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化TileRT权重 {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         weights_list = [state_dict[alias] for alias in self.tensor_alias]
 
@@ -688,7 +688,7 @@ class ExpertDownAllReduce(TileRTModule):
             device_id = self.device_id
         if device_id is None:
             device_id = 0
-        logger.debug(f"{self.op_name}: init_random_weights on cuda:{device_id}")
+        logger.debug(f"[dev={device_id}] {self.op_name}: 初始化随机权重，设备为 cuda:{device_id}")
         dev = f"cuda:{device_id}"
         # TP8: generate *full* down weights; ``process_down_weights`` will
         # perform the TP8 split along the intermediate dimension.
@@ -753,7 +753,7 @@ class ExpertDownAllReduce(TileRTModule):
         scores: torch.Tensor,
         x_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logger.info(f"[ExpertDownAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}, indices.shape={indices.shape}, scores.shape={scores.shape}")
+        logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}，indices.shape={indices.shape}，scores.shape={scores.shape}")
         
         assert self.ref_down is not None
         assert vec_in.dim() == 4 and vec_in.size(0) == 1
@@ -763,18 +763,18 @@ class ExpertDownAllReduce(TileRTModule):
         if indices.ndim == 2:
             indices = indices.unsqueeze(0)
             scores = scores.unsqueeze(0)
-            logger.info(f"[ExpertDownAllReduceOp.golden_forward_{self.device_id}] Promoted indices/scores from 2D to 3D")
+            logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 将 indices/scores 从二维提升为三维")
         # TP8: reference weights contain every expert but only the local
         # inter_dim shard, so global expert indices index directly into ref_down
         # (the shared expert lives at index 0).
         local_indices = indices
         seq_len = vec_in.shape[1]
-        logger.info(f"[ExpertDownAllReduceOp.golden_forward_{self.device_id}] Processing {seq_len} tokens, n_activated_experts={self.n_activated_experts}")
+        logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 正在处理 {seq_len} 个 token，n_activated_experts={self.n_activated_experts}")
         
         hidden_out_list = []
         for s in range(seq_len):
             hidden_out_w2_list = []
-            logger.debug(f"[ExpertDownAllReduceOp.golden_forward_{self.device_id}] Token {s}: computing shared expert")
+            logger.debug(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] Token {s}: 计算共享专家")
             hidden_out_w2_shared = vec_in[0, s, 0].float() @ self.ref_down[0].float().mT
             # Apply the shared-expert gate in the same place as the HF model:
             # after the shared expert down-projection and before adding the
@@ -784,7 +784,7 @@ class ExpertDownAllReduce(TileRTModule):
                     x_in[0, s].float() @ self.ref_shared_expert_gate.float().mT
                 )
                 hidden_out_w2_shared = hidden_out_w2_shared * shared_gate.squeeze(-1)
-                logger.debug(f"[ExpertDownAllReduceOp.golden_forward_{self.device_id}] Token {s}: applied shared gate")
+                logger.debug(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] Token {s}: 已应用共享门控")
             hidden_out_w2_list.append(hidden_out_w2_shared)
             ref_down_sel = self.ref_down[1:][local_indices[0, s]]
             for i in range(self.n_activated_experts):
@@ -796,7 +796,7 @@ class ExpertDownAllReduce(TileRTModule):
             hidden_out_list.append(hidden_out_w2)
         hidden_out = torch.stack(hidden_out_list, dim=0)
         result = hidden_out[None, ...]
-        logger.info(f"[ExpertDownAllReduceOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 出口: result.shape={result.shape}")
         
         return result
 
@@ -808,10 +808,10 @@ class ExpertDownAllReduce(TileRTModule):
         x_in: torch.Tensor,
         flag: int,
     ) -> torch.Tensor:
-        logger.info(f"[ExpertDownAllReduceOp.tilert_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}, indices.shape={indices.shape}, scores.shape={scores.shape}, flag={flag}")
+        logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.tilert_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}，indices.shape={indices.shape}，scores.shape={scores.shape}，flag={flag}")
         
         assert self.hidden_out is not None
-        logger.info(f"[ExpertDownAllReduceOp.tilert_forward_{self.device_id}] Calling CUDA kernel expert_down_allreduce")
+        logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.tilert_forward_{self.device_id}] 调用CUDA内核 expert_down_allreduce")
         expert_down_allreduce(
             vec_in,
             self.tilert_weights,
@@ -825,7 +825,7 @@ class ExpertDownAllReduce(TileRTModule):
             self.model_arch,
             self.compute_kernel_type,
         )
-        logger.info(f"[ExpertDownAllReduceOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.tilert_forward_{self.device_id}] 出口: hidden_out.shape={self.hidden_out.shape}")
         
         return self.hidden_out
 

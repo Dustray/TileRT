@@ -176,7 +176,7 @@ class DownAllReduce(TileRTModule):
         Returns:
             Tuple of weights.
         """
-        logger.info(f"[device_sharding] key_prefix: {key_prefix}, num_devices: {self.num_devices}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key_prefix: {key_prefix}，num_devices: {self.num_devices}")
         
         down_proj_weight_key = f"{key_prefix}.down_proj.weight"
         down_proj_scale_key = f"{key_prefix}.down_proj.weight_scale_inv"
@@ -217,8 +217,8 @@ class DownAllReduce(TileRTModule):
         down_scales = torch.stack(down_proj_scale_splited, dim=0)
         
         # Log sharding details
-        logger.info(f"[device_sharding] key: {down_proj_weight_key}, original shape: {original_down_weight_shape}, sharded shape: {down_weights.shape}, dtype: {down_weights.dtype}")
-        logger.info(f"[device_sharding] key: {down_proj_scale_key}, original shape: {original_down_scale_shape}, sharded shape: {down_scales.shape}, dtype: {down_scales.dtype}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key: {down_proj_weight_key}，原始形状: {original_down_weight_shape}，分片形状: {down_weights.shape}，数据类型: {down_weights.dtype}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] key: {down_proj_scale_key}，原始形状: {original_down_scale_shape}，分片形状: {down_scales.shape}，数据类型: {down_scales.dtype}")
         
         return down_weights.contiguous(), down_scales.contiguous()
 
@@ -235,7 +235,7 @@ class DownAllReduce(TileRTModule):
             state_dict: State dictionary.
             device_id: Device ID.
         """
-        logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
+        logger.debug(f"[dev={device_id}] {self.op_name}: 在设备上初始化参考权重 {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         down_weights = sharded_list[0][device_id]
@@ -254,7 +254,7 @@ class DownAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary.
         """
-        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
+        logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化TileRT权重 {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
         self.tilert_weights, self.tilert_scales = DownAllReduceWeightsConverter(
             self.model_args, self.num_devices
@@ -280,7 +280,7 @@ class DownAllReduce(TileRTModule):
         """Initialize the random weights."""
         if device_id is None:
             device_id = self.device_id
-        logger.debug(f"{self.op_name}: init_random_weights on device {device_id}")
+        logger.debug(f"[dev={device_id}] {self.op_name}: 初始化随机权重，设备为 {device_id}")
         scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
         down_weights = torch.randn(
             self.dim, self.inter_dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"
@@ -318,7 +318,7 @@ class DownAllReduce(TileRTModule):
         Returns:
             Output tensor.
         """
-        logger.info(f"[DownAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}")
+        logger.info(f"[dev={self.device_id}] [DownAllReduceOp.golden_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}")
         assert self.ref_down is not None
         bsz = vec_in.shape[0]
         assert bsz == 1
@@ -333,7 +333,7 @@ class DownAllReduce(TileRTModule):
             hidden_out_w2 = torch.sum(hidden_out_w2, dim=0)
             hidden_out_list.append(hidden_out_w2)
         result = torch.stack(hidden_out_list, dim=0)[None, ...]
-        logger.info(f"[DownAllReduceOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
+        logger.info(f"[dev={self.device_id}] [DownAllReduceOp.golden_forward_{self.device_id}] 出口: result.shape={result.shape}")
         return result
 
     def tilert_forward(
@@ -342,10 +342,10 @@ class DownAllReduce(TileRTModule):
         x_in: torch.Tensor,
         flag: int,
     ) -> torch.Tensor:
-        logger.info(f"[DownAllReduceOp.tilert_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}, x_in.shape={x_in.shape}, flag={flag}")
+        logger.info(f"[dev={self.device_id}] [DownAllReduceOp.tilert_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}，x_in.shape={x_in.shape}，flag={flag}")
         
         assert self.hidden_out is not None
-        logger.info(f"[DownAllReduceOp.tilert_forward_{self.device_id}] Calling CUDA kernel down_allreduce")
+        logger.info(f"[dev={self.device_id}] [DownAllReduceOp.tilert_forward_{self.device_id}] 调用CUDA内核 down_allreduce")
         down_allreduce(
             vec_in,
             self.tilert_weights,
@@ -357,7 +357,7 @@ class DownAllReduce(TileRTModule):
             self.model_arch,
             self.compute_kernel_type,
         )
-        logger.info(f"[DownAllReduceOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
+        logger.info(f"[dev={self.device_id}] [DownAllReduceOp.tilert_forward_{self.device_id}] 出口: hidden_out.shape={self.hidden_out.shape}")
         
         return self.hidden_out
 

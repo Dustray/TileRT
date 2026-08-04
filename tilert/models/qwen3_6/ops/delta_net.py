@@ -258,7 +258,7 @@ class DeltaNetOp(TileRTModule):
         prefix = self.ref_weights_alias.key_prefix
         aliases = self.ref_weights_alias.ref_tensor_alias
         
-        logger.info(f"[device_sharding] DeltaNet, key_prefix: {prefix}, num_devices: {self.num_devices}")
+        logger.info(f"[dev={self.device_id}] [device_sharding] DeltaNet，key_prefix: {prefix}，num_devices: {self.num_devices}")
 
         result = {
             alias: torch.stack(
@@ -270,7 +270,7 @@ class DeltaNetOp(TileRTModule):
         # Log sharding details for each key
         for alias, ref_alias in zip(self.tilert_weights_alias(), aliases):
             original_shape = weights_map[ref_alias].shape
-            logger.info(f"[device_sharding] key: {ref_alias}, original shape: {original_shape}, sharded shape: {result[alias].shape}, dtype: {result[alias].dtype}")
+            logger.info(f"[dev={self.device_id}] [device_sharding] key: {ref_alias}，原始形状: {original_shape}，分片形状: {result[alias].shape}，数据类型: {result[alias].dtype}")
         
         return result
 
@@ -279,7 +279,7 @@ class DeltaNetOp(TileRTModule):
         return []
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
+        logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化参考权重 {self.device_id}")
         sharded = self.device_sharding(state_dict)
         did = self.device_id
         self.in_proj_qkv_weights = sharded[self.tilert_weights_alias.in_proj_qkv_weights][did]
@@ -294,7 +294,7 @@ class DeltaNetOp(TileRTModule):
         self.is_ref_weights_init = True
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
+        logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化TileRT权重 {self.device_id}")
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
         converter = DeltaNetWeightsConverter(self.model_args, self.num_devices)
         (
@@ -331,7 +331,7 @@ class DeltaNetOp(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
-        logger.debug(f"{self.op_name}: init_random_weights on {device}")
+        logger.debug(f"[dev={self.device_id}] {self.op_name}: 初始化随机权重，设备为 {device}")
         args = self.model_args
         # Scale random weights by 1/sqrt(fan_in) so each layer preserves the
         # input variance.  This makes the 40-layer reference forward numerically
@@ -642,7 +642,7 @@ class DeltaNetOp(TileRTModule):
         ``(bsz, conv_dim, kernel_size)`` and ``recurrent_state`` has shape
         ``(bsz, num_heads, k_head_dim, v_head_dim)``.
         """
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, has_state={state is not None}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 入口: x.shape={x.shape}，start_pos={start_pos}，has_state={state is not None}")
         
         del start_pos
         assert self.in_proj_qkv_weights is not None
@@ -659,29 +659,29 @@ class DeltaNetOp(TileRTModule):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         bsz, seq_len, dim = x.shape
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Input: bsz={bsz}, seq_len={seq_len}, dim={dim}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 输入: bsz={bsz}，seq_len={seq_len}，dim={dim}")
 
         # Unpack persistent state.
         conv_state, recurrent_state = state if state is not None else (None, None)
 
         # Projections.
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step1: QKV/Z/B/A projections")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤1: QKV/Z/B/A 投影")
         mixed_qkv = x @ self.in_proj_qkv_weights.T
         z = x @ self.in_proj_z_weights.T
         b = x @ self.in_proj_b_weights.T
         a = x @ self.in_proj_a_weights.T
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   mixed_qkv.shape={mixed_qkv.shape}, z.shape={z.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}]   mixed_qkv.shape={mixed_qkv.shape}，z.shape={z.shape}")
 
         # Causal depthwise conv1d (groups = conv_dim) with cross-step state.
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step2: Causal conv1d")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤2: 因果卷积Conv1d")
         mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, conv_dim, seq_len)
         conv_weight = self.conv1d_weights.squeeze(1)  # (conv_dim, kernel_size)
         mixed_qkv, conv_state = self._causal_conv1d_update(mixed_qkv, conv_state, conv_weight)
         mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, seq_len, conv_dim)
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   After conv1d: mixed_qkv.shape={mixed_qkv.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}]   卷积之后: mixed_qkv.shape={mixed_qkv.shape}")
 
         # Split into q/k/v.
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step3: Split Q/K/V")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤3: 分割Q/K/V")
         q, k, v = torch.split(
             mixed_qkv,
             [
@@ -691,31 +691,31 @@ class DeltaNetOp(TileRTModule):
             ],
             dim=-1,
         )
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}]   q.shape={q.shape}，k.shape={k.shape}，v.shape={v.shape}")
 
         # Decay gate g and beta.
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step4: Compute beta and g (gating)")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤4: 计算 beta 和 g (门控)")
         beta = torch.sigmoid(b)
         # A is stored as log(A); official uses -exp(A_log) * softplus(a + dt_bias).
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   beta.shape={beta.shape}, g.shape={g.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}]   beta.shape={beta.shape}，g.shape={g.shape}")
 
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step5: Gated delta attention")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤5: 门控Delta注意力")
         attn_out, recurrent_state = self._gated_delta_attention(q, k, v, beta, g, recurrent_state)
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   attn_out.shape={attn_out.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}]   attn_out.shape={attn_out.shape}")
 
         # Gated RMSNorm.
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step6: Gated RMSNorm")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤6: 门控RMSNorm")
         attn_out = attn_out.reshape(-1, self.value_head_dim)
         z_gate = z.reshape(-1, self.value_head_dim)
         attn_out = self._rmsnorm_gated(attn_out, z_gate, self.norm_weights)
         attn_out = attn_out.reshape(bsz, seq_len, -1)
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}]   After RMSNorm: attn_out.shape={attn_out.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}]   RMSNorm之后: attn_out.shape={attn_out.shape}")
 
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] Step7: Output projection")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 步骤7: 输出投影")
         out = attn_out @ self.out_proj_weights.T
         out = out.view(original_shape)
-        logger.info(f"[DeltaNetOp.golden_forward_{self.device_id}] EXIT: out.shape={out.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 出口: out.shape={out.shape}")
         
         return out, (conv_state, recurrent_state)
 
@@ -726,14 +726,14 @@ class DeltaNetOp(TileRTModule):
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Optimized forward placeholder."""
-        logger.info(f"[DeltaNetOp.tilert_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, has_state={state is not None}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.tilert_forward_{self.device_id}] 入口: x.shape={x.shape}，start_pos={start_pos}，has_state={state is not None}")
         
         assert self.is_init
         assert self.hidden_out is not None
         assert self.state_out is not None
         assert self.profile_logs is not None
         
-        logger.info(f"[DeltaNetOp.tilert_forward_{self.device_id}] Calling CUDA kernel delta_net")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.tilert_forward_{self.device_id}] 调用CUDA内核 delta_net")
         delta_net(
             x,
             state if state is not None else torch.zeros_like(self.state_out),
@@ -743,7 +743,7 @@ class DeltaNetOp(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
-        logger.info(f"[DeltaNetOp.tilert_forward_{self.device_id}] CUDA kernel returned, hidden_out.shape={self.hidden_out.shape}")
+        logger.info(f"[dev={self.device_id}] [DeltaNetOp.tilert_forward_{self.device_id}] CUDA内核已返回，hidden_out.shape={self.hidden_out.shape}")
         
         return self.hidden_out, self.state_out
 
