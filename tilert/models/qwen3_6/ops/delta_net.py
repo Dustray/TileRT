@@ -611,7 +611,7 @@ class DeltaNetOp(TileRTModule):
             (bsz, hidden_size, seq_len).
         """
         bsz, hidden_size, seq_len = hidden_states.shape
-        kernel_size = weight.shape[-1]
+        kernel_size = weight.shape[-1] - 1
         if conv_state is None:
             conv_state = torch.zeros(bsz, hidden_size, kernel_size, dtype=hidden_states.dtype, device=hidden_states.device)
         hidden_new = torch.cat([conv_state, hidden_states], dim=-1)

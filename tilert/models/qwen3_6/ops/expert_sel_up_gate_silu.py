@@ -5,13 +5,13 @@ from enum import Enum
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.common import _safe_weight_dequant
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
-
 __all__ = [
     "ExpertSelectUpGateSiLUAlgorithm",
     "ExpertSelectUpGateSiLU",
@@ -394,6 +394,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         self.route_scale = self.model_args.route_scale
         self.block_size = self.model_args.block_size
         self.algorithm = algorithm
+        self.gate_up_proj_weight : torch.Tensor | None = None
 
         self.tilert_weights_alias = (
             tilert_weights_alias
@@ -823,17 +824,18 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         ref_alias = self.ref_weights_alias
         key_prefix = ref_alias.key_prefix
 
-        bias = state_dict.get(
-            f"{key_prefix}.gate.e_score_correction_bias",
-            torch.zeros(self.n_routed_experts, dtype=torch.float32),
-        )
-        self.ref_bias = bias.to(torch.float32).to(f"cuda:{did}")
+        # bias = state_dict.get(
+        #     f"{key_prefix}.gate.e_score_correction_bias",
+        #     torch.zeros(self.n_routed_experts, dtype=torch.float32),
+        # )
+        # self.ref_bias = bias.to(torch.float32).to(f"cuda:{did}")
 
         # TP8: keep the full expert count but only the local inter_dim shard on
         # each device.  Global expert indices select directly into the local
         # full-expert table, so no modulo remapping is needed.
         local_inter_dim = self.moe_inter_dim // self.num_devices
-        gate_up_proj = state_dict[f"{key_prefix}.experts.gate_up_proj"]
+        gate_up_proj = state_dict[f"{key_prefix}.experts.gate_up_proj"] # 已经是切分完成的
+        self.gate_up_proj_weight = gate_up_proj
         shared_gate = state_dict[f"{key_prefix}.shared_expert.gate_proj.weight"]
         shared_up = state_dict[f"{key_prefix}.shared_expert.up_proj.weight"]
 
@@ -1059,25 +1061,40 @@ class ExpertSelectUpGateSiLU(TileRTModule):
 
     def golden_forward(
         self,
-        x_in: torch.Tensor,
-        scores: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h_flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        expert_indices: torch.Tensor,
+    ):
         logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, scores.shape={scores.shape}")
-        
+        moe_out = torch.zeros_like(h_flat)  # 初始化输出缓冲区
+
+        assert self.gate_up_proj_weight is not None
         assert self.ref_gate is not None
         assert self.ref_up is not None
-        bsz = x_in.shape[0]
-        seq_len = x_in.shape[1]
-        assert bsz == 1
-        
+
+        # 用于收集所有激活专家的中间结果
+        moe_intermediate = []
+
         logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Running expert selection for arch={self.arch_name}")
-        if self.arch_name == "qwen3_6":
-            weights, indices = self._ref_expert_select_qwen36(scores)
-        elif self.arch_name == "glm_5":
-            weights, indices = self._ref_expert_select_glm5(scores)
-        else:
-            raise ValueError(f"Unsupported architecture: {self.arch_name}")
+        fused_experts = True # "mlp.experts.gate_up_proj" in w and "mlp.experts.down_proj" in w 是否存在堆叠的 BF16 gate_up/down 权重
+        for e in range(256):
+            mask = (expert_indices == e)  # 选中专家 e 的掩码
+            if not mask.any():  # 无则跳过
+                continue
+            token_idx, slot_idx = mask.nonzero(as_tuple=True)  # 获取 token 和 slot 索引
+            x_e = h_flat[token_idx]  # 专家 e 的输入
+            gate_up = F.linear(x_e, self.gate_up_proj_weight[e])  # gate+up 合并投影，gate_up_proj_weight是TP8切分后的权重
+            gate_e, up_e = gate_up.chunk(2, dim=-1)  # 切成 gate 和 up
+            ffn_e = F.silu(gate_e) * up_e
+            weight_e = routing_weights[ token_idx, slot_idx ].unsqueeze(-1)
+            moe_intermediate.append( ( e, token_idx, ffn_e, weight_e ) )
+        return moe_intermediate
+
+
+   
         
+        weights= routing_weights
+        indices = expert_indices
         logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Expert selection done: indices.shape={indices.shape}, weights.shape={weights.shape}")
         
         # ``rmsnorm_expert_proj`` flattens the batch dimension, so scores can be

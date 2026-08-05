@@ -342,6 +342,12 @@ class SerializableTileRTModule(TileRTModule):
                     if self.remove_selected:
                         keys_to_remove.add(original_key)
                     continue
+
+                ref_original_key = f"ref_{prefix}{op_key}{suffix}"
+                if ref_original_key in state_dict:
+                    op_state_dict[op_key] = state_dict[ref_original_key]
+                    continue
+
                 # Special case: the GQA attention op fuses q/k/v into a single
                 # ``qkv_proj_weights`` tensor, but the converted checkpoint
                 # stores them as separate ``q_proj``, ``k_proj`` and ``v_proj``
@@ -464,7 +470,7 @@ class SerializableTileRTModule(TileRTModule):
                 ref_prefixed_key = f"ref_{prefix}{ref_key}{suffix}"
                 if ref_prefixed_key in state_dict:
                     op_state_dict[ref_key] = state_dict[ref_prefixed_key]
-            if op_state_dict:
+            if False and op_state_dict: # 暂时不需要
                 op.init_reference_weights(op_state_dict)
         logger.info(f"{type(self).__name__}.init_reference_weights completed")
 

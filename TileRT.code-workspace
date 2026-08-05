@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../../../../../../usr/local/lib/python3.10/dist-packages/transformers"
+		},
+		{
+			"path": "../lynn-engine"
 		}
 	],
 	"settings": {}

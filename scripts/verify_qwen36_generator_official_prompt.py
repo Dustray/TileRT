@@ -56,7 +56,7 @@ def main():
 
     generator = Qwen36Generator(
         model_args=model_args,
-        max_new_tokens=20,
+        max_new_tokens=5,
         temperature=1.0,
         model_weights_dir=weights_dir,
         with_mtp=False,

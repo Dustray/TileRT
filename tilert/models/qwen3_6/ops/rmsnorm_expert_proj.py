@@ -83,10 +83,12 @@ class RMSNormExpertProj(TileRTModule):
             else RMSNormExpertProjTilertWeightsAlias()
         )
 
+        self.n_activated_experts = self.model_args.n_activated_experts
         self.is_ref_weights_init = False
         self.is_tilert_weights_init = False
 
         self.ref_rmsnorm: RMSNorm | None = None
+        self.ref_gate: RMSNorm | None = None
         self.ref_proj_weight: torch.Tensor | None = None
         self.proj_weight = nn.Parameter(
             init_func(torch.empty(model_args.n_routed_experts, model_args.dim))
@@ -133,6 +135,8 @@ class RMSNormExpertProj(TileRTModule):
             gate_w = gate_w.to(f"cuda:{self.device_id}")
         self.ref_rmsnorm = RMSNorm(self.dim, self.eps)
         self.ref_rmsnorm.weight.data = rms_w
+        self.ref_gate = RMSNorm(gate_w.shape[0]*gate_w.shape[1], self.eps)
+        self.ref_gate.weight.data = gate_w
         self.ref_proj_weight = gate_w
         self.is_ref_weights_init = True
 
@@ -164,20 +168,28 @@ class RMSNormExpertProj(TileRTModule):
 
     def golden_forward(
         self, x_in: torch.Tensor, residual: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, residual={residual is not None}")
+        import torch.nn.functional as F
         
         assert self.is_ref_weights_init, "Reference weights must be initialized before forward pass"
-        assert self.ref_rmsnorm is not None and self.ref_proj_weight is not None
+        assert self.ref_gate is not None and self.ref_rmsnorm is not None and self.ref_proj_weight is not None
         
         logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Applying RMSNorm")
-        norm_x = self.ref_rmsnorm(x_in, residual)
-        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Computing scores via linear projection")
-        scores = linear(norm_x.view(-1, self.dim).float(), self.ref_proj_weight.float())
+        B, M, D = x_in.shape  # 解包输入形状
+        x_flat = x_in.view(B * M, D)  # 展平为 [total_tokens, D]
+        router_logits = F.linear(x_flat, self.ref_proj_weight)  # 计算 router logits
+        routing_weights, expert_indices = torch.topk(router_logits, self.n_activated_experts, dim=-1)  # top-K 专家和未归一化权重
+        routing_weights = F.softmax(routing_weights, dim=-1, dtype=torch.float32).to(x_in.dtype)  # softmax 归一化后转回输入 dtype
+        return x_flat, routing_weights, expert_indices
+        # moe_out = torch.zeros_like(h_flat)  # 初始化输出缓冲区
+        # norm_x = self.ref_gate(x_flat, residual)
+        # logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Computing scores via linear projection")
+        # scores = linear(norm_x.view(-1, self.dim).float(), self.ref_proj_weight.float())
         
-        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] EXIT: norm_x.shape={norm_x.shape}, scores.shape={scores.shape}")
+        # logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] EXIT: norm_x.shape={norm_x.shape}, scores.shape={scores.shape}")
         
-        return norm_x, scores
+        # return norm_x, scores
 
     def tilert_forward(self, x_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logger.info(f"[RMSNormExpertProjOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}")

@@ -60,10 +60,19 @@ class QwenDeltaNetRef(TileRTModule):
         return []
 
     def get_tilert_weights_alias(self) -> list[str]:
-        return []
+        return self.get_ref_weights_alias()
 
     def get_ref_weights_alias(self) -> list[str]:
-        return []
+        return ["input_layernorm.weight", 
+                "post_attention_layernorm.weight", 
+                "mlp.gate.weight",
+                "mlp.experts.gate_up_proj",
+                "mlp.shared_expert.gate_proj.weight",
+                "mlp.shared_expert.up_proj.weight",
+                "mlp.shared_expert_gate.weight",
+                "mlp.experts.down_proj",
+                "mlp.shared_expert.down_proj.weight"
+                ]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         del weights_map
@@ -166,13 +175,15 @@ class DeltaNet(SerializableTileRTModule):
 
         self.input_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
         self.post_attention_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
+        self.recurrent_state = None
+        self.conv_state = None
 
     def _ensure_weights(self, x: torch.Tensor) -> None:
         """Lazy initialize weights for sanity testing without a checkpoint."""
-        if self.attn.in_proj_qkv_weights is None:
-            self.attn.init_random_weights(device=str(x.device))
-        if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
-            self.ffn.init_random_weights(device=str(x.device))
+        # if self.attn.in_proj_qkv_weights is None:
+        #     self.attn.init_tilert_weights(device=str(x.device))
+        # if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
+        #     self.ffn.init_tilert_weights(device=str(x.device))
         if self.input_layernorm.weight.device != x.device:
             self.input_layernorm.to(x.device)
         if self.post_attention_layernorm.weight.device != x.device:
@@ -183,6 +194,10 @@ class DeltaNet(SerializableTileRTModule):
         logger.debug(f"{self.op_name}: loading tilert weights + layernorms")
         super().init_tilert_weights(state_dict)
         self._load_layernorm_weights(state_dict)
+        if self.attn.in_proj_qkv_weights is None:
+            self.attn.init_reference_weights(state_dict)
+        if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
+            self.ffn.init_reference_weights(state_dict)
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Load reference weights and also set the RMSNorm module weights."""
@@ -236,7 +251,8 @@ class DeltaNet(SerializableTileRTModule):
         logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step2: attention (attn.golden_forward)")
         attn_out, new_state = self.attn.golden_forward(norm_x, start_pos, prev_state)
         logger.info(f"[DeltaNet.golden_forward_{self.device_id}] attn_out: shape={attn_out.shape}, new_state type={type(new_state)}")
-        
+        self.recurrent_state = new_state[0] # 保存一下 recurrent_state
+        self.conv_state = new_state[1] # 保存一下conv_state
         h = x + attn_out
         logger.info(f"[DeltaNet.golden_forward_{self.device_id}] After residual: h.shape={h.shape}")
 

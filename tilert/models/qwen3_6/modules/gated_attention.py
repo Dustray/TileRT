@@ -63,10 +63,19 @@ class QwenAttentionRef(TileRTModule):
         return []
 
     def get_tilert_weights_alias(self) -> list[str]:
-        return []
+        return self.get_ref_weights_alias()
 
     def get_ref_weights_alias(self) -> list[str]:
-        return []
+        return ["input_layernorm.weight", 
+                "post_attention_layernorm.weight", 
+                "mlp.gate.weight",
+                "mlp.experts.gate_up_proj",
+                "mlp.shared_expert.gate_proj.weight",
+                "mlp.shared_expert.up_proj.weight",
+                "mlp.shared_expert_gate.weight",
+                "mlp.experts.down_proj",
+                "mlp.shared_expert.down_proj.weight"
+                ]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         del weights_map

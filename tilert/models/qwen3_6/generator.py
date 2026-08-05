@@ -154,7 +154,8 @@ class Qwen36Generator:
     def _generate_without_mtp(self, prompt: str, print_log: bool=True, with_mtp: bool=False, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], int]:
         """Standard generation without MTP."""
         if prompt_tokens is None:
-            chat_output = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
+            chat_output = self.tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")  # prompt 编码为 input ids 并放 device
+            # chat_output = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
             if hasattr(chat_output, 'input_ids'):
                 prompt_tokens = list(chat_output['input_ids'])
             else:

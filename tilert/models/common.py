@@ -197,9 +197,11 @@ class RMSNorm(nn.Module):
             Normalized tensor, or (normalized, residual) tuple if residual given.
         """
         if residual is None:
+            in_dtype = x.dtype  # 保存输入数据类型，用于最后转回
             output = self._norm(x.float())
             output = output * (1.0 + self.weight.float())
-            return output.type_as(x)
+            return output.to(in_dtype)
+            # return output.type_as(x)
 
         x = residual = x.float() + residual.float()
         output = self._norm(x)

@@ -113,12 +113,12 @@ class QwenMoeBlock(TileRTModule):
         """Reference forward: rmsnorm -> gate score -> up/gate/silu -> down."""
         if not self.moe.rmsnorm_expert_proj.is_ref_weights_init:
             self.init_random_weights(device=str(x.device))
-        norm_x, scores = self.moe.rmsnorm_expert_proj.golden_forward(x)
-        up_gate_out, weights, indices = self.moe.exp_sel_up_gate_silu.golden_forward(
-            norm_x, scores
+        h_flat, routing_weights, expert_indices = self.moe.rmsnorm_expert_proj.golden_forward(x) # h_flat, routing_weights, expert_indices
+        moe_intermediate = self.moe.exp_sel_up_gate_silu.golden_forward(
+            h_flat, routing_weights, expert_indices
         )
         return self.moe.expert_down_allreduce.golden_forward(
-            up_gate_out, indices, weights, norm_x
+            h_flat, expert_indices, moe_intermediate
         )
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
