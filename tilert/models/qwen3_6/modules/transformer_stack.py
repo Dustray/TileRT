@@ -56,6 +56,7 @@ class QwenTransformerStack(SerializableTileRTModule):
                 block = GatedAttention(model_args=model_args, device_id=device_id, num_devices=num_devices)
             self.register_op(block, prefix=f'layer_{layer_idx}_', suffix=f'_dev_{device_id}')
             block.moe_sync_callback = self.moe_sync_callback
+            block.ffn.moe.expert_down_allreduce.moe_sync_callback = self.moe_sync_callback
             logger.debug(f"Registered layer {layer_idx}: {('DeltaNet' if layer_type == 0 else 'GatedAttention')}")
         logger.info('[dev={device_id}]QwenTransformerStack 构建完成')
 

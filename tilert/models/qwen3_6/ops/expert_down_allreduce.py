@@ -1,9 +1,14 @@
 """ExpertDownAllreduce operation module."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
@@ -368,7 +373,7 @@ class ExpertDownAllReduce(TileRTModule):
         # TP8: this op stores the *local* intermediate dimension.
         self.moe_inter_dim = self.model_args.inter_dim // self.num_devices
         self.block_size = self.model_args.block_size
-        self.hidden_size = self.model_args.
+        self.hidden_size = self.model_args.dim
         self.algorithm = algorithm
 
         self.ref_down: torch.Tensor | None = None
@@ -378,6 +383,7 @@ class ExpertDownAllReduce(TileRTModule):
         self.hidden_out: torch.Tensor | None = None
         self.profile_logs: torch.Tensor | None = None
         self.is_init = False
+        self.moe_sync_callback: Callable[[torch.Tensor], torch.Tensor] | None = None
 
         if self.arch_name in ("qwen3_6", "glm_5"):
             self.compute_kernel_type = "bf16"
@@ -402,7 +408,7 @@ class ExpertDownAllReduce(TileRTModule):
     def get_ref_weights_alias(self) -> list[str]:
         return list(self.ref_weights_alias())
 
-    def get_weights_list(self) -> list[torch.Tensor]:
+    def get_weights_list(self) -> list[torch.Tensor | None]:
         return [self.tilert_weights, self.tilert_scales]
 
     @staticmethod
@@ -681,7 +687,9 @@ class ExpertDownAllReduce(TileRTModule):
             dtype=torch.bfloat16,
             device=f"cuda:{device_id}",
         )
-        self.profile_logs = get_profile_log_tensor(device=f"cuda:{device_id}")
+        self.profile_logs = get_profile_log_tensor(
+            device=torch.device("cuda", device_id)
+        )
         self.is_init = True
 
     def init_random_weights(self, device_id: int | None = None) -> None:
@@ -738,6 +746,7 @@ class ExpertDownAllReduce(TileRTModule):
         self.init_reference_weights(state_dict, "mlp", device_id)
         # Keep reference weights in bf16 to avoid a 4x memory spike from the
         # fp32 dequantization fallback used during random-init sanity tests.
+        assert self.ref_down is not None
         self.ref_down = self.ref_down.to(torch.bfloat16)
         sharded_list = self.device_sharding(state_dict, "mlp")
         # ``sharded_list`` has shape (n_experts, num_devices, ...); under TP8
@@ -751,24 +760,69 @@ class ExpertDownAllReduce(TileRTModule):
         self,
         h_flat: torch.Tensor,
         expert_indices: torch.Tensor,
-        moe_intermediate,
+        moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
-        logger.info(
-            f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}，indices.shape={indices.shape}，scores.shape={scores.shape}"
-        )
-        moe_out = torch.zeros((self.num_tokens, hidden_size), device=device, dtype=torch.float16)
+        """TP8 local down-projection + weighted sum + all-reduce.
 
-        for e, token_idx, ffn_e, weight_e in moe_intermediate:
-            down_e = F.linear(ffn_e, self.down_proj_weight[e])
-            # routing weight
-            down_e *= weight_e
+        Args:
+            h_flat: [num_tokens, dim], RMSNorm-ed token hidden states.  Kept for
+                the shared-expert gate computation.
+            expert_indices: unused, kept for interface compatibility.
+            moe_intermediate: output from ``ExpertSelectUpGateSiLU.golden_forward``,
+                a list of ``(expert_id, token_idx, ffn_e, weight_e)`` tuples.
+
+        Returns:
+            [num_tokens, dim] fully all-reduced MoE output.
+        """
+        logger.info(
+            f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] "
+            f"ENTRY: h_flat.shape={h_flat.shape}, fragments={len(moe_intermediate)}"
+        )
+        assert self.ref_down is not None
+
+        num_tokens = h_flat.size(0)
+        hidden_size = self.hidden_size
+        device = h_flat.device
+        dtype = h_flat.dtype
+
+        # Partial output accumulator for this TP rank.
+        moe_out = torch.zeros(
+            (num_tokens, hidden_size), device=device, dtype=dtype
+        )
+
+        # Apply local down-projection, multiply by routing weight, and scatter-add.
+        for expert_id, token_idx, ffn_e, weight_e in moe_intermediate:
+            down_e = F.linear(ffn_e, self.ref_down[expert_id])
+            down_e = down_e * weight_e.to(dtype)
             moe_out.index_add_(0, token_idx, down_e)
 
-        # TP row parallel
-        torch.distributed.all_reduce(
-            moe_out, op=torch.distributed.ReduceOp.SUM, group=self.tp_group
-        )
+        # Apply the shared-expert gate in the same place as the HF model:
+        # after the shared expert down-projection and before adding the routed
+        # expert outputs.  The shared expert is always the first tuple.
+        if self.ref_shared_expert_gate is not None and moe_intermediate:
+            shared_token_idx = moe_intermediate[0][1]
+            shared_gate = torch.sigmoid(
+                h_flat[shared_token_idx].float()
+                @ self.ref_shared_expert_gate.float().mT
+            ).to(dtype)
+            moe_out[shared_token_idx] = moe_out[shared_token_idx] * shared_gate
 
+        # TP row parallel all-reduce.  When distributed is initialized use
+        # the default process group; otherwise fall back to the barrier-based
+        # callback installed by ``QwenTransformerStack`` / ``QwenShowHandsLayer``.
+        if dist.is_initialized():
+            dist.all_reduce(moe_out, op=dist.ReduceOp.SUM)
+        elif self.num_devices > 1 and self.moe_sync_callback is not None:
+            # Expand to [1, seq_len, dim] to match the callback convention.
+            seq_len = getattr(self, "_last_seq_len", 1)
+            partial_3d = moe_out.view(1, seq_len, hidden_size)
+            full_3d = self.moe_sync_callback(partial_3d)
+            moe_out = full_3d.view(num_tokens, hidden_size)
+
+        logger.info(
+            f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] "
+            f"EXIT: moe_out.shape={moe_out.shape}"
+        )
         return moe_out
         # assert self.ref_down is not None
         # assert vec_in.dim() == 4 and vec_in.size(0) == 1
@@ -826,6 +880,9 @@ class ExpertDownAllReduce(TileRTModule):
         logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.tilert_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}，indices.shape={indices.shape}，scores.shape={scores.shape}，flag={flag}")
 
         assert self.hidden_out is not None
+        assert self.tilert_weights is not None
+        assert self.tilert_scales is not None
+        assert self.profile_logs is not None
         logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.tilert_forward_{self.device_id}] 调用CUDA内核 expert_down_allreduce")
         expert_down_allreduce(
             vec_in,
@@ -846,8 +903,8 @@ class ExpertDownAllReduce(TileRTModule):
 
     def __call__(
         self,
-        x_in: torch.Tensor,
-        indices: torch.Tensor,
-        scores: torch.Tensor,
+        h_flat: torch.Tensor,
+        expert_indices: torch.Tensor,
+        moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
-        return self.golden_forward(x_in, indices, scores)
+        return self.golden_forward(h_flat, expert_indices, moe_intermediate)

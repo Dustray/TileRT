@@ -451,7 +451,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         """Output weight names for get_weights_list (backward compat)."""
         return self._tilert_tensor_alias
 
-    def get_weights_list(self) -> list[torch.Tensor]:
+    def get_weights_list(self) -> list[torch.Tensor | None]:
         """
         Get the weights list.
 
@@ -928,7 +928,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             device=device,
         )
 
-        self.profile_logs = get_profile_log_tensor(device=device)
+        self.profile_logs = get_profile_log_tensor(
+            device=torch.device(device) if isinstance(device, str) else device
+        )
         self.is_init = True
 
     def init_random_weights(self, device: str | int | None = None) -> None:
@@ -1064,78 +1066,73 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         h_flat: torch.Tensor,
         routing_weights: torch.Tensor,
         expert_indices: torch.Tensor,
-    ):
-        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, scores.shape={scores.shape}")
-        moe_out = torch.zeros_like(h_flat)  # 初始化输出缓冲区
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """TP8 local gate/up + SiLU.
 
-        assert self.gate_up_proj_weight is not None
+        Each device holds the full expert table but only a shard of the
+        intermediate dimension.  The function iterates over *all* experts,
+        gathers the tokens routed to expert ``e``, computes the local
+        gate/up/SiLU fragment, and returns a list of per-expert tuples so that
+        ``ExpertDownAllReduce`` can perform the local down-projection and
+        all-reduce.
+
+        Args:
+            h_flat: [num_tokens, dim], RMSNorm-ed token hidden states.
+            routing_weights: [num_tokens, n_activated_experts], normalized
+                routing weights produced by ``RMSNormExpertProj``.
+            expert_indices: [num_tokens, n_activated_experts], selected expert
+                indices (0-based, routed experts only).  The shared expert is
+                handled separately at index 0 of the local weight table.
+
+        Returns:
+            A list of tuples ``(expert_id, token_idx, ffn_e, weight_e)``:
+                - expert_id: int, 0 for shared expert, 1..n_routed_experts for
+                  routed experts.
+                - token_idx: [n_e], indices of tokens assigned to this expert.
+                - ffn_e: [n_e, local_inter_dim], local SiLU(gate) * up.
+                - weight_e: [n_e, 1], routing weights for the assignment.
+        """
+        logger.info(
+            f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] ENTRY: "
+            f"h_flat.shape={h_flat.shape}, routing_weights.shape={routing_weights.shape}, "
+            f"expert_indices.shape={expert_indices.shape}"
+        )
+
         assert self.ref_gate is not None
         assert self.ref_up is not None
 
-        # 用于收集所有激活专家的中间结果
-        moe_intermediate = []
+        moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Running expert selection for arch={self.arch_name}")
-        fused_experts = True # "mlp.experts.gate_up_proj" in w and "mlp.experts.down_proj" in w 是否存在堆叠的 BF16 gate_up/down 权重
-        for e in range(256):
-            mask = (expert_indices == e)  # 选中专家 e 的掩码
-            if not mask.any():  # 无则跳过
+        # Shared expert is stored at local index 0.
+        shared_gate = self.ref_gate[0]
+        shared_up = self.ref_up[0]
+        # For the shared expert every token uses it; gather routing weights
+        # from the first activated slot (HF places the shared expert outside
+        # top-k, but TileRT keeps it in slot 0 of the expanded table).
+        shared_weight = routing_weights[:, 0].unsqueeze(-1)
+        shared_ffn = F.silu(F.linear(h_flat, shared_gate)) * F.linear(h_flat, shared_up)
+        moe_intermediate.append((0, torch.arange(h_flat.size(0), device=h_flat.device), shared_ffn, shared_weight))
+
+        # Routed experts: local index 0 is shared, so routed expert e uses
+        # ref_gate/ref_up[e + 1].
+        n_routed = self.n_routed_experts
+        for e in range(n_routed):
+            mask = expert_indices == e
+            if not mask.any():
                 continue
-            token_idx, slot_idx = mask.nonzero(as_tuple=True)  # 获取 token 和 slot 索引
-            x_e = h_flat[token_idx]  # 专家 e 的输入
-            gate_up = F.linear(x_e, self.gate_up_proj_weight[e])  # gate+up 合并投影，gate_up_proj_weight是TP8切分后的权重
-            gate_e, up_e = gate_up.chunk(2, dim=-1)  # 切成 gate 和 up
+            token_idx, slot_idx = mask.nonzero(as_tuple=True)
+            x_e = h_flat[token_idx]
+            gate_e = F.linear(x_e, self.ref_gate[e + 1])
+            up_e = F.linear(x_e, self.ref_up[e + 1])
             ffn_e = F.silu(gate_e) * up_e
-            weight_e = routing_weights[ token_idx, slot_idx ].unsqueeze(-1)
-            moe_intermediate.append( ( e, token_idx, ffn_e, weight_e ) )
+            weight_e = routing_weights[token_idx, slot_idx].unsqueeze(-1)
+            moe_intermediate.append((e + 1, token_idx, ffn_e, weight_e))
+
+        logger.info(
+            f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] EXIT: "
+            f"{len(moe_intermediate)} activated expert fragments"
+        )
         return moe_intermediate
-
-
-   
-        
-        weights= routing_weights
-        indices = expert_indices
-        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Expert selection done: indices.shape={indices.shape}, weights.shape={weights.shape}")
-        
-        # ``rmsnorm_expert_proj`` flattens the batch dimension, so scores can be
-        # 2-D here.  Restore the batch dimension for token-wise indexing.
-        if indices.ndim == 2:
-            indices = indices.unsqueeze(0)
-            weights = weights.unsqueeze(0)
-            logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Promoted indices/weights from 2D to 3D")
-        # TP8: reference weights contain every expert but only the local
-        # inter_dim shard, so global expert IDs index directly into ref_gate/ref_up
-        # (the shared expert lives at index 0).
-        local_indices = indices
-        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Processing {seq_len} tokens, n_activated_experts={self.n_activated_experts}")
-        
-        hidden_out_list = []
-        for s in range(seq_len):
-            hidden_out_w1_list = []
-            hidden_out_w3_list = []
-            logger.debug(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] Token {s}: computing shared expert gate/up")
-            hidden_out_w1_shared = x_in[0, s].float() @ self.ref_gate[0].float().mT
-            hidden_out_w3_shared = x_in[0, s].float() @ self.ref_up[0].float().mT
-            hidden_out_w1_list.append(hidden_out_w1_shared)
-            hidden_out_w3_list.append(hidden_out_w3_shared)
-            ref_gate_sel = self.ref_gate[1:][local_indices[0, s]]
-            ref_up_sel = self.ref_up[1:][local_indices[0, s]]
-            for i in range(self.n_activated_experts):
-                hidden_out_w1_sel = x_in[0, s].float() @ ref_gate_sel[i].float().mT
-                hidden_out_w3_sel = x_in[0, s].float() @ ref_up_sel[i].float().mT
-                hidden_out_w1_list.append(hidden_out_w1_sel)
-                hidden_out_w3_list.append(hidden_out_w3_sel)
-            hidden_out_w1 = torch.stack(hidden_out_w1_list, dim=0)
-            hidden_out_w3 = torch.stack(hidden_out_w3_list, dim=0)
-            hidden_out = F.silu(hidden_out_w1.float()) * hidden_out_w3.float()
-            hidden_out = hidden_out.to(torch.bfloat16)
-            hidden_out_list.append(hidden_out)
-        hidden_out = torch.stack(hidden_out_list, dim=0)
-        hidden_out = hidden_out[None, ...]
-        
-        logger.info(f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] EXIT: hidden_out.shape={hidden_out.shape}, weights.shape={weights.shape}, indices.shape={indices.shape}")
-        
-        return hidden_out, weights, indices
 
     def tilert_forward(
         self,
@@ -1146,6 +1143,12 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, scores.shape={scores.shape}")
         
         assert self.algorithm is not None, "Algorithm is not set"
+        assert self.tilert_bias is not None
+        assert self.tilert_weights is not None
+        assert self.hidden_out is not None
+        assert self.expert_probs is not None
+        assert self.expert_indices is not None
+        assert self.profile_logs is not None
         logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] Calling CUDA kernel expert_select_up_gate_silu")
         expert_select_up_gate_silu(
             x_in,
@@ -1159,6 +1162,11 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             self.algorithm.value,
             model_arch=self.model_args.arch_name,
         )
-        logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}, expert_probs.shape={self.expert_probs.shape}, expert_indices.shape={self.expert_indices.shape}")
-        
+        logger.info(
+            f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] EXIT: "
+            f"hidden_out.shape={self.hidden_out.shape}, "
+            f"expert_probs.shape={self.expert_probs.shape}, "
+            f"expert_indices.shape={self.expert_indices.shape}"
+        )
+
         return self.hidden_out, self.expert_probs, self.expert_indices

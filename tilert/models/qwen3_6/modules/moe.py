@@ -55,7 +55,7 @@ class QwenMoe:
             algorithm=ExpertDownAllReduceAlgorithm.GENERAL,
         )
 
-    def get_weights_list(self) -> list[torch.Tensor]:
+    def get_weights_list(self) -> list[torch.Tensor | None]:
         return [
             *self.rmsnorm_expert_proj.get_weights_list(),
             *self.exp_sel_up_gate_silu.get_weights_list(),
@@ -110,16 +110,24 @@ class QwenMoeBlock(TileRTModule):
         self.moe.expert_down_allreduce.init_random_weights(device_id=device_id)
 
     def golden_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Reference forward: rmsnorm -> gate score -> up/gate/silu -> down."""
+        """Reference forward: rmsnorm -> gate score -> up/gate/silu -> down.
+
+        Under TP8 ``exp_sel_up_gate_silu`` computes local gate/up/SiLU fragments
+        and returns a list of per-expert tuples.  ``expert_down_allreduce``
+        performs the local down-projection, weighted aggregation, and
+        all-reduces across devices.
+        """
         if not self.moe.rmsnorm_expert_proj.is_ref_weights_init:
             self.init_random_weights(device=str(x.device))
-        h_flat, routing_weights, expert_indices = self.moe.rmsnorm_expert_proj.golden_forward(x) # h_flat, routing_weights, expert_indices
+        h_flat, routing_weights, expert_indices = self.moe.rmsnorm_expert_proj.golden_forward(x)
         moe_intermediate = self.moe.exp_sel_up_gate_silu.golden_forward(
             h_flat, routing_weights, expert_indices
         )
-        return self.moe.expert_down_allreduce.golden_forward(
+        moe_out = self.moe.expert_down_allreduce.golden_forward(
             h_flat, expert_indices, moe_intermediate
         )
+        # Restore the original [batch, seq_len, dim] shape.
+        return moe_out.view_as(x)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         logger.debug(f"{self.op_name}: init_tilert_weights")
@@ -148,7 +156,7 @@ class QwenMoeBlock(TileRTModule):
             return self.tilert_forward(x)
         return self.golden_forward(x)
 
-    def get_weights_list(self) -> list[torch.Tensor]:
+    def get_weights_list(self) -> list[torch.Tensor | None]:
         return self.moe.get_weights_list()
 
     def get_ref_weights_alias(self) -> list[str]:
