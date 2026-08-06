@@ -163,6 +163,7 @@ class QwenShowHandsLayer:
         self._moe_barrier: threading.Barrier | None = None
         self._moe_partial_buf: list[torch.Tensor] | None = None
         self._moe_aggregated_buf: list[torch.Tensor] | None = None
+        self._moe_partial_lens: list[int] = []
         self._hf_model: Any | None = None
         self._hf_past_key_values: Any | None = None
         self._hf_input_ids: torch.Tensor | None = None
@@ -589,35 +590,64 @@ class QwenShowHandsLayer:
         # 中文注释：为每个设备分配 all-reduce 的部分和与聚合 buffer。
         self._moe_partial_buf = [torch.zeros(1, max_seq_len, dim, dtype=torch.bfloat16, device=f'cuda:{d}') for d in range(self.num_devices)]
         self._moe_aggregated_buf = [torch.zeros(1, max_seq_len, dim, dtype=torch.bfloat16, device=f'cuda:{d}') for d in range(self.num_devices)]
+        self._moe_partial_lens = [0] * self.num_devices
 
         def _barrier_action() -> None:
             assert self._moe_partial_buf is not None
             assert self._moe_aggregated_buf is not None
-            total = self._moe_partial_buf[0].float().cpu()
-            for d in range(1, self.num_devices):
-                total.add_(self._moe_partial_buf[d].float().cpu())
+
+            # The partial buffers live on different GPUs.  Force each device to
+            # finish its copy before we read it on the host, otherwise the CPU
+            # side can observe a partially-updated tensor and corrupt the sum.
+            for d in range(self.num_devices):
+                torch.cuda.synchronize(d)
+
+            total = torch.zeros(1, max_seq_len, dim, dtype=torch.float32)
+            for d in range(self.num_devices):
+                active_len = self._moe_partial_lens[d]
+                if active_len <= 0:
+                    continue
+                part = self._moe_partial_buf[d][:, :active_len, :].float().cpu().clone()
+                total[:, :active_len, :] += part
             total = total.to(torch.bfloat16)
             for d in range(self.num_devices):
                 self._moe_aggregated_buf[d].copy_(total)
+                torch.cuda.synchronize(d)
         self._moe_barrier = threading.Barrier(self.num_devices, action=_barrier_action)
         logger.info(f'[QwenShowHandsLayer._init_moe_sync] TP8 MoE all-reduce 初始化完成：设备数={self.num_devices}, buffer_shape=(1, {max_seq_len}, {dim})')
 
     def _moe_sync(self, device_id: int, h: torch.Tensor) -> torch.Tensor:
-        """基于 barrier 的 TP8 MoE 部分输出 all-reduce。
+        """Barrier-based TP8 MoE fallback for environments without torch.distributed.
 
-        将本设备部分输出拷贝到共享 buffer，在 barrier 处等待所有设备，
-        然后返回聚合后的完整输出。
+        Each rank writes its local partial output into a shared buffer, waits at
+        the barrier, and then reads back the summed aggregation buffer.
+        The previous implementation was vulnerable to accidentally treating one
+        rank's buffer as the final global result because the barrier callback was
+        executed in a way that could race with the caller's subsequent use.
         """
         if self.num_devices <= 1 or self._moe_barrier is None:
             return h
         seq_len = h.size(1)
         assert self._moe_partial_buf is not None
         assert self._moe_aggregated_buf is not None
+
+        # Write the local contribution to the per-rank partial buffer and
+        # record the active length so the barrier action only sums the valid
+        # rows.  This avoids stale tail values from previous decode steps.
+        self._moe_partial_lens[device_id] = seq_len
+        self._moe_partial_buf[device_id].zero_()
         self._moe_partial_buf[device_id][:, :seq_len, :].copy_(h, non_blocking=False)
         torch.cuda.synchronize(device_id)
+
+        # Wait until every rank has submitted its partial result.
         self._moe_barrier.wait()
         torch.cuda.synchronize(device_id)
-        return self._moe_aggregated_buf[device_id][:, :seq_len, :]
+
+        # Return an independent copy of the aggregated tensor.  Returning a
+        # view into the shared buffer would let later barrier invocations
+        # overwrite the caller-visible value and make the result appear to
+        # change after the callback returns.
+        return self._moe_aggregated_buf[device_id][:, :seq_len, :].contiguous().clone()
 
     def _get_full_head_proj(self, device_id: int) -> torch.Tensor:
         """Return the full vocabulary head projection on the target device.

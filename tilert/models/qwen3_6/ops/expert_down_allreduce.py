@@ -790,22 +790,34 @@ class ExpertDownAllReduce(TileRTModule):
             (num_tokens, hidden_size), device=device, dtype=dtype
         )
 
-        # Apply local down-projection, multiply by routing weight, and scatter-add.
+        # Apply local down-projection and scatter-add for routed experts first.
+        # The shared expert is handled afterwards, matching the single-card
+        # prototype where it is added once, after the routed experts.
         for expert_id, token_idx, ffn_e, weight_e in moe_intermediate:
-            down_e = F.linear(ffn_e, self.ref_down[expert_id])
+            if expert_id == 0:
+                continue
+            down_weight = self.ref_down[expert_id].to(dtype=ffn_e.dtype)
+            down_e = F.linear(ffn_e, down_weight)
             down_e = down_e * weight_e.to(dtype)
             moe_out.index_add_(0, token_idx, down_e)
 
-        # Apply the shared-expert gate in the same place as the HF model:
-        # after the shared expert down-projection and before adding the routed
-        # expert outputs.  The shared expert is always the first tuple.
-        if self.ref_shared_expert_gate is not None and moe_intermediate:
-            shared_token_idx = moe_intermediate[0][1]
-            shared_gate = torch.sigmoid(
-                h_flat[shared_token_idx].float()
-                @ self.ref_shared_expert_gate.float().mT
-            ).to(dtype)
-            moe_out[shared_token_idx] = moe_out[shared_token_idx] * shared_gate
+        # Shared expert contribution: add it after the routed experts, using the
+        # dedicated shared-expert gate and unit weight, just like the single-card
+        # prototype path.
+        for expert_id, token_idx, ffn_e, weight_e in moe_intermediate:
+            if expert_id != 0:
+                continue
+            down_weight = self.ref_down[expert_id].to(dtype=ffn_e.dtype)
+            down_e = F.linear(ffn_e, down_weight)
+            if self.ref_shared_expert_gate is not None:
+                shared_gate_weight = self.ref_shared_expert_gate.to(dtype=h_flat.dtype)
+                shared_gate = torch.sigmoid(
+                    h_flat[token_idx].float() @ shared_gate_weight.float().mT
+                ).to(dtype)
+                down_e = down_e * shared_gate
+            down_e = down_e * weight_e.to(dtype)
+            moe_out.index_add_(0, token_idx, down_e)
+            break
 
         # TP row parallel all-reduce.  When distributed is initialized use
         # the default process group; otherwise fall back to the barrier-based
@@ -813,11 +825,17 @@ class ExpertDownAllReduce(TileRTModule):
         if dist.is_initialized():
             dist.all_reduce(moe_out, op=dist.ReduceOp.SUM)
         elif self.num_devices > 1 and self.moe_sync_callback is not None:
-            # Expand to [1, seq_len, dim] to match the callback convention.
-            seq_len = getattr(self, "_last_seq_len", 1)
-            partial_3d = moe_out.view(1, seq_len, hidden_size)
-            full_3d = self.moe_sync_callback(partial_3d)
-            moe_out = full_3d.view(num_tokens, hidden_size)
+            # Keep the callback contract explicit: local 2D MoE output is
+            # converted to a 3D [1, seq_len, dim] tensor and then reshaped back
+            # to [num_tokens, dim] after aggregation.  Using the stored
+            # sequence length is safer than a hard-coded 1, which could corrupt
+            # the returned tensor when the shape is not a single-token decode.
+            seq_len = getattr(self, "_last_seq_len", num_tokens)
+            if seq_len <= 0:
+                seq_len = num_tokens
+            partial_3d = moe_out.reshape(1, seq_len, hidden_size)
+            full_3d = self.moe_sync_callback(partial_3d.contiguous())
+            moe_out = full_3d.reshape(num_tokens, hidden_size)
 
         logger.info(
             f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] "

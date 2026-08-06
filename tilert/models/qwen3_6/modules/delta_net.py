@@ -268,16 +268,10 @@ class DeltaNet(SerializableTileRTModule):
             f"std={ffn_partial.float().std().item():.6f}"
         )
 
-        if self.moe_sync_callback is not None:
-            logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step5: MoE sync (all-reduce)")
-            ffn_full = self.moe_sync_callback(ffn_partial)
-            logger.info(
-                f"[DeltaNet.golden_forward_{self.device_id}] ffn_full after sync: "
-                f"shape={ffn_full.shape} mean={ffn_full.float().mean().item():.6f} "
-                f"std={ffn_full.float().std().item():.6f}"
-            )
-        else:
-            ffn_full = ffn_partial
+        # The TP8 MoE down-op already performs the all-reduce internally.
+        # Applying the callback again here would double-aggregate the same
+        # tensor and corrupt the result on multi-GPU runs.
+        ffn_full = ffn_partial
 
         # Final residual uses the all-reduced (full) FFN output.
         out = h + ffn_full

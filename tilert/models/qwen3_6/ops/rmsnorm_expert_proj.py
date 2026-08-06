@@ -130,9 +130,9 @@ class RMSNormExpertProj(TileRTModule):
         # Move to compute device if still on CPU; RMSNorm expects a float32
         # weight tensor on the target device.
         if rms_w.device.type != "meta":
-            rms_w = rms_w.to(f"cuda:{self.device_id}")
+            rms_w = rms_w.to(dtype=torch.float32, device=f"cuda:{self.device_id}")
         if gate_w.device.type != "meta":
-            gate_w = gate_w.to(f"cuda:{self.device_id}")
+            gate_w = gate_w.to(dtype=torch.float32, device=f"cuda:{self.device_id}")
         self.ref_rmsnorm = RMSNorm(self.dim, self.eps)
         self.ref_rmsnorm.weight.data = rms_w
         self.ref_gate = RMSNorm(gate_w.shape[0]*gate_w.shape[1], self.eps)
@@ -178,7 +178,7 @@ class RMSNormExpertProj(TileRTModule):
         logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Applying RMSNorm")
         B, M, D = x_in.shape  # 解包输入形状
         x_flat = x_in.view(B * M, D)  # 展平为 [total_tokens, D]
-        router_logits = F.linear(x_flat, self.ref_proj_weight)  # 计算 router logits
+        router_logits = F.linear(x_flat.float(), self.ref_proj_weight.float())  # 计算 router logits
         routing_weights, expert_indices = torch.topk(router_logits, self.n_activated_experts, dim=-1)  # top-K 专家和未归一化权重
         routing_weights = F.softmax(routing_weights, dim=-1, dtype=torch.float32).to(x_in.dtype)  # softmax 归一化后转回输入 dtype
         return x_flat, routing_weights, expert_indices

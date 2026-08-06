@@ -1100,6 +1100,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
 
         assert self.ref_gate is not None
         assert self.ref_up is not None
+        assert self.gate_up_proj_weight is not None
 
         moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
@@ -1109,8 +1110,13 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         # For the shared expert every token uses it; gather routing weights
         # from the first activated slot (HF places the shared expert outside
         # top-k, but TileRT keeps it in slot 0 of the expanded table).
-        shared_weight = routing_weights[:, 0].unsqueeze(-1)
-        shared_ffn = F.silu(F.linear(h_flat, shared_gate)) * F.linear(h_flat, shared_up)
+        # The shared expert is always present and should not be scaled by the
+        # routed-expert top-k weights.  It is later gated by the dedicated
+        # shared_expert_gate in the down path, so we use a unit weight here.
+        shared_weight = torch.ones(h_flat.size(0), 1, device=h_flat.device, dtype=routing_weights.dtype)
+        shared_gate_proj = F.linear(h_flat, shared_gate.to(dtype=h_flat.dtype))
+        shared_up_proj = F.linear(h_flat, shared_up.to(dtype=h_flat.dtype))
+        shared_ffn = F.silu(shared_gate_proj) * shared_up_proj
         moe_intermediate.append((0, torch.arange(h_flat.size(0), device=h_flat.device), shared_ffn, shared_weight))
 
         # Routed experts: local index 0 is shared, so routed expert e uses
@@ -1122,8 +1128,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
                 continue
             token_idx, slot_idx = mask.nonzero(as_tuple=True)
             x_e = h_flat[token_idx]
-            gate_e = F.linear(x_e, self.ref_gate[e + 1])
-            up_e = F.linear(x_e, self.ref_up[e + 1])
+            gate_e = F.linear(x_e, self.ref_gate[e + 1].to(dtype=x_e.dtype))
+            up_e = F.linear(x_e, self.ref_up[e + 1].to(dtype=x_e.dtype))
             ffn_e = F.silu(gate_e) * up_e
             weight_e = routing_weights[token_idx, slot_idx].unsqueeze(-1)
             moe_intermediate.append((e + 1, token_idx, ffn_e, weight_e))
