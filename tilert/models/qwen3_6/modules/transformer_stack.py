@@ -112,6 +112,8 @@ class QwenTransformerStack(SerializableTileRTModule):
             if torch.isnan(out).any() or torch.isinf(out).any():
                 logger.warning(f'QwenTransformerStack layer {layer_idx} produced NaN/Inf; mean={out.float().mean().item():.4f}, std={out.float().std().item():.4f}')
             h = out
+            if layer_idx == 9:
+                break
             if layer_idx % 10 == 0 or layer_idx == len(self.exec_seq) - 1:
                 logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Layer {layer_idx} output stats: mean={h.float().mean().item():.4f}, std={h.float().std().item():.4f}, min={h.float().min().item():.4f}, max={h.float().max().item():.4f}')
         caches['k_cache'] = shared_k_cache

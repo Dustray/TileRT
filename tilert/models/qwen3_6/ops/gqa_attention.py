@@ -366,12 +366,13 @@ class GQAAttention(TileRTModule):
             ],
             dim=-1,
         )
-        q, gate = torch.chunk(q_gate, 2, dim=-1)
+        q_full_view = q_gate.view(bsz, seq_len, self.num_local_heads, self.head_dim * 2)
+        q, gate = torch.chunk(q_full_view, 2, dim=-1)
         logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
 
         # Keep (bsz, seq_len, n_local_heads, head_dim) for apply_rotary_emb.
         logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] Step3: Reshape for multi-head")
-        q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim)
+        # q = q.view(bsz, seq_len, self.num_local_heads, self.head_dim)
         k = k.view(bsz, seq_len, self.num_local_kv_heads, self.head_dim)
         v = v.view(bsz, seq_len, self.num_local_kv_heads, self.v_head_dim)
         logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}]   q.view={q.shape}, k.view={k.shape}, v.view={v.shape}")

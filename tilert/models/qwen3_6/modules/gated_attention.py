@@ -249,10 +249,10 @@ class GatedAttention(SerializableTileRTModule):
 
     def _ensure_weights(self, x: torch.Tensor) -> None:
         """Lazy initialize weights for sanity testing without a checkpoint."""
-        if self.attn.qkv_proj_weights is None:
-            self.attn.init_random_weights(device=str(x.device))
-        if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
-            self.ffn.init_random_weights(device=str(x.device))
+        # if self.attn.qkv_proj_weights is None:
+        #     self.attn.init_random_weights(device=str(x.device))
+        # if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
+        #     self.ffn.init_random_weights(device=str(x.device))
         if self.input_layernorm.weight.device != x.device:
             self.input_layernorm.to(x.device)
         if self.post_attention_layernorm.weight.device != x.device:
@@ -263,6 +263,10 @@ class GatedAttention(SerializableTileRTModule):
         logger.debug(f"{self.op_name}: loading tilert weights + layernorms")
         super().init_tilert_weights(state_dict)
         self._load_layernorm_weights(state_dict)
+        if self.attn.qkv_proj_weights is None:
+            self.attn.init_reference_weights(state_dict)
+        if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
+            self.ffn.init_reference_weights(state_dict)
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Load reference weights and also set the RMSNorm module weights."""

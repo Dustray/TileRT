@@ -13,7 +13,7 @@
             "console": "integratedTerminal",
             "env": {
                 "PYTHONPATH": "/public/home/panyq/yiny/projects/TileRT",
-                "HIP_VISIBLE_DEVICES": "0,1,2,3"
+                "HIP_VISIBLE_DEVICES": "0,1,2,5"
             },
             "justMyCode": true
         },{

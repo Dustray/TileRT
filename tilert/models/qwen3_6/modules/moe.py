@@ -138,7 +138,7 @@ class QwenMoeBlock(TileRTModule):
         logger.debug(f"{self.op_name}: tilert weights initialized")
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        logger.debug(f"{self.op_name}: init_reference_weights")
+        logger.debug(f"{self.op_name}: init_reference_weights")# fix: 这个函数在linear attention和full attention初始化时会重复调用
         self.moe.rmsnorm_expert_proj.init_reference_weights(state_dict)
         self.moe.exp_sel_up_gate_silu.init_reference_weights(state_dict)
         self.moe.expert_down_allreduce.init_reference_weights(state_dict)
