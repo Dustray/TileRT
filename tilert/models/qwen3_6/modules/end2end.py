@@ -428,6 +428,11 @@ class QwenShowHandsLayer:
                     for alias in head_proj.tilert_weights_alias():
                         if alias not in head_state and prefixed_aliases[alias] in state_dicts:
                             head_state[alias] = state_dicts[prefixed_aliases[alias]]
+                    # golden/reference 路径需要二维的 norm 与 full lm_head；直接保存避免依赖 params 顺序。
+                    if 'model.norm.weight' in head_state:
+                        head_proj.ref_rmsnorm_gamma = head_state['model.norm.weight']
+                    if 'lm_head.weight' in head_state:
+                        head_proj.ref_head_proj = head_state['lm_head.weight']
                     head_proj.init_tilert_weights(head_state)
                 else:
                     head_proj.init_random_weights(device_id=device_id)
@@ -659,13 +664,19 @@ class QwenShowHandsLayer:
         if cached is not None:
             logger.warning(f'[QwenShowHandsLayer._get_full_head_proj_{device_id}] CACHE HIT shape={cached.shape} dtype={cached.dtype} ptr={cached.data_ptr()}')
             return cached
-        stack = self._stack_objects[device_id]
         head_proj = self._head_proj_objects[device_id]
-        if stack is None or head_proj is None:
-            raise RuntimeError(f'Stack/head not initialized on device {device_id}')
-        stack_weight_count = len(stack.get_weights_list())
-        local_head = self._get_device_result(device_id)[2][stack_weight_count + 1]
+        if head_proj is None:
+            raise RuntimeError(f'Head projection not initialized on device {device_id}')
+        local_head = head_proj.ref_head_proj
+        if local_head is None:
+            raise RuntimeError(f'ref_head_proj is not initialized on device {device_id}')
         logger.warning(f'[QwenShowHandsLayer._get_full_head_proj_{device_id}] CACHE MISS local_head.shape={local_head.shape} dtype={local_head.dtype} ptr={local_head.data_ptr()}')
+        # 说明 local_head 可能出现的几种三维情况：
+        # 1) device_sharding 在 init_reference_weights 中把每张卡的全量 head 堆成 (num_devices, vocab_size, dim)，
+        #    再按 device_id 取下标，得到 (vocab_size, dim) 的二维张量；
+        # 2) 如果传入的是 TileRT 转换后的 kernel layout，三维形状为 (logits_dim/16*num_steps, 16, 1024)，
+        #    第一维是展平后的 logits tile，不是 device id（device 维度已经在 device_sharding 阶段切掉了）。
+        # 以下 reshape 把这两种三维都还原回 golden 路径需要的 (vocab_size, dim)。
         if local_head.dim() == 2:
             full_head = local_head
         elif local_head.dim() == 3:
@@ -729,7 +740,8 @@ class QwenShowHandsLayer:
         logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Getting full head projection')
         full_head = self._get_full_head_proj(device_id)
         logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] full_head: shape={full_head.shape}, dtype={full_head.dtype}, device={full_head.device}')
-        head_proj.ref_rmsnorm_gamma = params[stack_weight_count]
+        if head_proj.ref_rmsnorm_gamma is None:
+            raise RuntimeError(f'ref_rmsnorm_gamma is not initialized on device {device_id}')
         head_proj.ref_head_proj = full_head
         logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] head_proj.ref_rmsnorm_gamma: shape={head_proj.ref_rmsnorm_gamma.shape}')
         logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Calling head_proj.golden_forward, input h.shape={h.shape}')
