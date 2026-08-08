@@ -174,26 +174,13 @@ class Qwen36Generator:
         finished = torch.tensor([False] * self.batch_size, dtype=torch.bool, device=self.default_device)
         time_list = []
         logger.info(f'[GENERATOR] 启动 decode 循环: range(1, {total_len})')
+        multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
+        (intermediates, *_) = multi_devices_results[0]
+        next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
         for cur_pos_val in range(1, total_len):
-            logger.info(f'[GENERATOR] === 第 {cur_pos_val}/{total_len - 1} 步 ===')
-            logger.info(f'[GENERATOR] prev_pos={prev_pos}, 调用 decode_layer.forward(tokens[0, {prev_pos}]={tokens[0, prev_pos].item()}, with_mtp={with_mtp})')
-            start_time = time.time()
-            multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
-            end_time = time.time()
-            elapsed = end_time - start_time
-            time_list.append(elapsed)
-            logger.info(f'[GENERATOR] forward() 耗时 {elapsed * 1000:.4f}ms, 获得 {len(multi_devices_results)} 个设备结果')
-            (intermediates, *_) = multi_devices_results[0]
-            next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
-            logger.info(f'[GENERATOR] 从 intermediates[Idx.TOKEN_OUT] 得到 next_token={next_token.item()}')
-            logger.info(f'[GENERATOR] 检查 cur_pos_val={cur_pos_val} 处的 prompt_mask: prompt_mask[0, {cur_pos_val}]={prompt_mask[0, cur_pos_val].item()}')
             next_token = torch.where(prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token)
-            logger.info(f'[GENERATOR] prompt_mask 检查后 next_token={next_token.item()}')
             tokens[0, cur_pos_val] = next_token
-            is_eos = (next_token == self.eos_id).item()
-            is_generating = (~prompt_mask[0, cur_pos_val]).item()
             finished = finished | torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
-            logger.info(f'[GENERATOR] 更新 tokens[{cur_pos_val}]={next_token.item()}, is_eos={is_eos}, is_generating={is_generating}')
             prev_pos = cur_pos_val
             if cur_pos_val >= prompt_len:
                 decoded_tokens = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
@@ -206,11 +193,6 @@ class Qwen36Generator:
                 break
             if cur_pos_val % 10 == 0:
                 logger.info(f'[GENERATOR] 进度: {cur_pos_val}/{total_len - 1} 步, finished={finished.any().item()}')
-        if print_log:
-            print('\n')
-            logger.info(f'[GENERATOR] -- 生成 token 总数: {len(time_list)}')
-            stats_time(time_list, '==== 性能统计 ====')
-            print('\n')
         self.decode_layer.reset_sequence()
         completion_tokens = []
         for (_, toks) in enumerate(tokens.tolist()):

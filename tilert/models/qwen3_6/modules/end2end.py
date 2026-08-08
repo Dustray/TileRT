@@ -698,7 +698,6 @@ class QwenShowHandsLayer:
         TileRT kernel via ``flag_enable_tilert``.
         """
         token_val = token_id.view(-1).tolist() if token_id.numel() > 1 else token_id.item()
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] ENTRY: token_id={token_val}, cur_pos={cur_pos}')
         (intermediates, caches, params, profile_logs) = self._get_device_result(device_id)
         stack = self._stack_objects[device_id]
         head_proj = self._head_proj_objects[device_id]
@@ -708,53 +707,28 @@ class QwenShowHandsLayer:
         embed_weight = params[stack_weight_count + 2]
         freqs_cos_param = params[stack_weight_count + 3]
         freqs_sin_param = params[stack_weight_count + 4]
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] params info:')
-        logger.info(f'  - stack_weight_count={stack_weight_count}')
-        logger.info(f'  - embed_weight: shape={embed_weight.shape}, dtype={embed_weight.dtype}, device={embed_weight.device}')
-        logger.info(f'  - freqs_cos_param: shape={freqs_cos_param.shape}, dtype={freqs_cos_param.dtype}, device={freqs_cos_param.device}')
-        logger.info(f'  - freqs_sin_param: shape={freqs_sin_param.shape}, dtype={freqs_sin_param.dtype}, device={freqs_sin_param.device}')
         stack_weights = stack.get_weights_list()
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] stack has {len(stack_weights)} weights')
-        for (i, w) in enumerate(stack_weights[:5]):
-            logger.info(f'  - stack_weights[{i}]: shape={w.shape}, dtype={w.dtype}, device={w.device}')
-        if len(stack_weights) > 5:
-            logger.info(f'  - ... and {len(stack_weights) - 5} more weights')
         idx = token_id.view(-1).to(embed_weight.device)
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Lookup embedding: idx.shape={idx.shape}, embed_weight.shape={embed_weight.shape}')
         x = embed_weight[idx].unsqueeze(0).to(torch.bfloat16)
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] x after embedding: shape={x.shape}, dtype={x.dtype}, device={x.device}')
         seq_len = x.size(1)
         if seq_len == 1:
             intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id.view(-1)[0]
         else:
             intermediates[Idx.TOKEN_ID][0, :seq_len, 0] = token_id.view(-1)
         intermediates[Idx.CUR_POS][0] = cur_pos
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Set TOKEN_ID and CUR_POS={cur_pos}')
         if self._golden_caches[device_id] is None:
-            logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Initializing layer caches')
             self._golden_caches[device_id] = stack._init_layer_caches((freqs_cos_param, freqs_sin_param))
-            logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Layer caches initialized')
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Calling stack.forward, input shape={x.shape}')
         (h, self._golden_caches[device_id]) = stack.forward(x, cur_pos, (freqs_cos_param, freqs_sin_param), self._golden_caches[device_id])
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] stack.forward output: h.shape={h.shape}, dtype={h.dtype}, device={h.device}')
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Getting full head projection')
         full_head = self._get_full_head_proj(device_id)
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] full_head: shape={full_head.shape}, dtype={full_head.dtype}, device={full_head.device}')
         if head_proj.ref_rmsnorm_gamma is None:
             raise RuntimeError(f'ref_rmsnorm_gamma is not initialized on device {device_id}')
         head_proj.ref_head_proj = full_head
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] head_proj.ref_rmsnorm_gamma: shape={head_proj.ref_rmsnorm_gamma.shape}')
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Calling head_proj.golden_forward, input h.shape={h.shape}')
         logits = head_proj.golden_forward(h)
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] logits after head_proj: shape={logits.shape}, dtype={logits.dtype}')
         last_pos = logits.size(1) - 1
         vocab_shard = logits.size(-1)
         intermediates[Idx.LOGITS_OUT][0, 0, :vocab_shard].copy_(logits[0, last_pos, :])
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Copied logits to intermediates, vocab_shard={vocab_shard}')
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] Sampling from logits at position {last_pos}')
         token_out = self._sample(logits[0, last_pos])
         intermediates[Idx.TOKEN_OUT][0, 0, 0] = token_out
-        logger.info(f'[QwenShowHandsLayer._golden_forward_device_{device_id}] EXIT: token_out={token_out}')
         return (intermediates, caches, params, profile_logs)
 
     def _sample(self, logits: torch.Tensor) -> int:

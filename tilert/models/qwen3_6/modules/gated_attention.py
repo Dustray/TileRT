@@ -106,7 +106,12 @@ class QwenAttentionRef(TileRTModule):
 
     @staticmethod
     def _rmsnorm_heads(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        """Apply RMSNorm along the head dimension.
+        """Apply per-head RMSNorm to Q/K projections.
+
+        Matches Qwen3.5/3.6 convention: the checkpoint stores a weight that is
+        added to 1.0 before scaling (``(1.0 + weight) * x / rms``).
+        ``ops/gqa_attention.py`` and ``lynn-engine/engine/full_forward.py`` use
+        the same formula.
 
         Args:
             x: Tensor of shape (bsz, n_heads, seq_len, head_dim).
@@ -117,7 +122,7 @@ class QwenAttentionRef(TileRTModule):
             Normalized tensor with the same shape as ``x``.
         """
         rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
-        return x * weight / rms
+        return x * (1.0 + weight) / rms
 
     def golden_forward(
         self,
