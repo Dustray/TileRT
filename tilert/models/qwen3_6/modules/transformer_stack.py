@@ -100,7 +100,7 @@ class QwenTransformerStack(SerializableTileRTModule):
                 logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Calling DeltaNet.forward')
                 (out, layer_state) = block.forward(h, start_pos, caches.get('delta_state', {}).get(layer_idx))
                 if layer_state is not None:
-                    caches.setdefault('delta_state', {})[layer_idx] = layer_state['delta_state']
+                    caches.setdefault('delta_state', {})[layer_idx] = layer_state
                 logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   DeltaNet.forward output: shape={out.shape}')
             elif isinstance(block, GatedAttention):
                 logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Calling GatedAttention.forward')

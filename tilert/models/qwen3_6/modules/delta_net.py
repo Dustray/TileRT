@@ -279,8 +279,10 @@ class DeltaNet(SerializableTileRTModule):
 
         # ``new_state`` is a tuple ``(conv_state, recurrent_state)`` produced by
         # ``DeltaNetOp.golden_forward`` to keep both the causal convolution and
-        # the gated delta recurrence alive across decode steps.
-        next_state = {"delta_state": new_state} if state is not None else None
+        # the gated delta recurrence alive across decode steps.  It must always
+        # be returned so that ``QwenTransformerStack`` can persist it, even on
+        # the very first call when no prior state was supplied.
+        next_state = {"delta_state": new_state}
         return out, next_state
 
     def tilert_forward(
@@ -293,7 +295,7 @@ class DeltaNet(SerializableTileRTModule):
         prev_state = state.get("delta_state") if state is not None else None
         attn_out, new_state = self.attn.forward(x, start_pos, prev_state)
         ffn_out = self.ffn.forward(attn_out)
-        next_state = {"delta_state": new_state} if state is not None else None
+        next_state = {"delta_state": new_state}
         return ffn_out, next_state
 
     def forward(

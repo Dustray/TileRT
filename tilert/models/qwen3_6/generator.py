@@ -156,10 +156,9 @@ class Qwen36Generator:
         if prompt_tokens is None:
             chat_output = self.tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")  # prompt 编码为 input ids 并放 device
             # chat_output = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
-            if hasattr(chat_output, 'input_ids'):
-                prompt_tokens = list(chat_output['input_ids'])
-            else:
-                prompt_tokens = list(chat_output)
+            if chat_output.dim() > 1:
+                chat_output = chat_output[0]
+            prompt_tokens = chat_output.tolist()
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
@@ -173,24 +172,52 @@ class Qwen36Generator:
         logger.info(f'[GENERATOR] 初始化 finished 标志: device={self.default_device}')
         finished = torch.tensor([False] * self.batch_size, dtype=torch.bool, device=self.default_device)
         time_list = []
-        logger.info(f'[GENERATOR] 启动 decode 循环: range(1, {total_len})')
+        logger.info(f'[GENERATOR] 启动 lynn 风格 prefill + decode 循环: prompt_len={prompt_len}, total_len={total_len}')
+
+        # === PREFILL ===
+        # 与 lynn-engine generate_incremental 对齐：逐 token 消费 prompt，
+        # 建立 KV cache 与 DeltaNet recurrent/conv state。单步受限是因为
+        # forward_max_seq_len=1，但 state 会在层间正确传递。
+        logger.info(f'[GENERATOR] 开始 prefill，处理 prompt 位置 0..{prompt_len - 1}')
         multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
         (intermediates, *_) = multi_devices_results[0]
         next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
-        for cur_pos_val in range(1, total_len):
-            next_token = torch.where(prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token)
+        for cur_pos_val in range(1, prompt_len):
+            # prompt 位置强制使用真实 token，丢弃模型对该位置的采样结果。
+            next_token = tokens[0, cur_pos_val]
             tokens[0, cur_pos_val] = next_token
-            finished = finished | torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
             prev_pos = cur_pos_val
-            if cur_pos_val >= prompt_len:
-                decoded_tokens = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
-                if print_log:
-                    print(f'[{next_token.item()}:{decoded_tokens!r}]', end='', flush=True)
-            elif print_log:
+            if print_log:
                 print(f'(prompt pos {cur_pos_val})', end='', flush=True)
+            logger.info(f'[GENERATOR] prefill 步骤 cur_pos_val={cur_pos_val}，使用真实 prompt token={next_token.item()}')
+            multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
+            (intermediates, *_) = multi_devices_results[0]
+            next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
+        logger.info(f'[GENERATOR] prefill 完成，第一个生成 token 候选={next_token.item()}')
+
+        # === DECODE ===
+        # 从 prompt 之后开始生成新 token，每步输入上一步生成的 token，
+        # 位置从 prompt_len 递增。
+        logger.info(f'[GENERATOR] 开始 decode，生成位置 {prompt_len}..{total_len - 1}')
+        for cur_pos_val in range(prompt_len, total_len):
+            tokens[0, cur_pos_val] = next_token
+            finished = finished | (next_token == self.eos_id)
+            is_eos = (next_token == self.eos_id).item()
+            decoded_tokens = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
+            if print_log:
+                print(f'[{next_token.item()}:{decoded_tokens!r}]', end='', flush=True)
+            logger.info(f'[GENERATOR] decode 步骤 cur_pos_val={cur_pos_val}，输出 token={next_token.item()} is_eos={is_eos}')
             if finished.all():
                 logger.info(f'[GENERATOR] 所有序列在第 {cur_pos_val} 步结束，跳出循环')
                 break
+            start_time = time.time()
+            multi_devices_results = self.decode_layer.forward(tokens[0, cur_pos_val], with_mtp=with_mtp, cur_pos=cur_pos_val)
+            end_time = time.time()
+            elapsed = end_time - start_time
+            time_list.append(elapsed)
+            (intermediates, *_) = multi_devices_results[0]
+            next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
+            prev_pos = cur_pos_val
             if cur_pos_val % 10 == 0:
                 logger.info(f'[GENERATOR] 进度: {cur_pos_val}/{total_len - 1} 步, finished={finished.any().item()}')
         self.decode_layer.reset_sequence()
