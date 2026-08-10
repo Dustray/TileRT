@@ -1092,52 +1092,54 @@ class ExpertSelectUpGateSiLU(TileRTModule):
                 - ffn_e: [n_e, local_inter_dim], local SiLU(gate) * up.
                 - weight_e: [n_e, 1], routing weights for the assignment.
         """
-        logger.info(
-            f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] ENTRY: "
-            f"h_flat.shape={h_flat.shape}, routing_weights.shape={routing_weights.shape}, "
-            f"expert_indices.shape={expert_indices.shape}"
-        )
-
         assert self.ref_gate is not None
         assert self.ref_up is not None
         assert self.gate_up_proj_weight is not None
 
-        moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        dtype = h_flat.dtype
+        device = h_flat.device
 
-        # Shared expert is stored at local index 0.
-        shared_gate = self.ref_gate[0]
-        shared_up = self.ref_up[0]
-        # For the shared expert every token uses it; gather routing weights
-        # from the first activated slot (HF places the shared expert outside
-        # top-k, but TileRT keeps it in slot 0 of the expanded table).
-        # The shared expert is always present and should not be scaled by the
-        # routed-expert top-k weights.  It is later gated by the dedicated
-        # shared_expert_gate in the down path, so we use a unit weight here.
-        shared_weight = torch.ones(h_flat.size(0), 1, device=h_flat.device, dtype=routing_weights.dtype)
-        shared_gate_proj = F.linear(h_flat, shared_gate.to(dtype=h_flat.dtype))
-        shared_up_proj = F.linear(h_flat, shared_up.to(dtype=h_flat.dtype))
+        # Shared expert: single batched GEMM for all tokens.
+        shared_gate_proj = F.linear(h_flat, self.ref_gate[0].to(dtype))
+        shared_up_proj = F.linear(h_flat, self.ref_up[0].to(dtype))
         shared_ffn = F.silu(shared_gate_proj) * shared_up_proj
-        moe_intermediate.append((0, torch.arange(h_flat.size(0), device=h_flat.device), shared_ffn, shared_weight))
+        shared_weight = torch.ones(h_flat.size(0), 1, device=device, dtype=routing_weights.dtype)
 
-        # Routed experts: local index 0 is shared, so routed expert e uses
-        # ref_gate/ref_up[e + 1].
-        n_routed = self.n_routed_experts
-        for e in range(n_routed):
-            mask = expert_indices == e
-            if not mask.any():
-                continue
-            token_idx, slot_idx = mask.nonzero(as_tuple=True)
-            x_e = h_flat[token_idx]
-            gate_e = F.linear(x_e, self.ref_gate[e + 1].to(dtype=x_e.dtype))
-            up_e = F.linear(x_e, self.ref_up[e + 1].to(dtype=x_e.dtype))
-            ffn_e = F.silu(gate_e) * up_e
-            weight_e = routing_weights[token_idx, slot_idx].unsqueeze(-1)
-            moe_intermediate.append((e + 1, token_idx, ffn_e, weight_e))
+        # Routed experts: batch all activated experts into one big GEMM to avoid
+        # many tiny F.linear launches (the main decode bottleneck on ROCm).
+        # Build per-assignment index tensors of length N = num_tokens * topk.
+        num_tokens = h_flat.size(0)
+        topk = expert_indices.size(-1)
+        flat_expert_ids = expert_indices.view(-1)  # [N]
+        token_idx = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        token_idx = token_idx.unsqueeze(1).expand(num_tokens, topk).contiguous().view(-1)
+        slot_idx = torch.arange(topk, device=device, dtype=torch.int64)
+        slot_idx = slot_idx.unsqueeze(0).expand(num_tokens, topk).contiguous().view(-1)
 
-        logger.info(
-            f"[ExpertSelUpGateSiluOp.golden_forward_{self.device_id}] EXIT: "
-            f"{len(moe_intermediate)} activated expert fragments"
-        )
+        # Gather the selected gate/up weight for each assignment.
+        # ref_gate/ref_up: [1 + n_routed, local_inter_dim, dim]
+        gate_weights_selected = self.ref_gate[1 + flat_expert_ids].to(dtype)  # [N, local_inter_dim, dim]
+        up_weights_selected = self.ref_up[1 + flat_expert_ids].to(dtype)
+        x_selected = h_flat[token_idx]  # [N, dim]
+
+        # One batched matmul for all routed gate projections, one for all up.
+        routed_gate_proj = torch.bmm(x_selected.unsqueeze(1), gate_weights_selected.transpose(1, 2)).squeeze(1)
+        routed_up_proj = torch.bmm(x_selected.unsqueeze(1), up_weights_selected.transpose(1, 2)).squeeze(1)
+        routed_ffn = F.silu(routed_gate_proj) * routed_up_proj
+        routed_weights = routing_weights[token_idx, slot_idx].unsqueeze(-1)
+
+        # Return a dict for batched downstream consumption plus the legacy list
+        # tuple for compatibility.
+        moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = [
+            (0, torch.arange(num_tokens, device=device), shared_ffn, shared_weight),
+        ]
+        moe_intermediate.append((
+            -1,
+            token_idx,
+            routed_ffn,
+            routed_weights,
+            flat_expert_ids,
+        ))  # type: ignore[arg-type]
         return moe_intermediate
 
     def tilert_forward(

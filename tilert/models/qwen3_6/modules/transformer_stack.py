@@ -77,10 +77,8 @@ class QwenTransformerStack(SerializableTileRTModule):
         Dispatches each block via ``block.forward()`` so that individual ops
         can decide between golden/tilert based on ``flag_enable_tilert``.
         """
-        logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, exec_seq_len={len(self.exec_seq)}')
         mrope_embed = self._prepare_mrope_embed(mrope_embed)
         if caches is None:
-            logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}] Initializing layer caches')
             caches = self._init_layer_caches(mrope_embed)
         h = x
         shared_k_cache = caches['k_cache']
@@ -90,35 +88,18 @@ class QwenTransformerStack(SerializableTileRTModule):
         if seq_len > 1:
             mask = torch.full((seq_len, seq_len), float('-inf'), dtype=torch.float32, device=x.device)
             mask = torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0)
-            logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}] Created attention mask for seq_len={seq_len}')
-        logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}] Starting layer loop: {len(self.exec_seq)} layers')
         for (layer_idx, block) in enumerate(self.exec_seq):
-            block_type = type(block).__name__
-            logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}] === Layer {layer_idx}/{len(self.exec_seq) - 1}: {block_type} ===')
-            logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Input h: shape={h.shape}, dtype={h.dtype}, device={h.device}')
             if isinstance(block, DeltaNet):
-                logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Calling DeltaNet.forward')
                 (out, layer_state) = block.forward(h, start_pos, caches.get('delta_state', {}).get(layer_idx))
                 if layer_state is not None:
                     caches.setdefault('delta_state', {})[layer_idx] = layer_state
-                logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   DeltaNet.forward output: shape={out.shape}')
             elif isinstance(block, GatedAttention):
-                logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Calling GatedAttention.forward')
                 (out, shared_k_cache, shared_v_cache) = block.forward(h, start_pos, mrope_embed, shared_k_cache, shared_v_cache, mask)
-                logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   GatedAttention.forward output: shape={out.shape}')
-                logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Updated caches: k_cache={shared_k_cache.shape}, v_cache={shared_v_cache.shape}')
             else:
                 raise TypeError(f'Unsupported block type: {type(block)}')
-            if torch.isnan(out).any() or torch.isinf(out).any():
-                logger.warning(f'QwenTransformerStack layer {layer_idx} produced NaN/Inf; mean={out.float().mean().item():.4f}, std={out.float().std().item():.4f}')
             h = out
-            if layer_idx == 9:
-                break
-            if layer_idx % 10 == 0 or layer_idx == len(self.exec_seq) - 1:
-                logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}]   Layer {layer_idx} output stats: mean={h.float().mean().item():.4f}, std={h.float().std().item():.4f}, min={h.float().min().item():.4f}, max={h.float().max().item():.4f}')
         caches['k_cache'] = shared_k_cache
         caches['v_cache'] = shared_v_cache
-        logger.info(f'[QwenTransformerStack.golden_forward_{self.device_id}] EXIT: h.shape={h.shape}, dtype={h.dtype}')
         return (h, caches)
 
     def tilert_forward(self, x: torch.Tensor, start_pos: int, mrope_embed: tuple[torch.Tensor, torch.Tensor], caches: dict[str, Any] | None=None) -> tuple[torch.Tensor, dict[str, Any]]:

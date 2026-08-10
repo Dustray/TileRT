@@ -774,10 +774,6 @@ class ExpertDownAllReduce(TileRTModule):
         Returns:
             [num_tokens, dim] fully all-reduced MoE output.
         """
-        logger.info(
-            f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] "
-            f"ENTRY: h_flat.shape={h_flat.shape}, fragments={len(moe_intermediate)}"
-        )
         assert self.ref_down is not None
 
         num_tokens = h_flat.size(0)
@@ -790,23 +786,37 @@ class ExpertDownAllReduce(TileRTModule):
             (num_tokens, hidden_size), device=device, dtype=dtype
         )
 
-        # Apply local down-projection and scatter-add for routed experts first.
-        # The shared expert is handled afterwards, matching the single-card
-        # prototype where it is added once, after the routed experts.
-        for expert_id, token_idx, ffn_e, weight_e in moe_intermediate:
+        # Separate legacy per-expert tuples from the new batched routed tuple.
+        routed_batched = None
+        shared_tuple = None
+        for item in moe_intermediate:
+            expert_id = item[0]
             if expert_id == 0:
-                continue
-            down_weight = self.ref_down[expert_id].to(dtype=ffn_e.dtype)
-            down_e = F.linear(ffn_e, down_weight)
-            down_e = down_e * weight_e.to(dtype)
-            moe_out.index_add_(0, token_idx, down_e)
+                shared_tuple = item
+            elif expert_id == -1:
+                routed_batched = item
+            else:
+                # Legacy per-expert path (kept for safety/fallback).
+                token_idx, ffn_e, weight_e = item[1], item[2], item[3]
+                down_weight = self.ref_down[expert_id].to(dtype=ffn_e.dtype)
+                down_e = F.linear(ffn_e, down_weight)
+                down_e = down_e * weight_e.to(dtype)
+                moe_out.index_add_(0, token_idx, down_e)
 
-        # Shared expert contribution: add it after the routed experts, using the
-        # dedicated shared-expert gate and unit weight, just like the single-card
-        # prototype path.
-        for expert_id, token_idx, ffn_e, weight_e in moe_intermediate:
-            if expert_id != 0:
-                continue
+        # Batched routed down-projection: one big bmm instead of many tiny linears.
+        if routed_batched is not None:
+            token_idx, ffn_e, weight_e, flat_expert_ids = (
+                routed_batched[1], routed_batched[2], routed_batched[3], routed_batched[4]
+            )
+            # ref_down: [1 + n_routed, dim, local_inter_dim]; select down weight per assignment.
+            down_weights_selected = self.ref_down[1 + flat_expert_ids].to(dtype)  # [N, dim, local_inter_dim]
+            down_proj = torch.bmm(ffn_e.unsqueeze(1), down_weights_selected.transpose(1, 2)).squeeze(1)
+            down_proj = down_proj * weight_e.to(dtype)
+            moe_out.index_add_(0, token_idx, down_proj)
+
+        # Shared expert contribution
+        if shared_tuple is not None:
+            expert_id, token_idx, ffn_e, weight_e = shared_tuple
             down_weight = self.ref_down[expert_id].to(dtype=ffn_e.dtype)
             down_e = F.linear(ffn_e, down_weight)
             if self.ref_shared_expert_gate is not None:
@@ -817,19 +827,11 @@ class ExpertDownAllReduce(TileRTModule):
                 down_e = down_e * shared_gate
             down_e = down_e * weight_e.to(dtype)
             moe_out.index_add_(0, token_idx, down_e)
-            break
 
-        # TP row parallel all-reduce.  When distributed is initialized use
-        # the default process group; otherwise fall back to the barrier-based
-        # callback installed by ``QwenTransformerStack`` / ``QwenShowHandsLayer``.
+        # TP row parallel all-reduce.
         if dist.is_initialized():
             dist.all_reduce(moe_out, op=dist.ReduceOp.SUM)
         elif self.num_devices > 1 and self.moe_sync_callback is not None:
-            # Keep the callback contract explicit: local 2D MoE output is
-            # converted to a 3D [1, seq_len, dim] tensor and then reshaped back
-            # to [num_tokens, dim] after aggregation.  Using the stored
-            # sequence length is safer than a hard-coded 1, which could corrupt
-            # the returned tensor when the shape is not a single-token decode.
             seq_len = getattr(self, "_last_seq_len", num_tokens)
             if seq_len <= 0:
                 seq_len = num_tokens
@@ -837,10 +839,6 @@ class ExpertDownAllReduce(TileRTModule):
             full_3d = self.moe_sync_callback(partial_3d.contiguous())
             moe_out = full_3d.reshape(num_tokens, hidden_size)
 
-        logger.info(
-            f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] "
-            f"EXIT: moe_out.shape={moe_out.shape}"
-        )
         return moe_out
         # assert self.ref_down is not None
         # assert vec_in.dim() == 4 and vec_in.size(0) == 1

@@ -17,7 +17,6 @@ import json
 import os
 import sys
 import threading
-import time
 import warnings
 from typing import Any
 import torch
@@ -369,7 +368,6 @@ class QwenShowHandsLayer:
             params: list[torch.Tensor] = []
             state_dicts: dict[str, torch.Tensor] = {}
             stack: QwenTransformerStack | None = None
-            start_time = time.time()
             with torch.cuda.device(device_id):
                 if model_path is not None:
                     skip_keys = skip_keys_per_device.get(device_id) if skip_keys_per_device is not None else None
@@ -488,11 +486,7 @@ class QwenShowHandsLayer:
                 self._base_caches_count = base_caches_count  # type: ignore[attr-defined]
             del state_dicts
             torch.cuda.empty_cache()
-            elapsed_time = time.time() - start_time
-            minutes = int(elapsed_time // 60)
-            seconds = int(elapsed_time % 60)
-            time_str = f'{minutes} minutes {seconds} seconds' if minutes > 0 else f'{seconds} seconds'
-            logger.info(f'Completed loading weights for device {device_id} in {time_str}')
+            logger.info(f'Completed loading weights for device {device_id}')
         threads: list[threading.Thread] = []
         exceptions: list[Exception | None] = [None] * self.num_devices
         if False:
@@ -711,10 +705,13 @@ class QwenShowHandsLayer:
         idx = token_id.view(-1).to(embed_weight.device)
         x = embed_weight[idx].unsqueeze(0).to(torch.bfloat16)
         seq_len = x.size(1)
+        max_token_id_len = intermediates[Idx.TOKEN_ID].size(1)
         if seq_len == 1:
             intermediates[Idx.TOKEN_ID][0, 0, 0] = token_id.view(-1)[0]
-        else:
+        elif seq_len <= max_token_id_len:
             intermediates[Idx.TOKEN_ID][0, :seq_len, 0] = token_id.view(-1)
+        else:
+            logger.warning(f'[QwenShowHandsLayer._golden_forward_device] token_id seq_len={seq_len} 超过 TOKEN_ID buffer={max_token_id_len}，跳过 TOKEN_ID 记录')
         intermediates[Idx.CUR_POS][0] = cur_pos
         if self._golden_caches[device_id] is None:
             self._golden_caches[device_id] = stack._init_layer_caches((freqs_cos_param, freqs_sin_param))
@@ -851,6 +848,24 @@ class QwenShowHandsLayer:
             logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] 设备 {device_id} token_out={token_out} argmax={argmax_token} logits_top5={logits_out.topk(5).indices.tolist()}')
         logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] 退出，返回 {len(results)} 个设备结果')
         return [results[device_id] for device_id in range(self.num_devices)]  # type: ignore[return-value]
+
+    def decode_step(self, token_id: torch.Tensor, cur_pos: int, with_mtp: bool | None=None) -> list[DeviceResult]:
+        """Incremental decode for a single new token.
+
+        Unlike :meth:`forward`, this method bypasses the CUDA-graph kernel
+        attempt and directly uses the golden/HF incremental path, since decode
+        is always ``seq_len == 1`` and must update the recurrent/KV caches
+        in place rather than recompute the whole prefix.
+        """
+        active_mtp = with_mtp if with_mtp is not None else self.with_mtp
+        token_val = token_id.view(-1).tolist() if token_id.numel() > 1 else token_id.item()
+        logger.info(f'[QwenShowHandsLayer.decode_step] ENTRY: token_id={token_val}, cur_pos={cur_pos}, num_devices={self.num_devices}')
+        with torch.inference_mode():
+            if self._hf_model is not None:
+                logger.info(f'[QwenShowHandsLayer.decode_step] 使用 HF 回退路径')
+                return self._hf_forward(token_id)
+            logger.info(f'[QwenShowHandsLayer.decode_step] Using golden incremental forward on all {self.num_devices} devices')
+            return self._golden_forward_all_devices(token_id, cur_pos)
 
     def set_sampling_seed(self, seed: int, with_mtp: bool | None=None) -> None:
         """Set the sampling seed for top-p sampling."""

@@ -239,49 +239,20 @@ class DeltaNet(SerializableTileRTModule):
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         """Reference forward: full DeltaNet layer with residuals and layer norms."""
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, has_state={state is not None}")
-        
         self._ensure_weights(x)
         prev_state = state.get("delta_state") if state is not None else None
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] prev_state: {type(prev_state)}")
 
-        # Pre-attention norm + attention + residual.
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step1: input_layernorm, input shape={x.shape}")
         norm_x = self.input_layernorm(x)
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step2: attention (attn.golden_forward)")
         attn_out, new_state = self.attn.golden_forward(norm_x, start_pos, prev_state)
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] attn_out: shape={attn_out.shape}, new_state type={type(new_state)}")
-        self.recurrent_state = new_state[0] # 保存一下 recurrent_state
-        self.conv_state = new_state[1] # 保存一下conv_state
+        self.recurrent_state = new_state[0]
+        self.conv_state = new_state[1]
         h = x + attn_out
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] After residual: h.shape={h.shape}")
 
-        # Post-attention norm + MoE FFN (partial TP8 sum) + all-reduce.
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step3: post_attention_layernorm")
         norm_h = self.post_attention_layernorm(h)
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Step4: MoE FFN (ffn.golden_forward)")
-        
         ffn_partial = self.ffn.golden_forward(norm_h)
-        logger.info(
-            f"[DeltaNet.golden_forward_{self.device_id}] ffn_partial: "
-            f"shape={ffn_partial.shape} mean={ffn_partial.float().mean().item():.6f} "
-            f"std={ffn_partial.float().std().item():.6f}"
-        )
 
-        # The TP8 MoE down-op already performs the all-reduce internally.
-        # Applying the callback again here would double-aggregate the same
-        # tensor and corrupt the result on multi-GPU runs.
-        ffn_full = ffn_partial
+        out = h + ffn_partial
 
-        # Final residual uses the all-reduced (full) FFN output.
-        out = h + ffn_full
-        logger.info(f"[DeltaNet.golden_forward_{self.device_id}] Final output: shape={out.shape}, mean={out.float().mean().item():.4f}")
-
-        # ``new_state`` is a tuple ``(conv_state, recurrent_state)`` produced by
-        # ``DeltaNetOp.golden_forward`` to keep both the causal convolution and
-        # the gated delta recurrence alive across decode steps.  It must always
-        # be returned so that ``QwenTransformerStack`` can persist it, even on
-        # the very first call when no prior state was supplied.
         next_state = {"delta_state": new_state}
         return out, next_state
 

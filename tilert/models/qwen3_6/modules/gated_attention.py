@@ -308,42 +308,18 @@ class GatedAttention(SerializableTileRTModule):
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reference GQA forward with residuals, norms, and MoE FFN."""
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
-        
         self._ensure_weights(x)
 
-        # Pre-attention norm + GQA (o_proj applied internally) + residual.
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step1: input_layernorm")
         norm_x = self.input_layernorm(x)
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step2: GQA attention (attn.golden_forward)")
         attn_out, k_cache, v_cache = self.attn.golden_forward(
             norm_x, start_pos, mrope_embed, k_cache, v_cache, mask
         )
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] attn_out: shape={attn_out.shape}, k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
-        
         h = x + attn_out
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] After residual: h.shape={h.shape}")
 
-        # Post-attention norm + MoE FFN (partial TP8 sum) + all-reduce.
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step3: post_attention_layernorm")
         norm_h = self.post_attention_layernorm(h)
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] Step4: MoE FFN (ffn.golden_forward)")
-        
         ffn_partial = self.ffn.golden_forward(norm_h)
-        logger.info(
-            f"[GatedAttention.golden_forward_{self.device_id}] ffn_partial: "
-            f"shape={ffn_partial.shape} mean={ffn_partial.float().mean().item():.6f} "
-            f"std={ffn_partial.float().std().item():.6f}"
-        )
 
-        # The TP8 MoE down-op already performs the all-reduce internally.
-        # Applying the callback again here would double-aggregate the same
-        # tensor and corrupt the result on multi-GPU runs.
-        ffn_full = ffn_partial
-
-        # Final residual uses the all-reduced (full) FFN output.
-        out = h + ffn_full
-        logger.info(f"[GatedAttention.golden_forward_{self.device_id}] EXIT: out.shape={out.shape}, mean={out.float().mean().item():.4f}")
+        out = h + ffn_partial
 
         return out, k_cache, v_cache
 

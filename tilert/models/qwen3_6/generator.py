@@ -1,6 +1,4 @@
 """Qwen3.6-35B-A3B generator module."""
-import math
-import time
 import torch
 from transformers import AutoTokenizer
 from tilert import logger
@@ -8,17 +6,7 @@ from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.end2end import QwenShowHandsLayer, _extract_ffn_ops, _get_moe_weight_keys
 from tilert.models.qwen3_6.temp_var_indices import Idx
 from tilert.tilert_init import tilert_init
-__all__ = ['Qwen36Generator', 'stats_time']
-
-def stats_time(time_list: list[float], title: str) -> None:
-    """Print timing statistics."""
-    if len(time_list) > 0:
-        avg_time = sum(time_list) / len(time_list)
-        std_dev = math.sqrt(sum(((x - avg_time) ** 2 for x in time_list)) / len(time_list))
-        logger.info(f'[GENERATOR] {title}')
-        logger.info(f'[GENERATOR] -- 平均生成单个 token 耗时: {avg_time * 1000:.4f} ms')
-        logger.info(f'[GENERATOR] -- 耗时标准差: {std_dev * 1000:.4f} ms')
-        logger.info(f'[GENERATOR] -- 等效吞吐: {1 / avg_time:.4f} tokens/s')
+__all__ = ['Qwen36Generator']
 
 class Qwen36Generator:
     """Generator for Qwen3.6-35B-A3B.
@@ -141,6 +129,8 @@ class Qwen36Generator:
         Returns:
             Tuple of (result_text, time_list, accepted_counts, prompt_len).
             accepted_counts is empty for non-MTP mode.
+            time_list is retained in the return signature for API compatibility
+            but is now empty.
         """
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         if active_mtp and (not self.with_mtp):
@@ -148,10 +138,10 @@ class Qwen36Generator:
         self.decode_layer.set_sampling_seed(self.sampling_seed, with_mtp=active_mtp)
         if active_mtp:
             return self._generate_with_mtp(prompt, print_log, prompt_tokens=prompt_tokens)
-        (result, time_list, prompt_len) = self._generate_without_mtp(prompt, print_log, with_mtp=active_mtp, prompt_tokens=prompt_tokens)
-        return (result, time_list, [], prompt_len)
+        (result, prompt_len) = self._generate_without_mtp(prompt, print_log, with_mtp=active_mtp, prompt_tokens=prompt_tokens)
+        return (result, [], [], prompt_len)
 
-    def _generate_without_mtp(self, prompt: str, print_log: bool=True, with_mtp: bool=False, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], int]:
+    def _generate_without_mtp(self, prompt: str, print_log: bool=True, with_mtp: bool=False, prompt_tokens: list[int] | None=None) -> tuple[str, int]:
         """Standard generation without MTP."""
         if prompt_tokens is None:
             chat_output = self.tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")  # prompt 编码为 input ids 并放 device
@@ -159,6 +149,8 @@ class Qwen36Generator:
             if chat_output.dim() > 1:
                 chat_output = chat_output[0]
             prompt_tokens = chat_output.tolist()
+        if prompt_tokens is None:
+            prompt_tokens = []
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
@@ -171,28 +163,16 @@ class Qwen36Generator:
         prev_pos = 0
         logger.info(f'[GENERATOR] 初始化 finished 标志: device={self.default_device}')
         finished = torch.tensor([False] * self.batch_size, dtype=torch.bool, device=self.default_device)
-        time_list = []
         logger.info(f'[GENERATOR] 启动 lynn 风格 prefill + decode 循环: prompt_len={prompt_len}, total_len={total_len}')
 
         # === PREFILL ===
-        # 与 lynn-engine generate_incremental 对齐：逐 token 消费 prompt，
-        # 建立 KV cache 与 DeltaNet recurrent/conv state。单步受限是因为
-        # forward_max_seq_len=1，但 state 会在层间正确传递。
-        logger.info(f'[GENERATOR] 开始 prefill，处理 prompt 位置 0..{prompt_len - 1}')
-        multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
+        # 与 lynn-engine generate_incremental 对齐：一次性把整个 prompt 并行过
+        # 模型，建立 KV cache 与 DeltaNet recurrent/conv state。
+        logger.info(f'[GENERATOR] 开始整段 prefill，prompt_len={prompt_len}')
+        prompt_ids = tokens[0, :prompt_len].reshape(1, prompt_len).to(torch.int32)
+        multi_devices_results = self.decode_layer.forward(prompt_ids, with_mtp=with_mtp, cur_pos=0)
         (intermediates, *_) = multi_devices_results[0]
-        next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
-        for cur_pos_val in range(1, prompt_len):
-            # prompt 位置强制使用真实 token，丢弃模型对该位置的采样结果。
-            next_token = tokens[0, cur_pos_val]
-            tokens[0, cur_pos_val] = next_token
-            prev_pos = cur_pos_val
-            if print_log:
-                print(f'(prompt pos {cur_pos_val})', end='', flush=True)
-            logger.info(f'[GENERATOR] prefill 步骤 cur_pos_val={cur_pos_val}，使用真实 prompt token={next_token.item()}')
-            multi_devices_results = self.decode_layer.forward(tokens[0, prev_pos], with_mtp=with_mtp, cur_pos=prev_pos)
-            (intermediates, *_) = multi_devices_results[0]
-            next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
+        next_token = intermediates[Idx.TOKEN_OUT][0, -1, 0]
         logger.info(f'[GENERATOR] prefill 完成，第一个生成 token 候选={next_token.item()}')
 
         # === DECODE ===
@@ -210,11 +190,7 @@ class Qwen36Generator:
             if finished.all():
                 logger.info(f'[GENERATOR] 所有序列在第 {cur_pos_val} 步结束，跳出循环')
                 break
-            start_time = time.time()
-            multi_devices_results = self.decode_layer.forward(tokens[0, cur_pos_val], with_mtp=with_mtp, cur_pos=cur_pos_val)
-            end_time = time.time()
-            elapsed = end_time - start_time
-            time_list.append(elapsed)
+            multi_devices_results = self.decode_layer.decode_step(tokens[0, cur_pos_val], cur_pos=cur_pos_val, with_mtp=with_mtp)
             (intermediates, *_) = multi_devices_results[0]
             next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
             prev_pos = cur_pos_val
@@ -228,19 +204,19 @@ class Qwen36Generator:
                 toks = toks[:toks.index(self.eos_id)]
             completion_tokens.append(toks)
         decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
-        return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', time_list, prompt_len)
+        return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', prompt_len)
 
     def _generate_with_mtp(self, prompt: str, print_log: bool=True, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], list[int], int]:
         """Generation with MTP (Multi-Token Prediction) speculative decoding."""
         if prompt_tokens is None:
             prompt_tokens = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
+        if prompt_tokens is None:
+            prompt_tokens = []
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
         tokens = torch.full((self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device)
         tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device=self.default_device)
-        prefill_time_list = []
-        decode_time_list = []
         decode_accepted_counts = []
         cur_pos = 0
         while cur_pos < prompt_len - 1:
@@ -259,10 +235,7 @@ class Qwen36Generator:
                 mtp_extra_token = int(tokens[0, draft_end - 1].item())
             self.decode_layer.set_prefill_mtp_extra_token(mtp_extra_token)
             self.decode_layer.set_prefill_valid_tokens(actual_token_count)
-            start_time = time.time()
             self.decode_layer.forward(draft_tokens, with_mtp=True, cur_pos=cur_pos)
-            end_time = time.time()
-            prefill_time_list.append(end_time - start_time)
             cur_pos += actual_token_count
         cur_pos = prompt_len - 1
         self.set_cur_pos(prompt_len - 1)
@@ -275,10 +248,7 @@ class Qwen36Generator:
                 draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
             else:
                 draft_tokens = self.decode_layer.get_next_draft_tokens(0).reshape(1, self.mtp_seq_len)
-            start_time = time.time()
             self.decode_layer.forward(draft_tokens, with_mtp=True, cur_pos=cur_pos)
-            end_time = time.time()
-            decode_time_list.append(end_time - start_time)
             num_accepted = self.decode_layer.get_num_accepted(0)
             predicted_tokens = self.decode_layer.get_predicted_tokens(0).flatten()
             decode_accepted_counts.append(num_accepted)
@@ -305,12 +275,6 @@ class Qwen36Generator:
                 min_accepted = min(decode_accepted_counts)
                 max_accepted = max(decode_accepted_counts)
                 logger.info(f'[GENERATOR] -- 每次调用接受 token 数: 均值={avg_accepted:.2f}, 最小={min_accepted}, 最大={max_accepted}')
-            if decode_time_list:
-                total_decode_time = sum(decode_time_list)
-                effective_tps = total_tokens / total_decode_time if total_decode_time > 0 else 0
-                avg_time_ms = total_decode_time / len(decode_time_list) * 1000
-                logger.info(f'[GENERATOR] -- 平均前向耗时: {avg_time_ms:.2f}ms')
-                logger.info(f'[GENERATOR] -- MTP 等效吞吐: {effective_tps:.2f} tokens/s')
             print('\n')
         self.decode_layer.reset_sequence()
         completion_tokens = []
@@ -321,7 +285,7 @@ class Qwen36Generator:
                 toks = toks[:toks.index(self.eos_id)]
             completion_tokens.append(toks)
         decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
-        return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', decode_time_list, decode_accepted_counts, prompt_len)
+        return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', [], decode_accepted_counts, prompt_len)
 
     def generate_streaming(self, prompt: str):
         """Generate text with streaming output.

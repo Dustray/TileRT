@@ -10,7 +10,6 @@ from tilert import logger
 from tilert.models.base import TileRTModule
 from tilert.models.common import RMSNorm, init_func, linear
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
-from tilert.utils import get_profile_log_tensor
 
 __all__ = [
     "RMSNormExpertProj",
@@ -97,10 +96,10 @@ class RMSNormExpertProj(TileRTModule):
 
         self.tilert_proj_weight: torch.Tensor | None = None
         self.tilert_rms_norm_weight: torch.Tensor | None = None
-
-        self.profile_logs = get_profile_log_tensor()
+        self.profile_logs: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
+        assert self.tilert_rms_norm_weight is not None and self.tilert_proj_weight is not None
         return [self.tilert_rms_norm_weight, self.tilert_proj_weight]
 
     def device_sharding(
@@ -169,18 +168,16 @@ class RMSNormExpertProj(TileRTModule):
     def golden_forward(
         self, x_in: torch.Tensor, residual: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, residual={residual is not None}")
         import torch.nn.functional as F
-        
+
         assert self.is_ref_weights_init, "Reference weights must be initialized before forward pass"
         assert self.ref_gate is not None and self.ref_rmsnorm is not None and self.ref_proj_weight is not None
-        
-        logger.info(f"[RMSNormExpertProjOp.golden_forward_{self.device_id}] Applying RMSNorm")
-        B, M, D = x_in.shape  # 解包输入形状
-        x_flat = x_in.view(B * M, D)  # 展平为 [total_tokens, D]
-        router_logits = F.linear(x_flat.float(), self.ref_proj_weight.float())  # 计算 router logits
-        routing_weights, expert_indices = torch.topk(router_logits, self.n_activated_experts, dim=-1)  # top-K 专家和未归一化权重
-        routing_weights = F.softmax(routing_weights, dim=-1, dtype=torch.float32).to(x_in.dtype)  # softmax 归一化后转回输入 dtype
+
+        B, M, D = x_in.shape
+        x_flat = x_in.view(B * M, D)
+        router_logits = F.linear(x_flat.float(), self.ref_proj_weight.float())
+        routing_weights, expert_indices = torch.topk(router_logits, self.n_activated_experts, dim=-1)
+        routing_weights = F.softmax(routing_weights, dim=-1, dtype=torch.float32).to(x_in.dtype)
         return x_flat, routing_weights, expert_indices
         # moe_out = torch.zeros_like(h_flat)  # 初始化输出缓冲区
         # norm_x = self.ref_gate(x_flat, residual)
