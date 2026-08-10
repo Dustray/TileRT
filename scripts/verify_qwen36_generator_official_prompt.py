@@ -12,7 +12,8 @@
 
 执行：
     cd /public/home/panyq/yiny/projects/TileRT
-    PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_official_prompt.py
+    export HIP_VISIBLE_DEVICES=0,1,2,3 
+    HIP_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/public/home/panyq/yiny/projects/TileRT python3 scripts/verify_qwen36_generator_official_prompt.py
 """
 import logging
 import os

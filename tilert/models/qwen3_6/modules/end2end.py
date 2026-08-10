@@ -15,6 +15,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import queue
 import sys
 import threading
 import warnings
@@ -171,6 +172,12 @@ class QwenShowHandsLayer:
         self.top_p = top_p
         self.top_k = top_k
         self.use_topp = use_topp
+        # 生产者-消费者模型：每个设备一个持久工作线程。
+        self._worker_queues_in: list[queue.Queue | None] = [None] * self.num_devices
+        self._worker_queues_out: list[queue.Queue | None] = [None] * self.num_devices
+        self._worker_threads: list[threading.Thread | None] = [None] * self.num_devices
+        self._workers_started = False
+        self._workers_shutdown = threading.Event()
         logger.info(f'[QwenShowHandsLayer.__init__] 配置完成：model_path={model_path}, num_devices={self.num_devices}, max_seq_len={self.forward_max_seq_len}, with_mtp={with_mtp}, temperature={temperature}, top_p={top_p}, top_k={top_k}, use_topp={use_topp}')
 
     def _gen_freqs_cis(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -527,6 +534,65 @@ class QwenShowHandsLayer:
                             self.forward_max_seq_len,
                             False,
                         )
+        self._start_device_workers()
+
+    def _start_device_workers(self) -> None:
+        """Start one persistent worker thread per device (producer-consumer)."""
+        if self._workers_started:
+            return
+        logger.info(f'[QwenShowHandsLayer._start_device_workers] 启动 {self.num_devices} 个设备工作线程')
+        for device_id in range(self.num_devices):
+            in_q: queue.Queue = queue.Queue(maxsize=1)
+            out_q: queue.Queue = queue.Queue(maxsize=1)
+            self._worker_queues_in[device_id] = in_q
+            self._worker_queues_out[device_id] = out_q
+            t = threading.Thread(target=self._device_worker_loop, args=(device_id,), name=f'qwen36-device-worker-{device_id}', daemon=True)
+            self._worker_threads[device_id] = t
+            t.start()
+        self._workers_started = True
+        logger.info('[QwenShowHandsLayer._start_device_workers] 工作线程启动完成')
+
+    def _stop_device_workers(self) -> None:
+        """Signal all device worker threads to exit and wait for them."""
+        if not self._workers_started:
+            return
+        logger.info('[QwenShowHandsLayer._stop_device_workers] 停止设备工作线程')
+        self._workers_shutdown.set()
+        for device_id in range(self.num_devices):
+            in_q = self._worker_queues_in[device_id]
+            if in_q is not None:
+                try:
+                    in_q.put_nowait(None)
+                except queue.Full:
+                    pass
+        for device_id in range(self.num_devices):
+            t = self._worker_threads[device_id]
+            if t is not None and t.is_alive():
+                t.join(timeout=5.0)
+        self._workers_started = False
+        self._workers_shutdown.clear()
+        logger.info('[QwenShowHandsLayer._stop_device_workers] 工作线程已停止')
+
+    def _device_worker_loop(self, device_id: int) -> None:
+        """Persistent worker loop: waits for tasks, runs golden forward, returns result."""
+        logger.info(f'[QwenShowHandsLayer._device_worker_loop_{device_id}] 工作线程启动')
+        in_q = self._worker_queues_in[device_id]
+        out_q = self._worker_queues_out[device_id]
+        assert in_q is not None and out_q is not None
+        while not self._workers_shutdown.is_set():
+            task = in_q.get()
+            if task is None:
+                break
+            token_id, cur_pos, done_event = task
+            try:
+                with torch.inference_mode():
+                    result = self._golden_forward_device(device_id, token_id, cur_pos)
+                out_q.put((result, None))
+            except Exception as exc:
+                out_q.put((None, exc))
+            finally:
+                done_event.set()
+        logger.info(f'[QwenShowHandsLayer._device_worker_loop_{device_id}] 工作线程退出')
 
     def _init_hf_fallback(self, model_path: str) -> None:
         """Load a transformers model as a fallback when TileRT kernels are unavailable.
@@ -813,32 +879,32 @@ class QwenShowHandsLayer:
             return results
 
     def _golden_forward_all_devices(self, token_id: torch.Tensor, cur_pos: int) -> list[DeviceResult]:
-        """Run the golden forward on all devices in parallel.
+        """Run the golden forward on all devices via persistent worker threads.
 
-        Each device computes its TP8 MoE shard; the barrier inside
-        ``_moe_sync`` aggregates partial outputs after every layer.
+        Uses a producer-consumer pattern: submit one task per device, wait for
+        completion events, and collect results.  This avoids creating and
+        destroying Python threads on every decode step.
         """
         token_val = token_id.view(-1).tolist() if token_id.numel() > 1 else token_id.item()
         logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] ENTRY: token_id={token_val}, cur_pos={cur_pos}, num_devices={self.num_devices}')
+        if not self._workers_started:
+            self._start_device_workers()
         results: list[DeviceResult | None] = [None] * self.num_devices
         exceptions: list[Exception | None] = [None] * self.num_devices
-
-        def _runner(device_id: int) -> None:
-            try:
-                logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] 启动设备 {device_id} 线程')
-                with torch.inference_mode():
-                    results[device_id] = self._golden_forward_device(device_id, token_id, cur_pos)
-                logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] 设备 {device_id} 线程完成')
-            except Exception as exc:
+        done_events: list[threading.Event] = [threading.Event() for _ in range(self.num_devices)]
+        for device_id in range(self.num_devices):
+            in_q = self._worker_queues_in[device_id]
+            assert in_q is not None
+            in_q.put((token_id, cur_pos, done_events[device_id]))
+        for device_id in range(self.num_devices):
+            done_events[device_id].wait()
+            out_q = self._worker_queues_out[device_id]
+            assert out_q is not None
+            result, exc = out_q.get()
+            if exc is not None:
                 exceptions[device_id] = exc
-                logger.error(f'[QwenShowHandsLayer._golden_forward_all_devices] 设备 {device_id} 线程失败：{exc}')
-        threads = [threading.Thread(target=_runner, args=(device_id,)) for device_id in range(self.num_devices)]
-        logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] 启动 {len(threads)} 个线程')
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        logger.info(f'[QwenShowHandsLayer._golden_forward_all_devices] 所有线程已 join')
+            else:
+                results[device_id] = result  # type: ignore[assignment]
         for (device_id, exc) in enumerate(exceptions):
             if exc is not None:
                 raise RuntimeError(f'设备 {device_id} 的 golden forward 失败：{exc}') from exc
@@ -902,6 +968,7 @@ class QwenShowHandsLayer:
 
     def cleanup(self) -> None:
         """Release CUDA graphs and cached reference tensors."""
+        self._stop_device_workers()
         self._golden_caches = [None] * self.num_devices
         self._full_head_proj_cache = [None] * self.num_devices
         try:
