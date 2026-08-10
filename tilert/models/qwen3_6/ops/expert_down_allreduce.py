@@ -840,50 +840,6 @@ class ExpertDownAllReduce(TileRTModule):
             moe_out = full_3d.reshape(num_tokens, hidden_size)
 
         return moe_out
-        # assert self.ref_down is not None
-        # assert vec_in.dim() == 4 and vec_in.size(0) == 1
-        # # ``rmsnorm_expert_proj`` returns scores as a 2-D tensor when the input
-        # # batch dimension is 1 (it calls ``view(-1, dim)``).  Promote back to
-        # # ``[1, seq_len, ...]`` so the token-wise indexing below is consistent.
-        # if indices.ndim == 2:
-        #     indices = indices.unsqueeze(0)
-        #     scores = scores.unsqueeze(0)
-        #     logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 将 indices/scores 从二维提升为三维")
-        # # TP8: reference weights contain every expert but only the local
-        # # inter_dim shard, so global expert indices index directly into ref_down
-        # # (the shared expert lives at index 0).
-        # local_indices = indices
-        # seq_len = vec_in.shape[1]
-        # logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 正在处理 {seq_len} 个 token，n_activated_experts={self.n_activated_experts}")
-
-        # hidden_out_list = []
-        # for s in range(seq_len):
-        #     hidden_out_w2_list = []
-        #     logger.debug(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] Token {s}: 计算共享专家")
-        #     hidden_out_w2_shared = vec_in[0, s, 0].float() @ self.ref_down[0].float().mT
-        #     # Apply the shared-expert gate in the same place as the HF model:
-        #     # after the shared expert down-projection and before adding the
-        #     # routed expert outputs.
-        #     if x_in is not None:
-        #         shared_gate = torch.sigmoid(
-        #             x_in[0, s].float() @ self.ref_shared_expert_gate.float().mT
-        #         )
-        #         hidden_out_w2_shared = hidden_out_w2_shared * shared_gate.squeeze(-1)
-        #         logger.debug(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] Token {s}: 已应用共享门控")
-        #     hidden_out_w2_list.append(hidden_out_w2_shared)
-        #     ref_down_sel = self.ref_down[1:][local_indices[0, s]]
-        #     for i in range(self.n_activated_experts):
-        #         hidden_out_w2_sel = vec_in[0, s, i + 1].float() @ ref_down_sel[i].float().mT
-        #         hidden_out_w2_list.append(hidden_out_w2_sel * scores[0, s, i])
-        #     hidden_out_w2 = torch.stack(hidden_out_w2_list, dim=0).to(torch.bfloat16)
-        #     hidden_out_w2 = torch.sum(hidden_out_w2, dim=0)
-
-        #     hidden_out_list.append(hidden_out_w2)
-        # hidden_out = torch.stack(hidden_out_list, dim=0)
-        # result = hidden_out[None, ...]
-        # logger.info(f"[dev={self.device_id}] [ExpertDownAllReduceOp.golden_forward_{self.device_id}] 出口: result.shape={result.shape}")
-
-        # return result
 
     def tilert_forward(
         self,

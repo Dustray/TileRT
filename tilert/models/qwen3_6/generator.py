@@ -1,4 +1,5 @@
 """Qwen3.6-35B-A3B generator module."""
+import time
 import torch
 from transformers import AutoTokenizer
 from tilert import logger
@@ -170,6 +171,7 @@ class Qwen36Generator:
         # 模型，建立 KV cache 与 DeltaNet recurrent/conv state。
         logger.info(f'[GENERATOR] 开始整段 prefill，prompt_len={prompt_len}')
         prompt_ids = tokens[0, :prompt_len].reshape(1, prompt_len).to(torch.int32)
+        step_start = time.perf_counter()
         multi_devices_results = self.decode_layer.forward(prompt_ids, with_mtp=with_mtp, cur_pos=0)
         (intermediates, *_) = multi_devices_results[0]
         next_token = intermediates[Idx.TOKEN_OUT][0, -1, 0]
@@ -180,12 +182,15 @@ class Qwen36Generator:
         # 位置从 prompt_len 递增。
         logger.info(f'[GENERATOR] 开始 decode，生成位置 {prompt_len}..{total_len - 1}')
         for cur_pos_val in range(prompt_len, total_len):
+            step_end = time.perf_counter()
             tokens[0, cur_pos_val] = next_token
             finished = finished | (next_token == self.eos_id)
             is_eos = (next_token == self.eos_id).item()
             decoded_tokens = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
             if print_log:
-                print(f'[{next_token.item()}:{decoded_tokens!r}]', end='', flush=True)
+                step_ms = (step_end - step_start) * 1000
+                print(f'[{next_token.item()}:{decoded_tokens!r}:{step_ms:.0f}ms]', end='', flush=True)
+            step_start = time.perf_counter()
             logger.info(f'[GENERATOR] decode 步骤 cur_pos_val={cur_pos_val}，输出 token={next_token.item()} is_eos={is_eos}')
             if finished.all():
                 logger.info(f'[GENERATOR] 所有序列在第 {cur_pos_val} 步结束，跳出循环')

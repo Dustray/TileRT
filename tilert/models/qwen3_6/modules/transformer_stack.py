@@ -98,6 +98,8 @@ class QwenTransformerStack(SerializableTileRTModule):
             else:
                 raise TypeError(f'Unsupported block type: {type(block)}')
             h = out
+            # if layer_idx == 9:
+            #     break
         caches['k_cache'] = shared_k_cache
         caches['v_cache'] = shared_v_cache
         return (h, caches)

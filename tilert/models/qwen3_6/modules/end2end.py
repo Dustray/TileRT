@@ -548,7 +548,9 @@ class QwenShowHandsLayer:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             assert AutoModelForCausalLM is not None
-            self._hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, dtype=torch.bfloat16, device_map='balanced', max_memory={0: '60GiB', 1: '60GiB', 'cpu': '200GiB'}, low_cpu_mem_usage=True, attn_implementation='sdpa')
+            max_memory = {d: '60GiB' for d in range(self.num_devices)}
+            max_memory['cpu'] = '200GiB'
+            self._hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, dtype=torch.bfloat16, device_map='balanced', max_memory=max_memory, low_cpu_mem_usage=True, attn_implementation='sdpa')
         self._hf_model.eval()
         logger.info('HF 回退模型已加载')
 
@@ -586,7 +588,7 @@ class QwenShowHandsLayer:
             return
         dim = self.model_args.dim
         max_seq_len = self.forward_max_seq_len
-        # 中文注释：为每个设备分配 all-reduce 的部分和与聚合 buffer。
+        # 为每个设备分配 all-reduce 的部分和与聚合 buffer。
         self._moe_partial_buf = [torch.zeros(1, max_seq_len, dim, dtype=torch.bfloat16, device=f'cuda:{d}') for d in range(self.num_devices)]
         self._moe_aggregated_buf = [torch.zeros(1, max_seq_len, dim, dtype=torch.bfloat16, device=f'cuda:{d}') for d in range(self.num_devices)]
         self._moe_partial_lens = [0] * self.num_devices
@@ -595,22 +597,23 @@ class QwenShowHandsLayer:
             assert self._moe_partial_buf is not None
             assert self._moe_aggregated_buf is not None
 
-            # The partial buffers live on different GPUs.  Force each device to
-            # finish its copy before we read it on the host, otherwise the CPU
-            # side can observe a partially-updated tensor and corrupt the sum.
             for d in range(self.num_devices):
                 torch.cuda.synchronize(d)
 
-            total = torch.zeros(1, max_seq_len, dim, dtype=torch.float32)
-            for d in range(self.num_devices):
+            total_0 = self._moe_partial_buf[0]
+            max_active_len = max(self._moe_partial_lens)
+            for d in range(1, self.num_devices):
                 active_len = self._moe_partial_lens[d]
                 if active_len <= 0:
                     continue
-                part = self._moe_partial_buf[d][:, :active_len, :].float().cpu().clone()
-                total[:, :active_len, :] += part
-            total = total.to(torch.bfloat16)
+                partial_d = self._moe_partial_buf[d][:, :active_len, :].to('cuda:0', non_blocking=False)
+                if active_len < max_active_len:
+                    total_0[:, :active_len, :].add_(partial_d)
+                else:
+                    total_0.add_(partial_d)
+            # Broadcast the FP32 sum back to every device.
             for d in range(self.num_devices):
-                self._moe_aggregated_buf[d].copy_(total)
+                self._moe_aggregated_buf[d].copy_(total_0, non_blocking=False)
                 torch.cuda.synchronize(d)
         self._moe_barrier = threading.Barrier(self.num_devices, action=_barrier_action)
         logger.info(f'[QwenShowHandsLayer._init_moe_sync] TP8 MoE all-reduce 初始化完成：设备数={self.num_devices}, buffer_shape=(1, {max_seq_len}, {dim})')
