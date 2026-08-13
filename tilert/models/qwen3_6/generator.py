@@ -35,7 +35,9 @@ class Qwen36Generator:
             tokenizer_dir: Optional tokenizer directory. If provided, the tokenizer
                 is loaded from here instead of ``model_weights_dir``. This is useful
                 when the converted checkpoint does not include tokenizer files.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.__init__')
         torch.set_num_threads(64)
         self.model_weights_dir = model_weights_dir
         self.tokenizer_dir = tokenizer_dir if tokenizer_dir is not None else model_weights_dir
@@ -52,40 +54,45 @@ class Qwen36Generator:
         self.eos_id = self.tokenizer.eos_token_id
         self.batch_size = 1
         self.default_device = torch.device('cuda:0')
-        logger.info(f'[GENERATOR] 构造 QwenShowHandsLayer: model_path={self.model_weights_dir}, with_mtp={with_mtp}, 设备数由 cuda 可见数量决定')
         self.decode_layer = QwenShowHandsLayer(model_args=self.config, model_path=self.model_weights_dir, with_mtp=with_mtp, use_topp=use_topp, top_p=top_p, top_k=top_k)
         self.mtp_seq_len = 4 if with_mtp else 1
-        logger.info(f'[GENERATOR] Qwen36Generator 初始化完成: max_new_tokens={max_new_tokens}, temperature={temperature}, with_mtp={with_mtp}, tokenizer_dir={self.tokenizer_dir}')
 
     def init(self) -> None:
+
         """Initialize the TileRT backend."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.init')
         tilert_init()
         logger.info('[GENERATOR] TileRT 后端已为 Qwen3.6 初始化')
 
     def cleanup(self) -> None:
+
         """Cleanup resources."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.cleanup')
         if self.decode_layer is not None:
             self.decode_layer.cleanup()
         logger.info('[GENERATOR] Qwen36Generator 清理完成')
 
     def init_random_weights(self) -> None:
+
         """Initialize weights randomly (for testing)."""
         logger.info('[GENERATOR] 正在初始化 Qwen36Generator 的随机权重')
         self.decode_layer.init_random_weights()
         logger.info('[GENERATOR] 随机权重初始化完成')
 
     def from_pretrained(self) -> None:
+
         """Load the model weights from the given path."""
-        logger.info(f'[GENERATOR] 开始从 {self.model_weights_dir} 加载权重')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.from_pretrained')
         self.decode_layer.from_pretrained(self.model_weights_dir)
-        logger.info(f'[GENERATOR] 完成从 {self.model_weights_dir} 加载权重')
 
     def extract_ffn_cache(self) -> tuple[dict[int, list], dict[int, set[str]]]:
         """Extract MOE/MLP op objects and skip keys from current loaded weights.
 
         Returns:
             Tuple of (cached_ffn_ops_per_device, skip_keys_per_device).
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.extract_ffn_cache')
         cached_ffn_ops: dict[int, list] = {}
         skip_keys: dict[int, set[str]] = {}
         for device_id in range(self.decode_layer.num_devices):
@@ -97,13 +104,16 @@ class Qwen36Generator:
         return (cached_ffn_ops, skip_keys)
 
     def from_pretrained_with_cache(self, cached_ffn_ops_per_device: dict[int, list], skip_keys_per_device: dict[int, set[str]]) -> None:
+
         """Load weights reusing cached MOE/MLP ops."""
-        logger.info(f'[GENERATOR] 使用 FFN 缓存算子从 {self.model_weights_dir} 加载权重')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.from_pretrained_with_cache')
         self.decode_layer.from_pretrained_with_cache(self.model_weights_dir, cached_ffn_ops_per_device, skip_keys_per_device)
         logger.info('[GENERATOR] 完成加载带 FFN 缓存算子的权重')
 
     def update_sampling_params(self, temperature: float=1.0, top_p: float=0.95, top_k: int=256, use_topp: bool=True) -> None:
+
         """Update sampling parameters for the next generation."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.update_sampling_params')
         self.temperature = temperature
         self.use_topp = use_topp
         self.top_p = top_p
@@ -111,7 +121,9 @@ class Qwen36Generator:
         self.decode_layer.update_sampling_config(temperature=temperature, top_p=top_p, top_k=top_k, use_topp=use_topp)
 
     def set_cur_pos(self, cur_pos: int, with_mtp: bool | None=None) -> None:
+
         """Set the current decode position for RoPE."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.set_cur_pos')
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         self.decode_layer.set_cur_pos(cur_pos, with_mtp=active_mtp)
 
@@ -132,7 +144,9 @@ class Qwen36Generator:
             accepted_counts is empty for non-MTP mode.
             time_list is retained in the return signature for API compatibility
             but is now empty.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator.generate')
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         if active_mtp and (not self.with_mtp):
             raise ValueError('Cannot use MTP mode: MTP weights were not loaded')
@@ -143,7 +157,9 @@ class Qwen36Generator:
         return (result, [], [], prompt_len)
 
     def _generate_without_mtp(self, prompt: str, print_log: bool=True, with_mtp: bool=False, prompt_tokens: list[int] | None=None) -> tuple[str, int]:
+
         """Standard generation without MTP."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator._generate_without_mtp')
         if prompt_tokens is None:
             chat_output = self.tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")  # prompt 编码为 input ids 并放 device
             # chat_output = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
@@ -155,32 +171,24 @@ class Qwen36Generator:
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
-        logger.info(f'[GENERATOR] _generate_without_mtp: prompt_len={prompt_len}, max_new_tokens={self.max_new_tokens}, total_len={total_len}, 前 20 个 token={prompt_tokens[:20]}')
-        logger.info(f'[GENERATOR] 分配 tokens 张量: batch_size={self.batch_size}, total_len={total_len}, device={self.default_device}')
         tokens = torch.full((self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device)
-        logger.info(f'[GENERATOR] 将 prompt tokens 填入张量, prompt_len={prompt_len}')
         tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device=self.default_device)
         prompt_mask = tokens != -1
         prev_pos = 0
-        logger.info(f'[GENERATOR] 初始化 finished 标志: device={self.default_device}')
         finished = torch.tensor([False] * self.batch_size, dtype=torch.bool, device=self.default_device)
-        logger.info(f'[GENERATOR] 启动 lynn 风格 prefill + decode 循环: prompt_len={prompt_len}, total_len={total_len}')
 
         # === PREFILL ===
         # 与 lynn-engine generate_incremental 对齐：一次性把整个 prompt 并行过
         # 模型，建立 KV cache 与 DeltaNet recurrent/conv state。
-        logger.info(f'[GENERATOR] 开始整段 prefill，prompt_len={prompt_len}')
         prompt_ids = tokens[0, :prompt_len].reshape(1, prompt_len).to(torch.int32)
         step_start = time.perf_counter()
         multi_devices_results = self.decode_layer.forward(prompt_ids, with_mtp=with_mtp, cur_pos=0)
         (intermediates, *_) = multi_devices_results[0]
         next_token = intermediates[Idx.TOKEN_OUT][0, -1, 0]
-        logger.info(f'[GENERATOR] prefill 完成，第一个生成 token 候选={next_token.item()}')
 
         # === DECODE ===
         # 从 prompt 之后开始生成新 token，每步输入上一步生成的 token，
         # 位置从 prompt_len 递增。
-        logger.info(f'[GENERATOR] 开始 decode，生成位置 {prompt_len}..{total_len - 1}')
         for cur_pos_val in range(prompt_len, total_len):
             step_end = time.perf_counter()
             tokens[0, cur_pos_val] = next_token
@@ -191,16 +199,14 @@ class Qwen36Generator:
                 step_ms = (step_end - step_start) * 1000
                 print(f'[{next_token.item()}:{decoded_tokens!r}:{step_ms:.0f}ms]', end='', flush=True)
             step_start = time.perf_counter()
-            logger.info(f'[GENERATOR] decode 步骤 cur_pos_val={cur_pos_val}，输出 token={next_token.item()} is_eos={is_eos}')
             if finished.all():
-                logger.info(f'[GENERATOR] 所有序列在第 {cur_pos_val} 步结束，跳出循环')
                 break
             multi_devices_results = self.decode_layer.decode_step(tokens[0, cur_pos_val], cur_pos=cur_pos_val, with_mtp=with_mtp)
             (intermediates, *_) = multi_devices_results[0]
             next_token = intermediates[Idx.TOKEN_OUT][0, 0, 0]
             prev_pos = cur_pos_val
             if cur_pos_val % 10 == 0:
-                logger.info(f'[GENERATOR] 进度: {cur_pos_val}/{total_len - 1} 步, finished={finished.any().item()}')
+                pass
         self.decode_layer.reset_sequence()
         completion_tokens = []
         for (_, toks) in enumerate(tokens.tolist()):
@@ -212,7 +218,9 @@ class Qwen36Generator:
         return (f'{decoded_tokens[0]}\n' if decoded_tokens else '', prompt_len)
 
     def _generate_with_mtp(self, prompt: str, print_log: bool=True, prompt_tokens: list[int] | None=None) -> tuple[str, list[float], list[int], int]:
+
         """Generation with MTP (Multi-Token Prediction) speculative decoding."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Qwen36Generator._generate_with_mtp')
         if prompt_tokens is None:
             prompt_tokens = self.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], add_generation_prompt=True, thinking=self.enable_thinking)
         if prompt_tokens is None:
@@ -273,13 +281,10 @@ class Qwen36Generator:
         if print_log:
             print('\n')
             total_tokens = sum(decode_accepted_counts)
-            logger.info(f'[GENERATOR] -- decode 前向调用次数: {len(decode_accepted_counts)}')
-            logger.info(f'[GENERATOR] -- 生成 token 总数: {total_tokens}')
             if len(decode_accepted_counts) > 0:
                 avg_accepted = sum(decode_accepted_counts) / len(decode_accepted_counts)
                 min_accepted = min(decode_accepted_counts)
                 max_accepted = max(decode_accepted_counts)
-                logger.info(f'[GENERATOR] -- 每次调用接受 token 数: 均值={avg_accepted:.2f}, 最小={min_accepted}, 最大={max_accepted}')
             print('\n')
         self.decode_layer.reset_sequence()
         completion_tokens = []
@@ -297,6 +302,7 @@ class Qwen36Generator:
 
         Note: Streaming generation is not yet supported.  This method yields
         the final output once generation completes.
+
         """
         logger.warning('[GENERATOR] generate_streaming: Qwen3.6 流式生成尚未实现')
         (result, *_) = self.generate(prompt)

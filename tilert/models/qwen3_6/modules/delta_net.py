@@ -32,6 +32,7 @@ class QwenDeltaNetRef(TileRTModule):
         device_id: int,
         num_devices: int,
     ):
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -57,12 +58,15 @@ class QwenDeltaNetRef(TileRTModule):
         self.post_attention_layernorm_weight: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.get_weights_list')
         return []
 
     def get_tilert_weights_alias(self) -> list[str]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.get_tilert_weights_alias')
         return self.get_ref_weights_alias()
 
     def get_ref_weights_alias(self) -> list[str]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.get_ref_weights_alias')
         return ["input_layernorm.weight", 
                 "post_attention_layernorm.weight", 
                 "mlp.gate.weight",
@@ -75,10 +79,12 @@ class QwenDeltaNetRef(TileRTModule):
                 ]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.device_sharding')
         del weights_map
         return {}
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.init_reference_weights')
         prefix = "linear_attn"
         self.in_proj_qkv_weight = state_dict[f"{prefix}.in_proj_qkv.weight"]
         self.in_proj_z_weight = state_dict[f"{prefix}.in_proj_z.weight"]
@@ -93,12 +99,15 @@ class QwenDeltaNetRef(TileRTModule):
         self.post_attention_layernorm_weight = state_dict["post_attention_layernorm.weight"]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.init_tilert_weights')
         del state_dict
 
     def init_random_weights(self) -> None:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.init_random_weights')
         pass
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.init_tilert_vars')
         del batch_size, seq_len
 
     def golden_forward(
@@ -114,11 +123,13 @@ class QwenDeltaNetRef(TileRTModule):
         values on first call so the module can be sanity-tested without a
         checkpoint.
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.golden_forward')
         if self.attn.in_proj_qkv_weights is None:
             self.attn.init_random_weights(device=str(x.device))
         return self.attn.golden_forward(x, start_pos, state)
 
     def tilert_forward(self, *args: Any, **kwargs: Any) -> Any:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenDeltaNetRef.tilert_forward')
         raise NotImplementedError("QwenDeltaNetRef is reference-only")
 
 
@@ -142,6 +153,7 @@ class DeltaNet(SerializableTileRTModule):
         remove_selected: bool = False,
         ffn_op: QwenMoeBlock | None = None,
     ):
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNet.__init__')
         super().__init__(
             model_args=model_args,
             device_id=device_id,
@@ -184,6 +196,7 @@ class DeltaNet(SerializableTileRTModule):
         #     self.attn.init_tilert_weights(device=str(x.device))
         # if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
         #     self.ffn.init_tilert_weights(device=str(x.device))
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNet._ensure_weights')
         if self.input_layernorm.weight.device != x.device:
             self.input_layernorm.to(x.device)
         if self.post_attention_layernorm.weight.device != x.device:
@@ -227,6 +240,7 @@ class DeltaNet(SerializableTileRTModule):
         into the ``RMSNorm`` modules so the golden/reference path uses the real
         values instead of random initialization.
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNet._load_layernorm_weights')
         if "input_layernorm.weight" in state_dict:
             self.input_layernorm.weight.data.copy_(state_dict["input_layernorm.weight"])
         if "post_attention_layernorm.weight" in state_dict:
@@ -239,6 +253,7 @@ class DeltaNet(SerializableTileRTModule):
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         """Reference forward: full DeltaNet layer with residuals and layer norms."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNet.golden_forward')
         self._ensure_weights(x)
         prev_state = state.get("delta_state") if state is not None else None
 
@@ -263,6 +278,7 @@ class DeltaNet(SerializableTileRTModule):
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         """Optimized forward using ``DeltaNetOp`` + ``QwenMoeBlock``."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNet.tilert_forward')
         prev_state = state.get("delta_state") if state is not None else None
         attn_out, new_state = self.attn.forward(x, start_pos, prev_state)
         ffn_out = self.ffn.forward(attn_out)
@@ -275,6 +291,7 @@ class DeltaNet(SerializableTileRTModule):
         start_pos: int,
         state: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNet.forward')
         if self.flag_enable_tilert:
             return self.tilert_forward(x, start_pos, state)
         return self.golden_forward(x, start_pos, state)

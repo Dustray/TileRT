@@ -1,11 +1,11 @@
 """RMSNormHeadProj operation module."""
+from tilert import logger
 
 from dataclasses import dataclass
 from enum import Enum
 
 import torch
 
-from tilert import logger
 from tilert.models.base import TileRTModule, TilertWeightsConverter
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.utils import get_profile_log_tensor
@@ -27,7 +27,9 @@ def rmsnorm_head_proj(
     model_arch: str,
     compute_kernel_type: str = "general",
 ) -> None:
+
     """RMS Norm Head Projection operation."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] rmsnorm_head_proj')
     torch.ops.tilert.rmsnorm_head_proj_op(
         hidden_in,
         gamma_in,
@@ -53,7 +55,9 @@ class RMSNormHeadProjWeightsConverter(TilertWeightsConverter):
     def tilert_to_tilert_native_bf16_warp_gemv(
         tilert_weight_in: torch.Tensor,
     ) -> torch.Tensor:
+
         """Convert TILERT weights to TILERT native bf16 warp gemv weights."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProjWeightsConverter.tilert_to_tilert_native_bf16_warp_gemv')
         weights = tilert_weight_in.reshape(1010, 16, 7, 1024)
         weights = weights.transpose(1, 2).reshape(7070, 16, 1024)
         return weights.contiguous()
@@ -69,7 +73,9 @@ class RMSNormHeadProjWeightsConverter(TilertWeightsConverter):
 
         Returns:
             Tuple of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProjWeightsConverter.convert_to_general')
         args = self.model_args
         assert args.arch_name == "qwen3_6" or args.arch_name == "glm_5"
 
@@ -93,9 +99,13 @@ class RMSNormHeadProjTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProjTilertWeightsAlias.tilert_tensor_alias')
         return [self.model_norm_weight, self.lm_head_weight]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProjTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -114,6 +124,8 @@ class RMSNormHeadProj(TileRTModule):
         num_devices: int,
         algorithm: RMSNormHeadProjAlgorithm = RMSNormHeadProjAlgorithm.GENERAL,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -148,6 +160,8 @@ class RMSNormHeadProj(TileRTModule):
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.tilert_tensor_alias')
         return self.tilert_weights_alias()
 
     def get_weights_list(self) -> list[torch.Tensor]:
@@ -156,7 +170,9 @@ class RMSNormHeadProj(TileRTModule):
 
         Returns:
             List of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.get_weights_list')
         return [self.tilert_rmsnorm_gamma, self.tilert_head_proj]
 
     def device_sharding(
@@ -171,24 +187,19 @@ class RMSNormHeadProj(TileRTModule):
             key_prefix: Key prefix.
         Returns:
             Tuple of weights.
+
         """
-        logger.info(f"[device_sharding] RMSNormHeadProj, num_devices: {self.num_devices}")
-        
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.device_sharding')
         rmsnorm_gamma_key = "model.norm.weight"
         head_proj_key = "lm_head.weight"
         # Qwen3.6 checkpoint stores final norm under model.language_model.norm.weight.
         qwen36_norm_key = "model.language_model.norm.weight"
         if qwen36_norm_key in weights_dict:
             rmsnorm_gamma = weights_dict[qwen36_norm_key][None, ...]
-            original_rmsnorm_shape = weights_dict[qwen36_norm_key].shape
-            rmsnorm_gamma_key_used = qwen36_norm_key
         else:
             rmsnorm_gamma = weights_dict[rmsnorm_gamma_key][None, ...]
-            original_rmsnorm_shape = weights_dict[rmsnorm_gamma_key].shape
-            rmsnorm_gamma_key_used = rmsnorm_gamma_key
         rmsnorm_gamma = rmsnorm_gamma.repeat(self.num_devices, 1)
         head_proj = weights_dict[head_proj_key]
-        original_head_proj_shape = head_proj.shape
 
         # Detect already-sharded TileRT checkpoint: each device already owns a
         # vocab shard of shape (vocab_shard, dim).  Stack them; otherwise
@@ -201,11 +212,7 @@ class RMSNormHeadProj(TileRTModule):
         else:
             # EP8 / replicated full vocab layout.
             head_proj = head_proj[None, ...].repeat(self.num_devices, 1, 1)
-        
-        # Log sharding details
-        logger.info(f"[device_sharding] key: {rmsnorm_gamma_key_used}, original shape: {original_rmsnorm_shape}, sharded shape: {rmsnorm_gamma.shape}, dtype: {rmsnorm_gamma.dtype}")
-        logger.info(f"[device_sharding] key: {head_proj_key}, original shape: {original_head_proj_shape}, sharded shape: {head_proj.shape}, dtype: {head_proj.dtype}")
-        
+
         return rmsnorm_gamma.contiguous(), head_proj.contiguous()
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -215,8 +222,9 @@ class RMSNormHeadProj(TileRTModule):
         Args:
             state_dict: State dictionary.
             device_id: Device ID.
+
         """
-        logger.debug(f"{self.op_name}: init_reference_weights on device {self.device_id}")
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.init_reference_weights')
         sharded_list = self.device_sharding(state_dict)
 
         gamma, head_proj = sharded_list[0][self.device_id], sharded_list[1][self.device_id]
@@ -229,8 +237,9 @@ class RMSNormHeadProj(TileRTModule):
 
         Args:
             state_dict: State dictionary.
+
         """
-        logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.init_tilert_weights')
         assert self.algorithm is not None
         self.tilert_rmsnorm_gamma, self.tilert_head_proj = RMSNormHeadProjWeightsConverter(
             self.model_args, self.num_devices
@@ -243,11 +252,9 @@ class RMSNormHeadProj(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
-        logger.debug(
-            f"{self.op_name}: init_tilert_vars batch_size={batch_size}, "
-            f"seq_len={seq_len} on cuda:{self.device_id}"
-        )
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.init_tilert_vars')
         self.hidden_rmsnorm_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -263,10 +270,11 @@ class RMSNormHeadProj(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device_id: int | None = None) -> None:
+
         """Initialize the random weights."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.init_random_weights')
         if device_id is None:
             device_id = self.device_id
-        logger.debug(f"{self.op_name}: init_random_weights on cuda:{device_id}")
         rmsnorm_gamma = torch.randn(self.dim, dtype=torch.float32, device=f"cuda:{device_id}")
         head_proj = torch.randn(
             self.logits_dim, self.dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"
@@ -298,9 +306,9 @@ class RMSNormHeadProj(TileRTModule):
 
         Returns:
             Output tensor.
+
         """
-        logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] ENTRY: hidden_in.shape={hidden_in.shape}")
-        
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.golden_forward')
         assert self.ref_rmsnorm_gamma is not None
         assert self.ref_head_proj is not None
         bsz = hidden_in.shape[0]
@@ -308,24 +316,15 @@ class RMSNormHeadProj(TileRTModule):
         hidden_in_float = hidden_in.float().detach()
         gamma = self.ref_rmsnorm_gamma.float().detach()
         # Qwen3.5-MoE/Qwen3.6 use the (1 + weight) RMSNorm convention.
-        logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] Applying RMSNorm with (1+gamma) scaling")
         hidden_rmsnorm = hidden_in_float * torch.rsqrt(
             hidden_in_float.pow(2).mean(dim=-1, keepdim=True) + self.eps
         )
         hidden_rmsnorm = hidden_rmsnorm * (1.0 + gamma)
-        # Handle both full 2-D head projection and the per-device sharded layout
-        # produced by device_sharding for the reference path.
+        # Golden path expects a full 2-D head projection; end2end ensures this.
         head_proj = self.ref_head_proj
-        if head_proj.dim() == 3:
-            if head_proj.size(-1) == 1024 and head_proj.size(-2) == 16:
-                # TileRT-swizzled layout: (logits_shard, 16, 1024) blocks.
-                head_proj = head_proj.transpose(1, 2).reshape(-1, self.dim)
-                logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] Transposed swizzled head_proj to 2D")
-            else:
-                # Already dense per-device vocab shard.
-                head_proj = head_proj.reshape(-1, self.dim)
-                logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] Reshaped head_proj to 2D")
-        
+        if head_proj.dim() != 2:
+            raise ValueError(f"Unexpected head projection layout: {head_proj.shape}")
+
         # Compute logits in chunks to keep peak memory low: each chunk does a
         # bf16 matmul (hidden_rmsnorm @ head_chunk.T) and immediately converts
         # the small result to float32, avoiding a full (1, vocab) float32 temp.
@@ -337,19 +336,15 @@ class RMSNormHeadProj(TileRTModule):
             end = min(start + chunk_size, vocab_size)
             chunk_logits = hidden_rmsnorm.to(torch.bfloat16) @ head_proj_bf16[start:end, :].T
             chunks.append(chunk_logits.float())
-        result = torch.cat(chunks, dim=-1)
-        logger.info(f"[RMSNormHeadProjOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}")
-
-        return result
+        return torch.cat(chunks, dim=-1)
 
     def tilert_forward(
         self,
         hidden_in: torch.Tensor,
     ) -> torch.Tensor:
-        logger.info(f"[RMSNormHeadProjOp.tilert_forward_{self.device_id}] ENTRY: hidden_in.shape={hidden_in.shape}")
-        
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.tilert_forward')
         assert self.hidden_out is not None
-        logger.info(f"[RMSNormHeadProjOp.tilert_forward_{self.device_id}] Calling CUDA kernel rmsnorm_head_proj")
         rmsnorm_head_proj(
             hidden_in,
             self.tilert_rmsnorm_gamma,
@@ -359,12 +354,12 @@ class RMSNormHeadProj(TileRTModule):
             self.profile_logs,
             model_arch=self.model_args.arch_name,
         )
-        logger.info(f"[RMSNormHeadProjOp.tilert_forward_{self.device_id}] EXIT: hidden_out.shape={self.hidden_out.shape}")
-        
         return self.hidden_out
 
     def __call__(
         self,
         hidden_in: torch.Tensor,
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormHeadProj.__call__')
         return self.golden_forward(hidden_in)

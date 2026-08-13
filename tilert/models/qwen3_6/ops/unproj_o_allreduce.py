@@ -45,7 +45,9 @@ def unproj_o_allreduce(
         profile_logs: Profile logs tensor.
         model_arch: Model architecture ("qwen3_6" or "glm_5").
         compute_kernel_type: Compute kernel type ("bf16", "fp16mma").
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] unproj_o_allreduce')
     torch.ops.tilert.unproj_o_allreduce_op(
         vec_in,
         mat_in,
@@ -75,9 +77,13 @@ class UnProjOAllReduceRefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceRefWeightsAlias.ref_tensor_alias')
         return [self.o_proj_weight, self.o_proj_scale_inv]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceRefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 
@@ -90,9 +96,13 @@ class UnProjOAllReduceTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceTilertWeightsAlias.tilert_tensor_alias')
         return [self.unproj_weights, self.unproj_scales]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -101,6 +111,8 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceWeightsConverter._swizzle_mma_16x16')
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
@@ -110,7 +122,9 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
         self,
         weights_list: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Convert weights to the FP16 MMA layout for the 128-CTA config."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceWeightsConverter.convert_to_fp16mma_128cta')
         with torch.inference_mode():
             mat, scales = weights_list
             if scales.dtype != torch.float32:
@@ -192,7 +206,9 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
         self,
         weights_list: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Convert common weights to the BF16 MMA layout."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceWeightsConverter.convert_to_bf16mma')
         assert (
             self.model_args.arch_name == "qwen3_6"
         ), "BF16 MMA dispatch is wired only for DeepSeek-V3.2 DevGroupB."
@@ -202,7 +218,9 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
         self,
         weights_list: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Convert common weights to TileRT FP16 MMA layout."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduceWeightsConverter.convert_to_fp16mma')
         if self.model_args.arch_name == "qwen3_6":
             return self.convert_to_fp16mma_128cta(weights_list)
         assert self.model_args.arch_name == "glm_5", "Only GLM-5 and DSV3.2 support FP16 MMA"
@@ -277,6 +295,8 @@ class UnProjOAllReduce(TileRTModule):
         tilert_weights_alias: UnProjOAllReduceTilertWeightsAlias | None = None,
         algorithm: UnProjOAllReduceAlgorithm = UnProjOAllReduceAlgorithm.FP16MMA,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduce.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -326,7 +346,9 @@ class UnProjOAllReduce(TileRTModule):
 
         Returns:
             List of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduce.get_weights_list')
         return [self.tilert_weights, self.tilert_scales]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -338,6 +360,7 @@ class UnProjOAllReduce(TileRTModule):
 
         Returns:
             Map from tilert weight alias to (num_devices, ...) tensors.
+
         """
         logger.info(f"[device_sharding] UnprojOAllreduce, num_devices: {self.num_devices}")
         
@@ -384,7 +407,9 @@ class UnProjOAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary keyed by ref weight alias (full model).
             device_id: Device ID for this shard; defaults to self.device_id.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduce.init_reference_weights')
         did = self.device_id if device_id is None else device_id
         logger.debug(f"{self.op_name}: init_reference_weights on device {did}")
         sharded = self.device_sharding(state_dict)
@@ -398,6 +423,7 @@ class UnProjOAllReduce(TileRTModule):
 
         Args:
             state_dict: State dictionary keyed by tilert weight alias (per-device).
+
         """
         logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
@@ -457,7 +483,9 @@ class UnProjOAllReduce(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduce.init_tilert_vars')
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -467,6 +495,7 @@ class UnProjOAllReduce(TileRTModule):
         self.is_var_init = True
 
     def init_random_weights(self) -> None:
+
         """Initialize the random weights."""
         logger.debug(f"{self.op_name}: init_random_weights on device {self.device_id}")
         unproj_o_weights = torch.randn(
@@ -507,6 +536,7 @@ class UnProjOAllReduce(TileRTModule):
 
         Returns:
             Output tensor.
+
         """
         logger.info(f"[UnprojOAllReduceOp.golden_forward_{self.device_id}] ENTRY: vec_in.shape={vec_in.shape}")
         
@@ -554,4 +584,6 @@ class UnProjOAllReduce(TileRTModule):
         self,
         vec_in: torch.Tensor,
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] UnProjOAllReduce.__call__')
         return self.golden_forward(vec_in)

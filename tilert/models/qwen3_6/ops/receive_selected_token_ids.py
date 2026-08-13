@@ -1,4 +1,5 @@
 """ReceiveSelectedTokenIds — receive idx_selects from GPU 0."""
+from tilert import logger
 
 import torch
 
@@ -24,7 +25,9 @@ def receive_selected_token_ids(
         profile_logs: Profile logs tensor.
         model_arch: Model architecture ("qwen3_6" or "glm_5").
         compute_kernel_type: Compute kernel type ("bf16").
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] receive_selected_token_ids')
     torch.ops.tilert.receive_selected_token_ids_op(
         ll_buf,
         dst,

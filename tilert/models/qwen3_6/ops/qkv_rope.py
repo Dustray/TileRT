@@ -21,7 +21,9 @@ def qkv_rope(pe_cache: torch.Tensor, kv_cache: torch.Tensor, rope_freqs: torch.T
         profile_logs: Profile logs tensor.
         model_arch: Model architecture string.
         compute_kernel_type: Compute kernel type string.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] qkv_rope')
     torch.ops.tilert.qkv_rope_op(pe_cache, kv_cache, rope_freqs, cur_pos, model_arch, compute_kernel_type, profile_logs)
 
 @dataclass
@@ -30,9 +32,13 @@ class QKVRoPERefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPERefWeightsAlias.ref_tensor_alias')
         return []
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPERefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 @dataclass
@@ -41,9 +47,13 @@ class QKVRoPETilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPETilertWeightsAlias.tilert_tensor_alias')
         return []
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPETilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 class QKVRoPEAlgorithm(Enum):
@@ -55,6 +65,8 @@ class QKVRoPE(TileRTModule):
     _SUPPORTED_ALGORITHMS = {'qwen3_6': [QKVRoPEAlgorithm.GENERAL], 'glm_5': [QKVRoPEAlgorithm.GENERAL]}
 
     def __init__(self, model_args: ModelArgsQwen36, num_devices: int=1, device_id: int=0, layer_idx: int=0, ref_weights_alias: QKVRoPERefWeightsAlias | None=None) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.__init__')
         super().__init__(self.__class__.__name__, model_args=model_args, num_devices=num_devices, device_id=device_id, layer_idx=layer_idx)
         self.tilert_weights_alias = QKVRoPETilertWeightsAlias()
         self.ref_weights_alias = ref_weights_alias if ref_weights_alias is not None else QKVRoPERefWeightsAlias()
@@ -63,10 +75,12 @@ class QKVRoPE(TileRTModule):
         self.profile_logs: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.get_weights_list')
         return []
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        logger.info(f'[device_sharding] QKVRoPE，无需分片权重')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.device_sharding')
         del weights_map
         return {}
 
@@ -82,34 +96,34 @@ class QKVRoPE(TileRTModule):
         logger.debug(f'{self.op_name}: init_random_weights on device {self.device_id}')
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device: str='cuda') -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.init_tilert_vars')
         del batch_size, seq_len
         self.profile_logs = get_profile_log_tensor(device=device)
         self.is_var_init = True
 
     def golden_forward(self, q_pe: torch.Tensor, pe_cache: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
-        logger.info(f'[QKVRopeOp.golden_forward_{self.device_id}] ENTRY: q_pe.shape={q_pe.shape}, pe_cache.shape={pe_cache.shape}, start_pos={start_pos}, bsz={bsz}, seqlen={seqlen}')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.golden_forward')
         end_pos = start_pos + seqlen
-        logger.info(f'[QKVRopeOp.golden_forward_{self.device_id}] Applying RoPE to K: pe_cache slice [:{bsz}, {start_pos}:{end_pos}]')
         k_pe = pe_cache[:bsz, start_pos:end_pos]
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
         result = apply_rotary_emb(q_pe, freqs_cis)
-        logger.info(f'[QKVRopeOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}')
         return result
 
     def tilert_forward(self, q_pe: torch.Tensor, pe_cache: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
-        logger.info(f'[QKVRopeOp.tilert_forward_{self.device_id}] ENTRY: q_pe.shape={q_pe.shape}, pe_cache.shape={pe_cache.shape}, start_pos={start_pos}, bsz={bsz}, seqlen={seqlen}')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.tilert_forward')
         assert self.profile_logs is not None
         end_pos = start_pos + seqlen
         q_pe_rope = q_pe.clone()
         rope_freqs = torch.view_as_real(freqs_cis).reshape(*freqs_cis.shape[:-1], -1)
         cur_pos = torch.tensor([start_pos], dtype=torch.int32)
-        logger.info(f'[QKVRopeOp.tilert_forward_{self.device_id}] Calling CUDA kernel qkv_rope')
         qkv_rope(q_pe_rope, pe_cache[:bsz, start_pos:end_pos], rope_freqs, cur_pos, self.profile_logs, model_arch=self.model_args.arch_name)
-        logger.info(f'[QKVRopeOp.tilert_forward_{self.device_id}] EXIT: q_pe_rope.shape={q_pe_rope.shape}')
         return q_pe_rope
 
     def __call__(self, q_pe: torch.Tensor, pe_cache: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QKVRoPE.__call__')
         if self.flag_enable_tilert:
             return self.tilert_forward(q_pe, pe_cache, start_pos, freqs_cis, bsz, seqlen)
         return self.golden_forward(q_pe, pe_cache, start_pos, freqs_cis, bsz, seqlen)

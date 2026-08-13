@@ -35,6 +35,8 @@ class QwenAttentionRef(TileRTModule):
         device_id: int,
         num_devices: int,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -60,12 +62,18 @@ class QwenAttentionRef(TileRTModule):
         self.post_attention_layernorm_weight: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.get_weights_list')
         return []
 
     def get_tilert_weights_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.get_tilert_weights_alias')
         return self.get_ref_weights_alias()
 
     def get_ref_weights_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.get_ref_weights_alias')
         return ["input_layernorm.weight", 
                 "post_attention_layernorm.weight", 
                 "mlp.gate.weight",
@@ -78,10 +86,14 @@ class QwenAttentionRef(TileRTModule):
                 ]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.device_sharding')
         del weights_map
         return {}
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.init_reference_weights')
         prefix = "self_attn"
         self.q_proj_weight = state_dict[f"{prefix}.q_proj.weight"]
         self.k_proj_weight = state_dict[f"{prefix}.k_proj.weight"]
@@ -93,15 +105,23 @@ class QwenAttentionRef(TileRTModule):
         self.post_attention_layernorm_weight = state_dict["post_attention_layernorm.weight"]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.init_tilert_weights')
         del state_dict
 
     def init_random_weights(self) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.init_random_weights')
         pass
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.init_tilert_vars')
         del batch_size, seq_len
 
     def tilert_forward(self, *args: Any, **kwargs: Any) -> Any:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.tilert_forward')
         raise NotImplementedError("QwenAttentionRef is reference-only")
 
     @staticmethod
@@ -120,7 +140,9 @@ class QwenAttentionRef(TileRTModule):
 
         Returns:
             Normalized tensor with the same shape as ``x``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef._rmsnorm_heads')
         rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
         return x * (1.0 + weight) / rms
 
@@ -136,7 +158,9 @@ class QwenAttentionRef(TileRTModule):
         """Standard GQA reference forward.
 
         Returns the attention output, updated k_cache, and updated v_cache.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenAttentionRef.golden_forward')
         assert self.q_proj_weight is not None
         assert self.k_proj_weight is not None
         assert self.v_proj_weight is not None
@@ -212,6 +236,8 @@ class GatedAttention(SerializableTileRTModule):
         num_devices: int,
         remove_selected: bool = False,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GatedAttention.__init__')
         super().__init__(
             model_args=model_args,
             device_id=device_id,
@@ -253,17 +279,20 @@ class GatedAttention(SerializableTileRTModule):
         self.post_attention_layernorm = RMSNorm(model_args.dim, eps=model_args.eps)
 
     def _ensure_weights(self, x: torch.Tensor) -> None:
+
         """Lazy initialize weights for sanity testing without a checkpoint."""
         # if self.attn.qkv_proj_weights is None:
         #     self.attn.init_random_weights(device=str(x.device))
         # if not self.ffn.moe.rmsnorm_expert_proj.is_ref_weights_init:
         #     self.ffn.init_random_weights(device=str(x.device))
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GatedAttention._ensure_weights')
         if self.input_layernorm.weight.device != x.device:
             self.input_layernorm.to(x.device)
         if self.post_attention_layernorm.weight.device != x.device:
             self.post_attention_layernorm.to(x.device)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+
         """Load weights and also set the RMSNorm module weights from the checkpoint."""
         logger.debug(f"{self.op_name}: loading tilert weights + layernorms")
         super().init_tilert_weights(state_dict)
@@ -274,6 +303,7 @@ class GatedAttention(SerializableTileRTModule):
             self.ffn.init_reference_weights(state_dict)
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+
         """Load reference weights and also set the RMSNorm module weights."""
         logger.debug(f"{self.op_name}: loading reference weights + layernorms")
         super().init_reference_weights(state_dict)
@@ -292,7 +322,9 @@ class GatedAttention(SerializableTileRTModule):
         self._load_layernorm_weights(state_dict)
 
     def _load_layernorm_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+
         """Copy checkpoint layernorm weights into the RMSNorm modules."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GatedAttention._load_layernorm_weights')
         if "input_layernorm.weight" in state_dict:
             self.input_layernorm.weight.data.copy_(state_dict["input_layernorm.weight"])
         if "post_attention_layernorm.weight" in state_dict:
@@ -307,7 +339,9 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
         """Reference GQA forward with residuals, norms, and MoE FFN."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GatedAttention.golden_forward')
         self._ensure_weights(x)
 
         norm_x = self.input_layernorm(x)
@@ -332,7 +366,9 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
         """Optimized forward using ``GQAAttentionOp`` + ``UnProjOAllReduce`` + ``QwenMoeBlock``."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GatedAttention.tilert_forward')
         attn_out, k_cache, v_cache = self.attn.forward(
             x, start_pos, mrope_embed, k_cache, v_cache, mask
         )
@@ -349,6 +385,8 @@ class GatedAttention(SerializableTileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GatedAttention.forward')
         if self.flag_enable_tilert:
             return self.tilert_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)
         return self.golden_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)

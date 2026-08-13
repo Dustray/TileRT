@@ -1,4 +1,5 @@
 """PaddedAllReduceAdd operation module."""
+from tilert import logger
 
 from enum import Enum
 
@@ -35,7 +36,9 @@ def padded_allreduce_add(
         profile_logs: Profile logs tensor.
         model_arch: Model architecture ("qwen3_6" or "glm_5").
         compute_kernel_type: Compute kernel type ("bf16").
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] padded_allreduce_add')
     torch.ops.tilert.padded_allreduce_add_op(
         partial_buf, x_in, flag, vec_out, profile_logs, model_arch, compute_kernel_type
     )
@@ -61,6 +64,8 @@ class PaddedAllReduceAdd(TileRTModule):
         num_devices: int,
         device_id: int = 0,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] PaddedAllReduceAdd.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -83,7 +88,9 @@ class PaddedAllReduceAdd(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] PaddedAllReduceAdd.init_tilert_vars')
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -110,6 +117,7 @@ class PaddedAllReduceAdd(TileRTModule):
 
         Returns:
             Output tensor (copy of x_in).
+
         """
         logger.info(f"[PaddedAllReduceAddOp.golden_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}")
         
@@ -131,6 +139,7 @@ class PaddedAllReduceAdd(TileRTModule):
 
         Returns:
             Output tensor [1, L, hidden_dim].
+
         """
         logger.info(f"[PaddedAllReduceAddOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, flag={flag}")
         
@@ -154,4 +163,6 @@ class PaddedAllReduceAdd(TileRTModule):
         self,
         x_in: torch.Tensor,
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] PaddedAllReduceAdd.__call__')
         return self.golden_forward(x_in)

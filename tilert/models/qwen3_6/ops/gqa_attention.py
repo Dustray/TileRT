@@ -49,7 +49,9 @@ def gqa_attention(
         profile_logs: Profile logs tensor.
         model_arch: Architecture string (e.g., "qwen3_6").
         compute_kernel_type: Kernel type ("general" for now).
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] gqa_attention')
     torch.ops.tilert.gqa_attention_op(
         q,
         k_cache,
@@ -70,6 +72,8 @@ class GQAAttentionRefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttentionRefWeightsAlias.ref_tensor_alias')
         return [
             f"{self.key_prefix}.q_proj.weight",
             f"{self.key_prefix}.k_proj.weight",
@@ -80,6 +84,8 @@ class GQAAttentionRefWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttentionRefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 
@@ -94,6 +100,8 @@ class GQAAttentionTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttentionTilertWeightsAlias.tilert_tensor_alias')
         return [
             self.qkv_proj_weights,
             self.o_proj_weights,
@@ -102,6 +110,8 @@ class GQAAttentionTilertWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttentionTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -127,6 +137,8 @@ class GQAAttentionWeightsConverter(TilertWeightsConverter):
         # q-projection output (query + gate), so ``q_proj.weight`` already
         # has shape ``[2 * n_heads * head_dim, dim]``.  Concatenate q, k, and v
         # along the output dimension to form the fused ``qkv_proj_weights``.
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttentionWeightsConverter.convert_to_general')
         if len(weights_list) == 6:
             q_proj_w, k_proj_w, v_proj_w, o_proj_w, q_norm_w, k_norm_w = weights_list
             qkv_proj_weights = torch.cat([q_proj_w, k_proj_w, v_proj_w], dim=0)
@@ -149,6 +161,8 @@ class GQAAttention(TileRTModule):
         num_devices: int,
         algorithm: GQAAttentionAlgorithm = GQAAttentionAlgorithm.GENERAL,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -181,13 +195,19 @@ class GQAAttention(TileRTModule):
 
     @property
     def tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.tensor_alias')
         return list(self.ref_weights_alias())
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.tilert_tensor_alias')
         return list(self.tilert_weights_alias())
 
     def get_weights_list(self) -> list[torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.get_weights_list')
         return [
             self.qkv_proj_weights,
             self.o_proj_weights,
@@ -204,7 +224,9 @@ class GQAAttention(TileRTModule):
         MoE experts are split across devices.  This method stacks the same full
         q/k/v/o_proj and q_norm/k_norm tensors ``num_devices`` times so that
         ``init_reference_weights`` can simply index ``[device_id]``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.device_sharding')
         prefix = self.ref_weights_alias.key_prefix
         logger.info(f"[device_sharding] key_prefix: {prefix}, num_devices: {self.num_devices}")
         
@@ -269,6 +291,8 @@ class GQAAttention(TileRTModule):
     def init_tilert_vars(
         self, batch_size: int, seq_len: int, device: str = "cuda"
     ) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.init_tilert_vars')
         self.out = torch.zeros(
             batch_size,
             seq_len,
@@ -339,6 +363,7 @@ class GQAAttention(TileRTModule):
         """Reference GQA forward implemented in PyTorch.
 
         This is a fallback used until the CUDA kernel is available.
+
         """
         logger.info(f"[GQAAttentionOp.golden_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}, k_cache.shape={k_cache.shape}")
         
@@ -456,6 +481,7 @@ class GQAAttention(TileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
         """Optimized forward placeholder."""
         logger.info(f"[GQAAttentionOp.tilert_forward_{self.device_id}] ENTRY: x.shape={x.shape}, start_pos={start_pos}")
         
@@ -487,6 +513,8 @@ class GQAAttention(TileRTModule):
         v_cache: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] GQAAttention.forward')
         if self.flag_enable_tilert:
             return self.tilert_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)
         return self.golden_forward(x, start_pos, mrope_embed, k_cache, v_cache, mask)

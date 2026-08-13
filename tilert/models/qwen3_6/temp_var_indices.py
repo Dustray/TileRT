@@ -9,6 +9,7 @@ Until the CUDA kernels land, these same slots are used by the Python reference
 decode loop in ``QwenShowHandsLayer`` so that the layout stays aligned with
 future kernel expectations.
 """
+from tilert import logger
 
 from enum import IntEnum
 
@@ -88,7 +89,9 @@ def validate_temp_vars_layout() -> None:
 
     Raises:
       RuntimeError: If any validation check fails.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] validate_temp_vars_layout')
     members = list(QwenTempVarIdx)
 
     if len(members) != TEMP_VARS_SIZE:

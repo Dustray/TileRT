@@ -46,7 +46,9 @@ def down_allreduce(
         profile_logs: Profile logs tensor (1D).
         model_arch: Model architecture ("qwen3_6" or "glm_5").
         compute_kernel_type: Compute kernel type ("bf16").
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] down_allreduce')
     torch.ops.tilert.down_allreduce_op(
         vec_in,
         mat_in,
@@ -78,9 +80,13 @@ class DownAllReduceTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduceTilertWeightsAlias.tilert_tensor_alias')
         return [self.down_weights, self.down_scales]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduceTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -99,6 +105,8 @@ class DownAllReduce(TileRTModule):
         num_devices: int,
         algorithm: DownAllReduceAlgorithm = DownAllReduceAlgorithm.GENERAL,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduce.__init__')
         super().__init__(
             self.__class__.__name__,
             device_id=device_id,
@@ -151,6 +159,8 @@ class DownAllReduce(TileRTModule):
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduce.tilert_tensor_alias')
         return self.tilert_weights_alias.tilert_tensor_alias
 
     def get_weights_list(self) -> list[torch.Tensor]:
@@ -159,7 +169,9 @@ class DownAllReduce(TileRTModule):
 
         Returns:
             List of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduce.get_weights_list')
         return [self.tilert_weights, self.tilert_scales]
 
     def device_sharding(
@@ -175,6 +187,7 @@ class DownAllReduce(TileRTModule):
             key_prefix: Key prefix.
         Returns:
             Tuple of weights.
+
         """
         logger.info(f"[dev={self.device_id}] [device_sharding] key_prefix: {key_prefix}，num_devices: {self.num_devices}")
         
@@ -234,6 +247,7 @@ class DownAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary.
             device_id: Device ID.
+
         """
         logger.debug(f"[dev={device_id}] {self.op_name}: 在设备上初始化参考权重 {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
@@ -253,6 +267,7 @@ class DownAllReduce(TileRTModule):
 
         Args:
             state_dict: State dictionary.
+
         """
         logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化TileRT权重 {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
@@ -267,7 +282,9 @@ class DownAllReduce(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduce.init_tilert_vars')
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -277,7 +294,9 @@ class DownAllReduce(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device_id: int | None = None) -> None:
+
         """Initialize the random weights."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduce.init_random_weights')
         if device_id is None:
             device_id = self.device_id
         logger.debug(f"[dev={device_id}] {self.op_name}: 初始化随机权重，设备为 {device_id}")
@@ -317,6 +336,7 @@ class DownAllReduce(TileRTModule):
 
         Returns:
             Output tensor.
+
         """
         logger.info(f"[dev={self.device_id}] [DownAllReduceOp.golden_forward_{self.device_id}] 入口: vec_in.shape={vec_in.shape}")
         assert self.ref_down is not None
@@ -365,4 +385,6 @@ class DownAllReduce(TileRTModule):
         self,
         x_in: torch.Tensor,
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DownAllReduce.__call__')
         return self.golden_forward(x_in)

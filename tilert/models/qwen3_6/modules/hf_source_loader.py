@@ -6,20 +6,22 @@ not modify the source files; all sharding is performed in memory and the
 resulting state dicts are stored on the target devices.
 """
 from __future__ import annotations
+
+from tilert import logger
 import json
 import os
-from collections import defaultdict
 from typing import Any
 import torch
 from safetensors import safe_open
-from tilert import logger
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.transformer_stack import QwenTransformerStack
 from tilert.models.qwen3_6.ops.rmsnorm_head_proj import RMSNormHeadProj
 _HF_CHECKPOINT_CPU_CACHE: dict[str, dict[str, torch.Tensor]] = {}
 
 def _is_hf_checkpoint(model_path: str) -> bool:
+
     """Return True if ``model_path`` points to an HF Qwen3.6 checkpoint."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _is_hf_checkpoint')
     index_path = os.path.join(model_path, 'model.safetensors.index.json')
     if not os.path.exists(index_path):
         return False
@@ -34,7 +36,9 @@ def _is_hf_checkpoint(model_path: str) -> bool:
     return False
 
 def _strip_language_model_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+
     """Strip the ``model.language_model`` prefix from HF text-only keys."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _strip_language_model_prefix')
     out: dict[str, torch.Tensor] = {}
     prefix = 'model.language_model.'
     for (key, tensor) in state_dict.items():
@@ -45,7 +49,9 @@ def _strip_language_model_prefix(state_dict: dict[str, torch.Tensor]) -> dict[st
     return out
 
 def _layer_state_from_hf(state_dict: dict[str, torch.Tensor], layer_idx: int) -> dict[str, torch.Tensor]:
+
     """Extract a single layer's weights from the (stripped) HF state dict."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _layer_state_from_hf')
     prefix = f'layers.{layer_idx}.'
     out: dict[str, torch.Tensor] = {}
     for (key, tensor) in state_dict.items():
@@ -66,7 +72,9 @@ def _unshard_to_per_device(sharded: dict[str, torch.Tensor], device_id: int, num
         keep the local inter_dim shard for every expert (shared + all routed).
       * Small replicated tensors such as ``unproj_o_gamma`` and
         ``exp_proj_weights`` are returned as-is.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _unshard_to_per_device')
     per_device: dict[str, torch.Tensor] = {}
     for (key, tensor) in sharded.items():
         if tensor.dim() == 0:
@@ -81,43 +89,27 @@ def _unshard_to_per_device(sharded: dict[str, torch.Tensor], device_id: int, num
         per_device[key] = tensor
     return per_device
 
-def _head_state_from_hf(state_dict: dict[str, torch.Tensor], head_proj: RMSNormHeadProj, num_devices: int, device_id: int) -> dict[str, torch.Tensor]:
-    """Build per-device TileRT head/norm state from the HF state dict."""
-    head_input: dict[str, torch.Tensor | None] = {'model.language_model.norm.weight': state_dict.get('model.language_model.norm.weight'), 'lm_head.weight': state_dict.get('lm_head.weight')}
-    if 'norm.weight' in state_dict:
-        head_input['model.language_model.norm.weight'] = state_dict['norm.weight']
-    head_input = {k: v for (k, v) in head_input.items() if v is not None}
-    (gamma, head) = head_proj.device_sharding(head_input)
-    n_layers = head_proj.model_args.n_layers
-    return {f'layer_{n_layers}_model.norm.weight_dev_{device_id}': gamma[device_id], f'layer_{n_layers}_lm_head.weight_dev_{device_id}': head[device_id]}
-
 def _load_hf_checkpoint_into_cpu(model_path: str, weight_index: dict[str, str]) -> dict[str, torch.Tensor]:
-    """Load all text-only HF weights into CPU memory once and cache it.
 
-    This is a one-time cost; the full checkpoint is ~35B bf16 (~70 GiB) and
-    should fit into the container's CPU RAM (several hundred GiB).  The cache is
-    shared across per-device loader calls so the 26 safetensors shards are only
-    read from disk once.
-    """
+    """Load all text-only HF weights into CPU memory once and cache it."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _load_hf_checkpoint_into_cpu')
     global _HF_CHECKPOINT_CPU_CACHE
     if model_path in _HF_CHECKPOINT_CPU_CACHE:
-        logger.info('HF-source loader：复用缓存的 CPU 检查点')
         return _HF_CHECKPOINT_CPU_CACHE[model_path]
-    logger.info('HF-source loader：将完整 HF 检查点加载到 CPU 内存')
     target_files = sorted(set(weight_index.values()))
     state_dict: dict[str, torch.Tensor] = {}
     for weight_file in target_files:
         filepath = os.path.join(model_path, weight_file)
-        logger.info(f'HF-source loader: loading {weight_file}')
         with safe_open(filepath, framework='pt', device='cpu') as f:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
-    logger.info(f'HF-source loader: loaded {len(state_dict)} tensors')
     _HF_CHECKPOINT_CPU_CACHE[model_path] = state_dict
     return state_dict
 
 def _split_state_dict_by_layer(state_dict: dict[str, torch.Tensor], n_layers: int) -> tuple[dict[str, torch.Tensor], list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+
     """Split full HF state dict into embeddings, per-layer, and head/norm."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _split_state_dict_by_layer')
     embeddings: dict[str, torch.Tensor] = {}
     head_norm: dict[str, torch.Tensor] = {}
     layers: list[dict[str, torch.Tensor]] = [dict() for _ in range(n_layers)]
@@ -150,7 +142,9 @@ def _precompute_all_device_states(model_path: str, model_args: ModelArgsQwen36, 
 
     This centralizes the CPU-heavy ``device_sharding`` work so that it runs
     exactly once, regardless of how many devices are being loaded.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] _precompute_all_device_states')
     index_path = os.path.join(model_path, 'model.safetensors.index.json')
     with open(index_path, encoding='utf-8') as f:
         weight_index = json.load(f)['weight_map']
@@ -246,7 +240,9 @@ def load_hf_source_weights(model_path: str, model_args: ModelArgsQwen36, num_dev
     device are stored under ``ref_layer_{idx}_{hf_key}_dev_{device_id}`` so that
     ``init_reference_weights`` can be called once without triggering lazy random
     initialization on every forward step.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] load_hf_source_weights')
     dev = f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu'
     if precomputed is None:
         (embeddings, head_state_per_device, per_device_layer_states, per_device_ref_layer_states) = _precompute_all_device_states(model_path, model_args, num_devices, stack)
@@ -273,5 +269,4 @@ def load_hf_source_weights(model_path: str, model_args: ModelArgsQwen36, num_dev
             result[f'ref_layer_{layer_idx}_{ref_key}_dev_{device_id}'] = tensor.to(dev)
     for (alias, tensor) in head_state_per_device[str(device_id)].items():
         result[alias] = tensor.to(dev)
-    logger.info(f'HF-source loader: device {device_id} received {len(result)} tensors')
     return result

@@ -26,6 +26,8 @@ class RMSNormExpertProjRefWeightsAlias:
     mlp_gate_weight = "mlp.gate.weight"
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProjRefWeightsAlias.__call__')
         return [self.post_attention_layernorm_weight, self.mlp_gate_weight]
 
 
@@ -37,6 +39,8 @@ class RMSNormExpertProjTilertWeightsAlias:
     exp_proj_weights = "exp_proj_weights"
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProjTilertWeightsAlias.__call__')
         return [self.unproj_o_gamma, self.exp_proj_weights]
 
 
@@ -62,6 +66,8 @@ class RMSNormExpertProj(TileRTModule):
         ref_weights_alias: RMSNormExpertProjRefWeightsAlias | None = None,
         tilert_weights_alias: RMSNormExpertProjTilertWeightsAlias | None = None,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProj.__init__')
         super().__init__(
             type(self).__name__,
             model_args=model_args,
@@ -99,6 +105,8 @@ class RMSNormExpertProj(TileRTModule):
         self.profile_logs: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProj.get_weights_list')
         assert self.tilert_rms_norm_weight is not None and self.tilert_proj_weight is not None
         return [self.tilert_rms_norm_weight, self.tilert_proj_weight]
 
@@ -122,6 +130,8 @@ class RMSNormExpertProj(TileRTModule):
     def init_reference_weights(
         self, state_dict: dict[str, torch.Tensor], device_id: int | None = None
     ) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProj.init_reference_weights')
         del device_id
         logger.debug(f"{self.op_name}: init_reference_weights")
         rms_w = state_dict[self.ref_weights_alias.post_attention_layernorm_weight]
@@ -150,6 +160,8 @@ class RMSNormExpertProj(TileRTModule):
         self.is_tilert_weights_init = True
 
     def init_random_weights(self, device: str | None = None) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProj.init_random_weights')
         if device is None:
             device = f"cuda:{self.device_id}" if torch.cuda.is_available() else "cpu"
         proj_weight = torch.randn(self.n_routed_experts, self.dim, device=device)
@@ -168,6 +180,8 @@ class RMSNormExpertProj(TileRTModule):
     def golden_forward(
         self, x_in: torch.Tensor, residual: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProj.golden_forward')
         import torch.nn.functional as F
 
         assert self.is_ref_weights_init, "Reference weights must be initialized before forward pass"
@@ -214,4 +228,6 @@ class RMSNormExpertProj(TileRTModule):
         return hidden_out, scores_out
 
     def __call__(self, x_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormExpertProj.__call__')
         return self.tilert_forward(x_in)

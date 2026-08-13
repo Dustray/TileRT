@@ -1,6 +1,7 @@
 """RMSNormQuant operation module."""
-
 from __future__ import annotations
+
+from tilert import logger
 
 import torch
 
@@ -37,7 +38,9 @@ def rmsnorm_quant(
         quant_hidden_out: Optional quantized output (..., dim). If None, no quant.
         quant_hidden_scale_out: Optional quant scale (..., dim // block_size). If None, no quant.
         profile_logs: Optional profile logs tensor.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] rmsnorm_quant')
     if profile_logs is None:
         raise ValueError("profile_logs is required when calling rmsnorm_quant.")
 

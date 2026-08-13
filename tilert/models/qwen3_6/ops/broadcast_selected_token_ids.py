@@ -1,4 +1,5 @@
 """BroadcastSelectedTokenIds — P2P broadcast of idx_selects from GPU 0 to peers."""
+from tilert import logger
 
 import torch
 
@@ -25,7 +26,9 @@ def broadcast_selected_token_ids(
         profile_logs: Profile logs tensor.
         model_arch: Model architecture ("qwen3_6" or "glm_5").
         compute_kernel_type: Compute kernel type ("bf16").
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] broadcast_selected_token_ids')
     torch.ops.tilert.broadcast_selected_token_ids_op(
         idx_selects,
         peer_bufs,

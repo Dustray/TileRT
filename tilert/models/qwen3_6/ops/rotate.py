@@ -12,6 +12,8 @@ try:
     from fast_hadamard_transform import hadamard_transform
 
     def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] rotate_activation')
         assert x.dtype == torch.bfloat16
         hidden_size = x.size(-1)
         return hadamard_transform(x, scale=hidden_size ** (-0.5))
@@ -21,6 +23,8 @@ except ImportError:
     from scipy.linalg import hadamard
 
     def hadamard_transform_ref(x: torch.Tensor, scale: float=1.0) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] hadamard_transform_ref')
         x_shape = x.shape
         dim = x.shape[-1]
         x = x.reshape(-1, dim)
@@ -33,6 +37,8 @@ except ImportError:
         return out[..., :dim].reshape(*x_shape)
 
     def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] rotate_activation')
         assert x.dtype == torch.bfloat16
         hidden_size = x.size(-1)
         return hadamard_transform_ref(x, scale=hidden_size ** (-0.5))
@@ -57,7 +63,9 @@ def rotate(input_raw: torch.Tensor, output_raw: torch.Tensor, freqs_cis_raw: tor
 
     Returns:
         None
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] rotate')
     torch.ops.tilert.rotate_op(input_raw, output_raw, freqs_cis_raw, model_arch, compute_kernel_type, profile_logs, kv_cache, cur_pos, cache_base, cache_stride, cache_compressed)
 
 @dataclass
@@ -66,9 +74,13 @@ class RotateRefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RotateRefWeightsAlias.ref_tensor_alias')
         return []
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RotateRefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 @dataclass
@@ -77,9 +89,13 @@ class RotateTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RotateTilertWeightsAlias.tilert_tensor_alias')
         return []
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RotateTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 class RotateAlgorithm(Enum):
@@ -95,6 +111,8 @@ class Rotate(TileRTModule):
     _SUPPORTED_ALGORITHMS = {'qwen3_6': [RotateAlgorithm.GENERAL], 'glm_5': [RotateAlgorithm.GENERAL]}
 
     def __init__(self, model_args: ModelArgsQwen36, num_devices: int=1, device_id: int=0, ref_weights_alias: RotateRefWeightsAlias | None=None):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Rotate.__init__')
         super().__init__(self.__class__.__name__, model_args=model_args, num_devices=num_devices, device_id=device_id)
         self.tilert_weights_alias = RotateTilertWeightsAlias()
         self.ref_weights_alias = ref_weights_alias if ref_weights_alias is not None else RotateRefWeightsAlias()
@@ -105,10 +123,12 @@ class Rotate(TileRTModule):
         self.profile_logs: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Rotate.get_weights_list')
         return []
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        logger.info(f'[device_sharding] Rotate，无需分片权重')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Rotate.device_sharding')
         del weights_map
         return {}
 
@@ -124,27 +144,24 @@ class Rotate(TileRTModule):
         logger.debug(f'{self.op_name}: init_random_weights on device {self.device_id}')
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device: str='cuda') -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Rotate.init_tilert_vars')
         self.output = torch.zeros((batch_size, seq_len, self.index_n_heads, self.index_head_dim), dtype=torch.bfloat16, device=device)
         self.profile_logs = get_profile_log_tensor(device=device)
         self.is_init = True
 
     def golden_forward(self, idx_q: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        logger.info(f'[RotateOp.golden_forward_{self.device_id}] ENTRY: idx_q.shape={idx_q.shape}, freqs_cis.shape={freqs_cis.shape}')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Rotate.golden_forward')
         (q_pe_idx, q_nope_idx) = torch.split(idx_q, [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim], dim=-1)
-        logger.info(f'[RotateOp.golden_forward_{self.device_id}] Split: q_pe_idx.shape={q_pe_idx.shape}, q_nope_idx.shape={q_nope_idx.shape}')
         q_pe_idx = apply_rotary_emb(q_pe_idx, freqs_cis, interleaved=False)
         idx_q = torch.cat([q_pe_idx, q_nope_idx], dim=-1)
-        logger.info(f'[RotateOp.golden_forward_{self.device_id}] Concatenated idx_q.shape={idx_q.shape}')
         result = rotate_activation(idx_q)
-        logger.info(f'[RotateOp.golden_forward_{self.device_id}] EXIT: result.shape={result.shape}')
         return result
 
     def tilert_forward(self, idx_q: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        logger.info(f'[RotateOp.tilert_forward_{self.device_id}] ENTRY: idx_q.shape={idx_q.shape}, freqs_cis.shape={freqs_cis.shape}')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] Rotate.tilert_forward')
         assert self.output is not None
         assert self.profile_logs is not None
         freqs_cis_real = torch.view_as_real(freqs_cis).reshape(*freqs_cis.shape[:-1], -1)
-        logger.info(f'[RotateOp.tilert_forward_{self.device_id}] Calling CUDA kernel rotate')
         rotate(idx_q, self.output, freqs_cis_real, self.profile_logs, model_arch=self.model_args.arch_name)
-        logger.info(f'[RotateOp.tilert_forward_{self.device_id}] EXIT: output.shape={self.output.shape}')
         return self.output

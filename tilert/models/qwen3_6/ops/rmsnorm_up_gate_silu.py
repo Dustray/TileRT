@@ -33,7 +33,9 @@ def rmsnorm_up_gate_silu(
     model_arch: str,
     compute_kernel_type: str = "fp8mma",
 ) -> None:
+
     """rmsnorm_up_gate_silu operation."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] rmsnorm_up_gate_silu')
     torch.ops.tilert.rmsnorm_up_gate_silu_op(
         hidden_in,
         gamma_in,
@@ -69,6 +71,8 @@ class RMSNormUpGateSiLUTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLUTilertWeightsAlias.tilert_tensor_alias')
         return [
             self.unproj_o_gamma,
             self.gate_weights,
@@ -78,6 +82,8 @@ class RMSNormUpGateSiLUTilertWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLUTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -96,6 +102,8 @@ class RMSNormUpGateSiLU(TileRTModule):
         num_devices: int,
         algorithm: RMSNormUpGateSiLUAlgorithm = RMSNormUpGateSiLUAlgorithm.FP8MMA,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLU.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -149,6 +157,8 @@ class RMSNormUpGateSiLU(TileRTModule):
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLU.tilert_tensor_alias')
         return self.tilert_weights_alias()
 
     def get_weights_list(self) -> list[torch.Tensor]:
@@ -157,7 +167,9 @@ class RMSNormUpGateSiLU(TileRTModule):
 
         Returns:
             List of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLU.get_weights_list')
         return [self.tilert_norm_gamma, self.tilert_weights, self.tilert_scales]
 
     def device_sharding(
@@ -173,6 +185,7 @@ class RMSNormUpGateSiLU(TileRTModule):
 
         Returns:
             Tuple of weights.
+
         """
         logger.info(f"[device_sharding] key_prefix: {key_prefix}")
         
@@ -237,6 +250,7 @@ class RMSNormUpGateSiLU(TileRTModule):
         Args:
             state_dict: State dictionary.
             device_id: Device ID.
+
         """
         logger.debug(f"{self.op_name}: init_reference_weights on device {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
@@ -264,6 +278,7 @@ class RMSNormUpGateSiLU(TileRTModule):
 
         Args:
             state_dict: State dictionary.
+
         """
         logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
@@ -278,7 +293,9 @@ class RMSNormUpGateSiLU(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLU.init_tilert_vars')
         self.hidden_out = torch.zeros(
             (
                 batch_size,
@@ -299,7 +316,9 @@ class RMSNormUpGateSiLU(TileRTModule):
 
         Returns:
             None
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLU.init_random_weights')
         if dev_id is None:
             dev_id = self.device_id
         logger.debug(f"{self.op_name}: init_random_weights on device {dev_id}")
@@ -404,4 +423,6 @@ class RMSNormUpGateSiLU(TileRTModule):
         self,
         x_in: torch.Tensor,
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] RMSNormUpGateSiLU.__call__')
         return self.golden_forward(x_in)

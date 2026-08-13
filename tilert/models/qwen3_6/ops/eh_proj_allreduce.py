@@ -36,7 +36,9 @@ def eh_proj_allreduce(
         vec_out: Output tensor of shape (1, seq_len, 7168).
         profile_logs: Profile logs tensor (1D).
         model_arch: Model architecture string.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] eh_proj_allreduce')
     compute_kernel_type = "bf16"
     torch.ops.tilert.eh_proj_allreduce_op(
         vec_in_enorm,
@@ -69,7 +71,9 @@ class EHProjAllReduceWeightsConverter(TilertWeightsConverter):
 
         Returns:
             Tuple of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduceWeightsConverter.convert_to_general')
         args = self.model_args
         assert args.arch_name == "qwen3_6" or args.arch_name == "glm_5"
         dim = args.dim
@@ -94,9 +98,13 @@ class EHProjAllReduceTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduceTilertWeightsAlias.tilert_tensor_alias')
         return [self.eh_proj_weights]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduceTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -114,6 +122,8 @@ class EHProjAllReduce(TileRTModule):
         num_devices: int,
         algorithm: EHProjAllReduceAlgorithm = EHProjAllReduceAlgorithm.GENERAL,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduce.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -146,6 +156,8 @@ class EHProjAllReduce(TileRTModule):
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduce.tilert_tensor_alias')
         return self.tilert_weights_alias.tilert_tensor_alias
 
     def get_weights_list(self) -> list[torch.Tensor]:
@@ -154,7 +166,9 @@ class EHProjAllReduce(TileRTModule):
 
         Returns:
             List of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduce.get_weights_list')
         return [self.tilert_proj]
 
     def device_sharding(
@@ -170,6 +184,7 @@ class EHProjAllReduce(TileRTModule):
             key_prefix: Key prefix.
         Returns:
             Tuple of weights.
+
         """
         logger.info(f"[dev={self.device_id}] [device_sharding] key_prefix: {key_prefix}，num_devices: {self.num_devices}")
         
@@ -203,6 +218,7 @@ class EHProjAllReduce(TileRTModule):
         Args:
             state_dict: State dictionary.
             device_id: Device ID.
+
         """
         logger.debug(f"[dev={device_id}] {self.op_name}: 在设备上初始化参考权重 {device_id}")
         sharded_list = self.device_sharding(state_dict, key_prefix)
@@ -217,6 +233,7 @@ class EHProjAllReduce(TileRTModule):
 
         Args:
             state_dict: State dictionary.
+
         """
         logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化TileRT权重 {self.device_id}")
         assert self.algorithm is not None
@@ -231,7 +248,9 @@ class EHProjAllReduce(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduce.init_tilert_vars')
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -241,7 +260,9 @@ class EHProjAllReduce(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device_id: int | None = None) -> None:
+
         """Initialize the random weights."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] EHProjAllReduce.init_random_weights')
         if device_id is None:
             device_id = self.device_id
         logger.debug(f"[dev={device_id}] {self.op_name}: 初始化随机权重，设备为 {device_id}")
@@ -276,6 +297,7 @@ class EHProjAllReduce(TileRTModule):
 
         Returns:
             Output tensor.
+
         """
         logger.info(f"[dev={self.device_id}] [EHProjAllReduceOp.golden_forward_{self.device_id}] 入口: vec_in_enorm.shape={vec_in_enorm.shape}，vec_in_hnorm.shape={vec_in_hnorm.shape}，device_id={device_id}")
         

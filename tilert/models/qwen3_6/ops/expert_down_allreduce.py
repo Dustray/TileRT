@@ -53,7 +53,9 @@ def expert_down_allreduce(
         vec_out: [1, seq_len, dim], bfloat16 (output).
         profile_logs: 1D tensor for profile logs.
         compute_kernel_type: "bf16".
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] expert_down_allreduce')
     torch.ops.tilert.expert_down_allreduce_op(
         vec_in,
         mat_in,
@@ -80,6 +82,8 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_qmma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_qmma_16x32')
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
         assert mat_in.dtype == torch.float8_e4m3fn
         pre_shape = mat_in.shape[:-2]
@@ -88,13 +92,17 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_qmma_8x32(mat_in: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_qmma_8x32')
         assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
         pre_shape = mat_in.shape[:-2]
         return mat_in.reshape(*pre_shape, 8, 2, 4, 4).transpose(-2, -3).contiguous()
 
     @staticmethod
     def _swizzle_bf16mma_full_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+
         """Swizzle a (16, 32) FP8 sub-block for the BF16 MMA kernel."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_bf16mma_full_16x32')
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
         assert mat_in.dtype == torch.float8_e4m3fn
         pre = mat_in.shape[:-2]
@@ -105,7 +113,9 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_bf16mma_partial_8x32(mat_in: torch.Tensor) -> torch.Tensor:
+
         """Swizzle a (8, 32) FP8 partial sub-block for the BF16 MMA kernel."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_bf16mma_partial_8x32')
         assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
         assert mat_in.dtype == torch.float8_e4m3fn
         pre = mat_in.shape[:-2]
@@ -122,7 +132,9 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
         EP8: each device keeps the full intermediate dimension for its local
         experts.  The swizzling therefore processes the full ``inter_dim``
         rather than ``inter_dim // num_devices``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter.convert_to_general')
         args = self.model_args
         assert args.arch_name in ("qwen3_6", "glm_5")
         arch_name = args.arch_name
@@ -230,7 +242,9 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
         Returns the raw FP8 weights and a scalar scale.  The resulting tilert
         tensors are not layout-swizzled, but they keep ``init_tilert_weights``
         and the tilert path importable for random-init smoke tests.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._convert_to_general_fallback')
         mat_in, scale_in = weights_list
         # Preserve a 3-D scale tensor so the rest of the op can keep using
         # scale_in as if it came from ``process_down_weights``.
@@ -249,7 +263,9 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
     def convert_to_bf16mma(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Pack FP8 weights for the BF16 MMA kernel (DSv32 only)."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter.convert_to_bf16mma')
         args = self.model_args
         assert args.arch_name == "deepseek_v3_2", "BF16 MMA layout is only valid for DSv32."
         dim = args.dim
@@ -311,9 +327,13 @@ class ExpertDownAllReduceTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceTilertWeightsAlias.tilert_tensor_alias')
         return [self.exp_down_weights, self.exp_down_scales]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -331,6 +351,8 @@ class ExpertDownAllReduceRefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceRefWeightsAlias.ref_tensor_alias')
         prefix = self.key_prefix
         return [
             f"{prefix}.shared_expert.down_proj.weight",
@@ -340,6 +362,8 @@ class ExpertDownAllReduceRefWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceRefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 
@@ -359,6 +383,8 @@ class ExpertDownAllReduce(TileRTModule):
         num_devices: int,
         algorithm: ExpertDownAllReduceAlgorithm = ExpertDownAllReduceAlgorithm.GENERAL,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -399,16 +425,24 @@ class ExpertDownAllReduce(TileRTModule):
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.tilert_tensor_alias')
         return self.tilert_weights_alias.tilert_tensor_alias
 
     @property
     def tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.tensor_alias')
         return self._tensor_alias
 
     def get_ref_weights_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.get_ref_weights_alias')
         return list(self.ref_weights_alias())
 
     def get_weights_list(self) -> list[torch.Tensor | None]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.get_weights_list')
         return [self.tilert_weights, self.tilert_scales]
 
     @staticmethod
@@ -434,7 +468,9 @@ class ExpertDownAllReduce(TileRTModule):
           EP8: (n_local_experts, num_devices, dim, inter_dim)
           TP8: (n_experts,       num_devices, dim, inter_dim // num_devices)
         where n_local_experts = 1 shared + n_routed_experts // num_devices routed.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.process_down_weights')
         if is_stacked_experts:
             down_proj_weight = weights_hf[f"{key_prefix}.down_proj"]
             down_proj_scale = weights_hf.get(
@@ -483,6 +519,7 @@ class ExpertDownAllReduce(TileRTModule):
             stacked layout ``(n_experts, num_devices, dim_scale_dim,
             local_in_scale_dim)``.
             """
+            logger.info(f'[{__file__.split(chr(47))[-1]}] _tp_shard_scale')
             if scale.dim() == 2:
                 scale = scale.unsqueeze(0)
             cols_needed = num_devices * local_in_scale_dim
@@ -536,6 +573,8 @@ class ExpertDownAllReduce(TileRTModule):
         num_devices: int = 1,
         tp_mode: bool = False,
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce._fake_ones_scale')
         if is_stacked_experts:
             _, dim, inter_dim = weight.shape
         else:
@@ -558,6 +597,8 @@ class ExpertDownAllReduce(TileRTModule):
         weights_dict: dict[str, torch.Tensor],
         key_prefix: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.device_sharding')
         if key_prefix is None:
             key_prefix = self.ref_weights_alias.key_prefix
 
@@ -599,7 +640,9 @@ class ExpertDownAllReduce(TileRTModule):
         weights: torch.Tensor,
         scales: torch.Tensor,
     ) -> torch.Tensor:
+
         """Dequantize a stack of expert down weights to bf16."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce._dequant_expert_stack')
         return torch.stack(
             [
                 _safe_weight_dequant(weights[i], scales[i]).to(torch.bfloat16)
@@ -659,7 +702,9 @@ class ExpertDownAllReduce(TileRTModule):
         self.is_ref_weights_init = True
 
     def get_tilert_weights_alias(self) -> list[str]:
+
         """Return the alias list keyed into ``state_dict`` for this op."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.get_tilert_weights_alias')
         return list(self.tilert_weights_alias())
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -682,6 +727,8 @@ class ExpertDownAllReduce(TileRTModule):
         ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.init_tilert_vars')
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -693,6 +740,8 @@ class ExpertDownAllReduce(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device_id: int | None = None) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.init_random_weights')
         if device_id is None:
             device_id = self.device_id
         if device_id is None:
@@ -773,7 +822,9 @@ class ExpertDownAllReduce(TileRTModule):
 
         Returns:
             [num_tokens, dim] fully all-reduced MoE output.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.golden_forward')
         assert self.ref_down is not None
 
         num_tokens = h_flat.size(0)
@@ -879,4 +930,6 @@ class ExpertDownAllReduce(TileRTModule):
         expert_indices: torch.Tensor,
         moe_intermediate: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduce.__call__')
         return self.golden_forward(h_flat, expert_indices, moe_intermediate)

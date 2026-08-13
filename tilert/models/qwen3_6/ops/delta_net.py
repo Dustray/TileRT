@@ -61,7 +61,9 @@ def delta_net(
         profile_logs: Profile logs tensor.
         model_arch: Architecture string.
         compute_kernel_type: Kernel type ("general" for now).
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] delta_net')
     torch.ops.tilert.delta_net_op(
         hidden_in,
         state_in,
@@ -82,6 +84,8 @@ class DeltaNetRefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetRefWeightsAlias.ref_tensor_alias')
         return [
             f"{self.key_prefix}.in_proj_qkv.weight",
             f"{self.key_prefix}.in_proj_z.weight",
@@ -95,6 +99,8 @@ class DeltaNetRefWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetRefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 
@@ -114,6 +120,8 @@ class DeltaNetTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetTilertWeightsAlias.tilert_tensor_alias')
         return [
             self.in_proj_qkv_weights,
             self.in_proj_z_weights,
@@ -127,6 +135,8 @@ class DeltaNetTilertWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -157,6 +167,8 @@ class DeltaNetWeightsConverter(TilertWeightsConverter):
         torch.Tensor,
         torch.Tensor,
     ]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetWeightsConverter.convert_to_general')
         in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, conv1d, A_log, dt_bias, norm, out_proj = (
             weights_list
         )
@@ -187,6 +199,8 @@ class DeltaNetOp(TileRTModule):
         num_devices: int,
         algorithm: DeltaNetAlgorithm = DeltaNetAlgorithm.GENERAL,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -226,13 +240,19 @@ class DeltaNetOp(TileRTModule):
 
     @property
     def tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.tensor_alias')
         return list(self.ref_weights_alias())
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.tilert_tensor_alias')
         return list(self.tilert_weights_alias())
 
     def get_weights_list(self) -> list[torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.get_weights_list')
         return [
             self.in_proj_qkv_weights,
             self.in_proj_z_weights,
@@ -254,7 +274,9 @@ class DeltaNetOp(TileRTModule):
         and DeltaNet projection weights are replicated in full.  This method
         stacks the same full tensors ``num_devices`` times so the downstream
         ``init_reference_weights`` can still index ``[device_id]``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.device_sharding')
         prefix = self.ref_weights_alias.key_prefix
         aliases = self.ref_weights_alias.ref_tensor_alias
         
@@ -275,7 +297,9 @@ class DeltaNetOp(TileRTModule):
         return result
 
     def _get_local_out_slices(self) -> list[list[slice]]:
+
         """Unused under EP8; kept for backward compatibility only."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._get_local_out_slices')
         return []
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -312,6 +336,8 @@ class DeltaNetOp(TileRTModule):
     def init_tilert_vars(
         self, batch_size: int, seq_len: int, device: str = "cuda"
     ) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.init_tilert_vars')
         self.hidden_out = torch.zeros(
             batch_size,
             seq_len,
@@ -387,7 +413,9 @@ class DeltaNetOp(TileRTModule):
 
         Uses a state matrix S of shape (bsz, n_kv_heads, head_dim, head_dim).
         q/k are expanded to n_heads and then collapsed back via mean over groups.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._linear_attention')
         bsz, seq_len, _ = q.shape
         q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.n_k_heads, self.head_dim).transpose(1, 2)
@@ -463,7 +491,9 @@ class DeltaNetOp(TileRTModule):
 
         This keeps TileRT's golden path bit-level compatible with the official
         Qwen3.5-MoE/Qwen3.6 model without relying on ``fla`` / ``causal-conv1d``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._gated_delta_attention')
         initial_dtype = q.dtype
         bsz, seq_len, _ = q.shape
         q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
@@ -571,6 +601,8 @@ class DeltaNetOp(TileRTModule):
 
     @staticmethod
     def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._l2norm')
         return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 
     def _rmsnorm_gated(
@@ -584,7 +616,9 @@ class DeltaNetOp(TileRTModule):
 
         The official implementation normalises first, multiplies by the
         learnable weight (not ``1 + weight``), and then applies the SiLU gate.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._rmsnorm_gated')
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -609,7 +643,9 @@ class DeltaNetOp(TileRTModule):
         Returns:
             (output, updated_conv_state) with output shape
             (bsz, hidden_size, seq_len).
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._causal_conv1d_update')
         bsz, hidden_size, seq_len = hidden_states.shape
         kernel_size = weight.shape[-1] - 1
         if conv_state is None:
@@ -641,6 +677,7 @@ class DeltaNetOp(TileRTModule):
         across decode steps.  ``conv_state`` has shape
         ``(bsz, conv_dim, kernel_size)`` and ``recurrent_state`` has shape
         ``(bsz, num_heads, k_head_dim, v_head_dim)``.
+
         """
         logger.info(f"[dev={self.device_id}] [DeltaNetOp.golden_forward_{self.device_id}] 入口: x.shape={x.shape}，start_pos={start_pos}，has_state={state is not None}")
         
@@ -725,6 +762,7 @@ class DeltaNetOp(TileRTModule):
         start_pos: int,
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Optimized forward placeholder."""
         logger.info(f"[dev={self.device_id}] [DeltaNetOp.tilert_forward_{self.device_id}] 入口: x.shape={x.shape}，start_pos={start_pos}，has_state={state is not None}")
         
@@ -753,6 +791,8 @@ class DeltaNetOp(TileRTModule):
         start_pos: int,
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp.forward')
         if self.flag_enable_tilert:
             return self.tilert_forward(x, start_pos, state)
         return self.golden_forward(x, start_pos, state)

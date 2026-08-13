@@ -1,5 +1,7 @@
 """topk operations module."""
 from __future__ import annotations
+
+from tilert import logger
 from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
@@ -22,7 +24,9 @@ def topk_approximate(logits: torch.Tensor, seq_len: int, topk: int, profile_logs
 
     Returns:
         indices (torch.Tensor): The output tensor.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] topk_approximate')
     if logits.dtype != torch.float32:
         raise ValueError('logits must be a float32 tensor.')
     if topk != 2048:
@@ -50,7 +54,9 @@ def topk_accurate(logits: torch.Tensor, seq_len: int, topk: int, profile_logs: t
         ratio (int): Token-domain to logits-trailing-dim compression factor.
     Returns:
         indices (torch.Tensor): The output tensor.
+
     """
+    logger.info(f'[{__file__.split(chr(47))[-1]}] topk_accurate')
     if logits.dtype != torch.float32:
         raise ValueError('logits must be a float32 tensor.')
     if topk not in (512, 1024, 2048):
@@ -70,6 +76,8 @@ class TopK(nn.Module):
     """
 
     def __init__(self, use_approximate: bool=False, model_args: ModelArgsQwen36 | None=None) -> None:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] TopK.__init__')
         super().__init__()
         self.use_approximate = use_approximate
         if model_args is None:
@@ -86,11 +94,11 @@ class TopK(nn.Module):
 
         Returns:
             Indices of top-k values along the last dimension.
+
         """
-        logger.info(f'[TopKOp.golden_forward] 进入: logits.shape={logits.shape}, topk={topk}')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] TopK.golden_forward')
         seq_len = logits.shape[-1]
         result = logits.topk(min(topk, seq_len), dim=-1)[1]
-        logger.info(f'[TopKOp.golden_forward] 退出: result.shape={result.shape}')
         return result
 
     def tilert_forward(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
@@ -102,18 +110,15 @@ class TopK(nn.Module):
 
         Returns:
             Indices tensor of shape (batch, num_samples, topk).
+
         """
-        logger.info(f'[TopKOp.tilert_forward] 进入: logits.shape={logits.shape}, topk={topk}, use_approximate={self.use_approximate}')
+        logger.info(f'[{__file__.split(chr(47))[-1]}] TopK.tilert_forward')
         profile_logs = get_profile_log_tensor(device=logits.device)
         cache_len = logits.shape[-1]
         if self.use_approximate:
-            logger.info(f'[TopKOp.tilert_forward] 调用 CUDA kernel topk_approximate')
             indices = topk_approximate(logits, cache_len, topk, profile_logs, model_arch=self.model_args.arch_name)
         else:
-            logger.info(f'[TopKOp.tilert_forward] 调用 CUDA kernel topk_accurate')
             indices = topk_accurate(logits, cache_len, topk, profile_logs, model_arch=self.model_args.arch_name)
         if indices.dim() == 2:
             indices = indices.unsqueeze(0)
-            logger.info(f'[TopKOp.tilert_forward] 将 indices 升维至 3D')
-        logger.info(f'[TopKOp.tilert_forward] 退出: indices.shape={indices.shape}')
         return indices

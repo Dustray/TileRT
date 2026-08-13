@@ -37,6 +37,8 @@ class QwenMoe:
         device_id: int,
         num_devices: int,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoe.__init__')
         self.rmsnorm_expert_proj = RMSNormExpertProj(
             model_args=model_args,
             device_id=device_id,
@@ -56,6 +58,8 @@ class QwenMoe:
         )
 
     def get_weights_list(self) -> list[torch.Tensor | None]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoe.get_weights_list')
         return [
             *self.rmsnorm_expert_proj.get_weights_list(),
             *self.exp_sel_up_gate_silu.get_weights_list(),
@@ -79,6 +83,8 @@ class QwenMoeBlock(TileRTModule):
         num_devices: int,
         moe: QwenMoe | None = None,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -97,6 +103,7 @@ class QwenMoeBlock(TileRTModule):
         )
 
     def init_random_weights(self, device: str | None = None) -> None:
+
         """Lazy initialize random weights for sanity testing."""
         logger.debug(f"{self.op_name}: init_random_weights on {device}")
         if device is None:
@@ -116,7 +123,9 @@ class QwenMoeBlock(TileRTModule):
         and returns a list of per-expert tuples.  ``expert_down_allreduce``
         performs the local down-projection, weighted aggregation, and
         all-reduces across devices.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.golden_forward')
         if not self.moe.rmsnorm_expert_proj.is_ref_weights_init:
             self.init_random_weights(device=str(x.device))
         h_flat, routing_weights, expert_indices = self.moe.rmsnorm_expert_proj.golden_forward(x)
@@ -144,7 +153,9 @@ class QwenMoeBlock(TileRTModule):
         self.moe.expert_down_allreduce.init_reference_weights(state_dict)
 
     def tilert_forward(self, x: torch.Tensor) -> torch.Tensor:
+
         """TileRT forward: dispatches to registered ops."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.tilert_forward')
         norm_x, scores = self.moe.rmsnorm_expert_proj.tilert_forward(x)
         up_gate_out, weights, indices = self.moe.exp_sel_up_gate_silu.tilert_forward(
             norm_x, scores
@@ -152,24 +163,34 @@ class QwenMoeBlock(TileRTModule):
         return self.moe.expert_down_allreduce.tilert_forward(up_gate_out, indices, weights, x, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.forward')
         if self.flag_enable_tilert:
             return self.tilert_forward(x)
         return self.golden_forward(x)
 
     def get_weights_list(self) -> list[torch.Tensor | None]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.get_weights_list')
         return self.moe.get_weights_list()
 
     def get_ref_weights_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.get_ref_weights_alias')
         return self.moe.rmsnorm_expert_proj.get_ref_weights_alias() + \
                self.moe.exp_sel_up_gate_silu.get_ref_weights_alias() + \
                self.moe.expert_down_allreduce.get_ref_weights_alias()
 
     def get_tilert_weights_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.get_tilert_weights_alias')
         return self.moe.rmsnorm_expert_proj.get_tilert_weights_alias() + \
                self.moe.exp_sel_up_gate_silu.get_tilert_weights_alias() + \
                self.moe.expert_down_allreduce.get_tilert_weights_alias()
 
     def device_sharding(self, raw_weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenMoeBlock.device_sharding')
         sharded = {}
         rmsnorm = self.moe.rmsnorm_expert_proj
         rms_w = raw_weights_map.get(rmsnorm.ref_weights_alias.post_attention_layernorm_weight)

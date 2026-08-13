@@ -34,7 +34,9 @@ def expert_select_up_gate_silu(
     *,
     model_arch: str,
 ) -> None:
+
     """Expert SelectUpGateSiLU operation."""
+    logger.info(f'[{__file__.split(chr(47))[-1]}] expert_select_up_gate_silu')
     torch.ops.tilert.expert_select_up_gate_silu_op(
         hidden_in,
         scores_in,
@@ -69,6 +71,7 @@ class ExpertSelectUpGateSiLURefWeightsAlias:
 
     @property
     def ref_tensor_alias(self) -> list[str]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLURefWeightsAlias.ref_tensor_alias')
         return (
             [f"{self.key_prefix}.shared_expert.gate_proj.weight"]
             + [f"{self.key_prefix}.shared_expert.up_proj.weight"]
@@ -81,6 +84,7 @@ class ExpertSelectUpGateSiLURefWeightsAlias:
         )
 
     def __call__(self) -> list[str]:
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLURefWeightsAlias.__call__')
         return self.ref_tensor_alias
 
 
@@ -96,6 +100,8 @@ class ExpertSelectUpGateSiLUTilertWeightsAlias:
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUTilertWeightsAlias.tilert_tensor_alias')
         return [
             self.exp_bias,
             self.exp_gate_weights,
@@ -105,6 +111,8 @@ class ExpertSelectUpGateSiLUTilertWeightsAlias:
         ]
 
     def __call__(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUTilertWeightsAlias.__call__')
         return self.tilert_tensor_alias
 
 
@@ -121,6 +129,8 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_qmma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter._swizzle_qmma_16x32')
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
         assert mat_in.dtype == torch.float8_e4m3fn
         pre_shape = mat_in.shape[:-2]
@@ -129,6 +139,8 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_mma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32')
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
@@ -136,6 +148,8 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x16')
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
@@ -154,7 +168,9 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             mma_type: MMA type, None,"16x32" or "16x16"
         Returns:
             tilert_144sm weights and scales
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm')
         exp_num = mat_in.shape[0]
         assert mat_in.shape == (exp_num, 512, 7168)
         assert mat_scale_in.shape == (exp_num, 4, 64)
@@ -216,7 +232,9 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             mat_scale_in: tilert scales
         Returns:
             tilert_144sm weights and scales
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm_mma')
         return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(
             mat_in, mat_scale_in, mma_type
         )
@@ -224,7 +242,9 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
     def convert_to_mma(
         self, weights_list: list[torch.Tensor], algorithm: str = "fp8mma"
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Convert the weights to mma format."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_mma')
         args = self.model_args
         dim = args.dim
         pages = dim // 1024
@@ -327,7 +347,9 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
 
         Returns:
             Tuple of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_fp8mma')
         return self.convert_to_mma(weights_list, "fp8mma")
 
     def convert_to_fp16mma(
@@ -341,13 +363,17 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
 
         Returns:
             Tuple of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_fp16mma')
         return self.convert_to_mma(weights_list, "fp16mma")
 
     def convert_to_bf16mma(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Convert the weights to bf16mma format."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_bf16mma')
         return self.convert_to_mma(weights_list, "fp16mma")
 
 
@@ -374,6 +400,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         tilert_weights_alias: ExpertSelectUpGateSiLUTilertWeightsAlias | None = None,
         algorithm: ExpertSelectUpGateSiLUAlgorithm = ExpertSelectUpGateSiLUAlgorithm.FP8MMA,
     ):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.__init__')
         super().__init__(
             self.__class__.__name__,
             model_args=model_args,
@@ -444,11 +472,15 @@ class ExpertSelectUpGateSiLU(TileRTModule):
 
     @property
     def tensor_alias(self) -> list[str]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.tensor_alias')
         return self._tensor_alias
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+
         """Output weight names for get_weights_list (backward compat)."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.tilert_tensor_alias')
         return self._tilert_tensor_alias
 
     def get_weights_list(self) -> list[torch.Tensor | None]:
@@ -457,7 +489,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
 
         Returns:
             List of weights.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.get_weights_list')
         return [self.tilert_bias, self.tilert_weights, self.tilert_scales]
 
     @staticmethod
@@ -495,7 +529,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         where n_local_experts = 1 shared + n_routed_experts // num_devices routed.
         The ``num_devices`` dim is kept for compatibility with the existing
         ``device_sharding`` stacking convention.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.process_gate_up_weights')
         if is_stacked_experts:
             gate_up_proj = weights_hf[f"{key_prefix}.gate_up_proj"]
             gate_proj_weight = gate_up_proj[:, :inter_dim, :]
@@ -682,7 +718,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         Under TP8 the scale grid follows the local (sharded) intermediate
         dimension.  If ``inter_dim // num_devices`` is smaller than
         ``block_size``, we keep one scale column per row block.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU._fake_ones_scale')
         block_size = 128
         if is_stacked_experts:
             n_experts, in_dim, dim = weight.shape
@@ -710,7 +748,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
 
         Returns:
             Dict keyed by tilert_weights_alias() with (num_devices, ...) tensors.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.device_sharding')
         ref_alias = self.ref_weights_alias
         key_prefix = ref_alias.key_prefix
         
@@ -798,7 +838,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         ``weights`` has shape ``(n_experts, inter_dim, dim)`` or
         ``(n_experts, in_scale_dim, scale_dim)`` and ``scales`` has the matching
         scale shape.  The result is stacked along the first dimension.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU._dequant_expert_stack')
         return torch.stack(
             [
                 _safe_weight_dequant(weights[i], scales[i]).to(torch.bfloat16)
@@ -818,7 +860,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         Args:
             state_dict: State dict keyed by ref_weights_alias().
             device_id: Device ID; defaults to self.device_id.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.init_reference_weights')
         did = self.device_id if device_id is None else device_id
         logger.debug(f"{self.op_name}: init_reference_weights on device {did}")
         ref_alias = self.ref_weights_alias
@@ -879,10 +923,13 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         self.is_ref_weights_init = True
 
     def get_tilert_weights_alias(self) -> list[str]:
+
         """Return the alias list keyed into ``state_dict`` for this op."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.get_tilert_weights_alias')
         return list(self.tilert_weights_alias())
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+
         """Initialize the tilert weights."""
         logger.debug(f"{self.op_name}: init_tilert_weights on device {self.device_id}")
         assert self.algorithm is not None, "Algorithm is not set"
@@ -904,8 +951,10 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         Args:
             batch_size: Batch size.
             seq_len: Sequence length.
+
         """
         # TP8: each device holds inter_dim // num_devices for every expert.
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.init_tilert_vars')
         local_inter_dim = max(self.moe_inter_dim // self.num_devices, 1)
         self.hidden_out = torch.zeros(
             (
@@ -941,7 +990,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             device: Device to place weights on. May be a ``torch.device`` string,
                 an integer device id, or ``None`` to default to
                 ``f"cuda:{self.device_id}"``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.init_random_weights')
         if device is None:
             device = f"cuda:{self.device_id}"
         elif isinstance(device, int):
@@ -1028,6 +1079,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         self.init_tilert_weights(per_device_state)
 
     def _ref_expert_select_glm5(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU._ref_expert_select_glm5')
         scores = scores.sigmoid()
         original_scores = scores
         if self.ref_bias is not None:
@@ -1048,7 +1101,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         no additional route_scale.  We keep the multiplication for backwards
         compatibility with older checkpoints/conversions, but the default
         `route_scale` for qwen3_6 is now 1.0.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU._ref_expert_select_qwen36')
         original_scores = scores
         if self.ref_bias is not None:
             scores = scores + self.ref_bias
@@ -1091,7 +1146,9 @@ class ExpertSelectUpGateSiLU(TileRTModule):
                 - token_idx: [n_e], indices of tokens assigned to this expert.
                 - ffn_e: [n_e, local_inter_dim], local SiLU(gate) * up.
                 - weight_e: [n_e, 1], routing weights for the assignment.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU.golden_forward')
         assert self.ref_gate is not None
         assert self.ref_up is not None
         assert self.gate_up_proj_weight is not None
@@ -1147,6 +1204,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         x_in: torch.Tensor,
         scores: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
         """Run the kernel."""
         logger.info(f"[ExpertSelUpGateSiluOp.tilert_forward_{self.device_id}] ENTRY: x_in.shape={x_in.shape}, scores.shape={scores.shape}")
         

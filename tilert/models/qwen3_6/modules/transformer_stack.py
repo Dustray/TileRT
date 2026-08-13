@@ -4,9 +4,10 @@ This module is not related to DeepSeek's DSA (DeepSeek Sparse Attention).
 Qwen3.6 uses GQA + DeltaNet; this file simply stacks the 40 heterogeneous
 Transformer layers and provides the golden / TileRT forward dispatchers.
 """
+from tilert import logger
+
 from typing import Any
 import torch
-from tilert import logger
 from tilert.models.base import SerializableTileRTModule
 from tilert.models.qwen3_6.model_args import ModelArgsQwen36
 from tilert.models.qwen3_6.modules.gated_attention import GatedAttention
@@ -33,6 +34,8 @@ class QwenTransformerStack(SerializableTileRTModule):
     """
 
     def __init__(self, model_args: ModelArgsQwen36, device_id: int, num_devices: int, cached_ffn_ops: list | None=None, moe_sync_callback: Any | None=None):
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.__init__')
         super().__init__(model_args=model_args, device_id=device_id, num_devices=num_devices, remove_selected=True)
         self.model_args = model_args
         self.device_id = device_id
@@ -44,10 +47,6 @@ class QwenTransformerStack(SerializableTileRTModule):
         for _ in range(model_args.n_blocks):
             self.layer_types.extend([0, 0, 0, 1])
         self.layer_types = self.layer_types[:model_args.n_layers]
-        logger.info(f'QwenTransformerStack: building {len(self.layer_types)} layers on cuda:{device_id} (num_devices={num_devices}), cached_ffn_ops={cached_ffn_ops is not None}')
-        delta_count = sum((1 for t in self.layer_types if t == 0))
-        gqa_count = len(self.layer_types) - delta_count
-        logger.info(f'QwenTransformerStack: {delta_count} DeltaNet + {gqa_count} GatedAttention layers')
         for (layer_idx, layer_type) in enumerate(self.layer_types):
             ffn_op = cached_ffn_ops[layer_idx] if cached_ffn_ops else None
             if layer_type == 0:
@@ -57,11 +56,11 @@ class QwenTransformerStack(SerializableTileRTModule):
             self.register_op(block, prefix=f'layer_{layer_idx}_', suffix=f'_dev_{device_id}')
             block.moe_sync_callback = self.moe_sync_callback
             block.ffn.moe.expert_down_allreduce.moe_sync_callback = self.moe_sync_callback
-            logger.debug(f"Registered layer {layer_idx}: {('DeltaNet' if layer_type == 0 else 'GatedAttention')}")
-        logger.info('[dev={device_id}]QwenTransformerStack 构建完成')
 
     def _prepare_mrope_embed(self, mrope_embed: tuple[torch.Tensor, torch.Tensor] | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
         """Normalize RoPE tables to a (cos, sin) tuple."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack._prepare_mrope_embed')
         if isinstance(mrope_embed, tuple):
             return mrope_embed
         freqs_cis = mrope_embed
@@ -76,7 +75,9 @@ class QwenTransformerStack(SerializableTileRTModule):
 
         Dispatches each block via ``block.forward()`` so that individual ops
         can decide between golden/tilert based on ``flag_enable_tilert``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.golden_forward')
         mrope_embed = self._prepare_mrope_embed(mrope_embed)
         if caches is None:
             caches = self._init_layer_caches(mrope_embed)
@@ -109,10 +110,14 @@ class QwenTransformerStack(SerializableTileRTModule):
 
         Currently routes through ``golden_forward`` because the dedicated
         Qwen3.6 CUDA-graph wrappers are not yet implemented.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.tilert_forward')
         return self.golden_forward(x, start_pos, mrope_embed, caches)
 
     def forward(self, x: torch.Tensor, start_pos: int, mrope_embed: tuple[torch.Tensor, torch.Tensor], caches: dict[str, Any] | None=None) -> tuple[torch.Tensor, dict[str, Any]]:
+
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.forward')
         if self.flag_enable_tilert:
             return self.tilert_forward(x, start_pos, mrope_embed, caches)
         return self.golden_forward(x, start_pos, mrope_embed, caches)
@@ -121,19 +126,26 @@ class QwenTransformerStack(SerializableTileRTModule):
         """Allocate KV caches for Gated Attention layers.
 
         DeltaNet layers carry their own recurrent state in ``caches["delta_state"]``.
+
         """
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack._init_layer_caches')
         dev = f'cuda:{self.device_id}'
         cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
         return {'k_cache': torch.zeros(self.model_args.max_batch_size, cache_seq_len, self.model_args.n_kv_heads, self.model_args.qk_head_dim, dtype=torch.bfloat16, device=dev), 'v_cache': torch.zeros(self.model_args.max_batch_size, cache_seq_len, self.model_args.n_kv_heads, self.model_args.v_head_dim, dtype=torch.bfloat16, device=dev), 'mrope_embed': mrope_embed, 'delta_state': {}}
 
     def get_tilert_weights_alias(self) -> list[str]:
+
         """Aggregate aliases from all registered ops."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.get_tilert_weights_alias')
         return super().get_tilert_weights_alias()
 
     def from_pretrained(self, model_path: str) -> None:
+
         """Load pretrained weights."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.from_pretrained')
         raise NotImplementedError('QwenTransformerStack weight loading not yet implemented.')
 
     def cleanup(self) -> None:
         """Cleanup resources."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] QwenTransformerStack.cleanup')
         pass
