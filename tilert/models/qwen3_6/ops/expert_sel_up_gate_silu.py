@@ -121,7 +121,6 @@ class ExpertSelectUpGateSiLUAlgorithm(Enum):
 
     FP8MMA = "fp8mma"
     FP16MMA = "fp16mma"
-    BF16MMA = "bf16mma"
 
 
 class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
@@ -137,114 +136,12 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
         return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 4).transpose(-3, -2)
 
-    @staticmethod
-    def _swizzle_mma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
-
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32')
-        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
-        pre_shape = mat_in.shape[:-2]
-        mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
-        return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 4).transpose(-3, -2)
-
-    @staticmethod
-    def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
-
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x16')
-        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
-        pre_shape = mat_in.shape[:-2]
-        mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
-        return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 2).transpose(-3, -2)
-
-    @staticmethod
-    def tilert_to_tilert_144sm(
-        mat_in: torch.Tensor, mat_scale_in: torch.Tensor, mma_type: str | None = None
-    ) -> torch.Tensor:
-        """
-        Convert tilert weights and scales to tilert_144sm input format.
-
-        Args:
-            mat_in: tilert weights
-            mat_scale_in: tilert scales
-            mma_type: MMA type, None,"16x32" or "16x16"
-        Returns:
-            tilert_144sm weights and scales
-
-        """
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm')
-        exp_num = mat_in.shape[0]
-        assert mat_in.shape == (exp_num, 512, 7168)
-        assert mat_scale_in.shape == (exp_num, 4, 64)
-        weights_trt = mat_in.reshape(exp_num, 128, 4, 7168)
-        weights_w1 = weights_trt[:, :, :2].reshape(exp_num, 256, 7168)
-        weights_w3 = weights_trt[:, :, 2:].reshape(exp_num, 256, 7168)
-        weights_w1 = weights_w1.reshape(exp_num, 16, 16, 7, 1024).transpose(2, 3)
-        weights_w3 = weights_w3.reshape(exp_num, 16, 16, 7, 1024).transpose(2, 3)
-        if mma_type == "16x32":
-            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 32, 32).transpose(3, 4)
-            weights_w1 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_w1)
-            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 1024)
-            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 32, 32).transpose(3, 4)
-            weights_w3 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_w3)
-            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 1024)
-        elif mma_type == "16x16":
-            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 64, 16).transpose(3, 4)
-            weights_w1 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x16(weights_w1)
-            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 1024)
-            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 64, 16).transpose(3, 4)
-            weights_w3 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x16(weights_w3)
-            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 1024)
-
-        weights = torch.cat([weights_w1, weights_w3], dim=3)
-        assert weights.shape == (exp_num, 16, 7, 32, 1024)
-        weights = weights.reshape(exp_num, 16, 7, 32 * 1024)
-
-        scales_unswizzled = torch.zeros(exp_num, 4, 56)
-        for i in range(64):
-            if ((i % 8) * 8 + i // 8) < 56:
-                scales_unswizzled[..., ((i % 8) * 8 + i // 8)] = mat_scale_in[..., i]
-        scales_unswizzled = scales_unswizzled.reshape(exp_num, 2, 2, 56)
-
-        scales_w1 = scales_unswizzled[:, :, :1].repeat(1, 1, 8, 1).reshape(exp_num, 16, 1, 7, 8)
-        scales_w1 = scales_w1.transpose(2, 3)
-        scales_w3 = scales_unswizzled[:, :, 1:].repeat(1, 1, 8, 1).reshape(exp_num, 16, 1, 7, 8)
-        scales_w3 = scales_w3.transpose(2, 3)
-        scales = torch.cat([scales_w1, scales_w3], dim=3)
-        assert scales.shape == (exp_num, 16, 7, 2, 8)
-        scales = (
-            scales.reshape(exp_num, 16, 7, 2 * 8).to(torch.bfloat16).view(dtype=torch.float8_e4m3fn)
-        )
-        weights_and_scales = torch.zeros(
-            exp_num, 16, 7, 32 * 1024 + 128, dtype=torch.float8_e4m3fn, device=mat_in.device
-        )
-        weights_and_scales[:, :, :, : 32 * 1024].copy_(weights)
-        weights_and_scales[:, :, :, 32 * 1024 : 32 * 1024 + 32].copy_(scales)
-        return weights_and_scales
-
-    @staticmethod
-    def tilert_to_tilert_144sm_mma(
-        mat_in: torch.Tensor, mat_scale_in: torch.Tensor, mma_type: str = "16x32"
-    ) -> torch.Tensor:
-        """
-        Convert tilert weights and scales to tilert_144sm_mma input format.
-
-        Args:
-            mat_in: tilert weights
-            mat_scale_in: tilert scales
-        Returns:
-            tilert_144sm weights and scales
-
-        """
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm_mma')
-        return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(
-            mat_in, mat_scale_in, mma_type
-        )
-
-    def convert_to_mma(
-        self, weights_list: list[torch.Tensor], algorithm: str = "fp8mma"
+    def convert_to_fp8mma(
+        self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        """Convert the weights to mma format."""
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_mma')
+        """Convert the weights to fp8mma format."""
+        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_fp8mma')
         args = self.model_args
         dim = args.dim
         pages = dim // 1024
@@ -263,7 +160,7 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             scale_m_dim = scales_w1.shape[1]
             weights_w1 = weights_w1.reshape(exp_num, n_row_groups, 16, pages, 1024).transpose(2, 3)
             weights_w3 = weights_w3.reshape(exp_num, n_row_groups, 16, pages, 1024).transpose(2, 3)
-            if algorithm == "fp8mma":
+            if True:
                 weights_w1 = weights_w1.reshape(exp_num, n_row_groups, pages, 16, 32, 32).transpose(
                     3, 4
                 )
@@ -273,17 +170,6 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
                     3, 4
                 )
                 weights_w3 = self._swizzle_qmma_16x32(weights_w3)
-                weights_w3 = weights_w3.reshape(exp_num, n_row_groups, pages, 16, 1024)
-            elif algorithm == "fp16mma":
-                weights_w1 = weights_w1.reshape(exp_num, n_row_groups, pages, 16, 64, 16).transpose(
-                    3, 4
-                )
-                weights_w1 = self._swizzle_mma_16x16(weights_w1)
-                weights_w1 = weights_w1.reshape(exp_num, n_row_groups, pages, 16, 1024)
-                weights_w3 = weights_w3.reshape(exp_num, n_row_groups, pages, 16, 64, 16).transpose(
-                    3, 4
-                )
-                weights_w3 = self._swizzle_mma_16x16(weights_w3)
                 weights_w3 = weights_w3.reshape(exp_num, n_row_groups, pages, 16, 1024)
             else:
                 raise ValueError(f"Unsupported algorithm: {algorithm}")
@@ -308,16 +194,13 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             scales = torch.cat([scales_w1, scales_w3], dim=3)
             assert scales.shape == (exp_num, n_row_groups, pages, 2, scales_per_page)
 
-            if self.model_args.arch_name in ("glm_5", "qwen3_6"):
-                if scales.dtype != torch.float32:
-                    print(
-                        "Warning: ExpertSelectUpGateSiLUWeightsConverter: "
-                        + f"scales.dtype: {scales.dtype} "
-                        + "is not float32, convert to float32."
-                    )
-                scales = scales.to(torch.float32)
-            else:
-                scales = scales.to(torch.bfloat16)
+            if scales.dtype != torch.float32:
+                print(
+                    "Warning: ExpertSelectUpGateSiLUWeightsConverter: "
+                    + f"scales.dtype: {scales.dtype} "
+                    + "is not float32, convert to float32."
+                )
+            scales = scales.to(torch.float32)
 
             scales = scales.reshape(exp_num, n_row_groups, pages, 2 * scales_per_page).view(
                 dtype=torch.float8_e4m3fn
@@ -335,46 +218,6 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             weights_and_scales[:, :, :, 32 * 1024 : 32 * 1024 + scales.shape[-1]].copy_(scales)
 
             return bias_or_gamma.float(), weights_and_scales.contiguous()
-
-    def convert_to_fp8mma(
-        self, weights_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert the weights to fp8mma format.
-
-        Args:
-            weights: List of weights.
-
-        Returns:
-            Tuple of weights.
-
-        """
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_fp8mma')
-        return self.convert_to_mma(weights_list, "fp8mma")
-
-    def convert_to_fp16mma(
-        self, weights_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert the weights to fp16mma format.
-
-        Args:
-            weights: List of weights.
-
-        Returns:
-            Tuple of weights.
-
-        """
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_fp16mma')
-        return self.convert_to_mma(weights_list, "fp16mma")
-
-    def convert_to_bf16mma(
-        self, weights_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        """Convert the weights to bf16mma format."""
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLUWeightsConverter.convert_to_bf16mma')
-        return self.convert_to_mma(weights_list, "fp16mma")
 
 
 class ExpertSelectUpGateSiLU(TileRTModule):
@@ -1077,20 +920,6 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             "shared_expert_gate": sharded["shared_expert_gate"][self.device_id],
         }
         self.init_tilert_weights(per_device_state)
-
-    def _ref_expert_select_glm5(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertSelectUpGateSiLU._ref_expert_select_glm5')
-        scores = scores.sigmoid()
-        original_scores = scores
-        if self.ref_bias is not None:
-            scores = scores + self.ref_bias
-        indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
-        indices = indices.view(*original_scores.shape[:-1], self.n_activated_experts)
-        weights = original_scores.gather(-1, indices)
-        weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
-        return weights, indices
 
     def _ref_expert_select_qwen36(
         self, scores: torch.Tensor

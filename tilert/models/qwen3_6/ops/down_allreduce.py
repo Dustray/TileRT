@@ -67,7 +67,6 @@ class DownAllReduceAlgorithm(Enum):
 
     GENERAL = "general"
 
-
 DownAllReduceWeightsConverter = ExpertDownAllReduceWeightsConverter
 
 

@@ -296,12 +296,6 @@ class DeltaNetOp(TileRTModule):
         
         return result
 
-    def _get_local_out_slices(self) -> list[list[slice]]:
-
-        """Unused under EP8; kept for backward compatibility only."""
-        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._get_local_out_slices')
-        return []
-
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         logger.debug(f"[dev={self.device_id}] {self.op_name}: 在设备上初始化参考权重 {self.device_id}")
         sharded = self.device_sharding(state_dict)
@@ -401,75 +395,6 @@ class DeltaNetOp(TileRTModule):
         ) = converter.convert_to_general(
             [in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, conv1d, A_log, dt_bias, norm, out_proj]
         )
-
-    def _linear_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Simple DeltaNet-style linear attention reference.
-
-        Uses a state matrix S of shape (bsz, n_kv_heads, head_dim, head_dim).
-        q/k are expanded to n_heads and then collapsed back via mean over groups.
-
-        """
-        logger.info(f'[{__file__.split(chr(47))[-1]}] DeltaNetOp._linear_attention')
-        bsz, seq_len, _ = q.shape
-        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.n_k_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.n_v_heads, self.value_head_dim).transpose(1, 2)
-
-        # Expand q/k to match v head count for the per-head recurrence.
-        reps = self.n_v_heads // self.n_k_heads
-        q = q.repeat_interleave(reps, dim=1)
-        k = k.repeat_interleave(reps, dim=1)
-
-        # Use a numerically-stable linear-attention kernel (elu+1 +
-        # cumulative-sum normalization).  This reference path intentionally
-        # deviates from the true DeltaNet recurrence; its only purpose is to
-        # produce bounded, sensible layer outputs for the golden forward.
-        q = F.elu(q) + 1.0
-        k = F.elu(k) + 1.0
-        # Temperature to keep the dot-products from amplifying too much over
-        # a long cumulative state.
-        q = q / (self.head_dim ** 0.5)
-        k = k / (self.head_dim ** 0.5)
-
-        if state is None:
-            state = torch.zeros(
-                bsz,
-                self.n_v_heads,
-                self.value_head_dim,
-                self.head_dim,
-                dtype=q.dtype,
-                device=q.device,
-            )
-            norm_state = torch.zeros(
-                bsz,
-                self.n_v_heads,
-                self.head_dim,
-                dtype=q.dtype,
-                device=q.device,
-            )
-        else:
-            # Existing state is already (S, norm_state) from a previous call.
-            state, norm_state = state
-
-        outputs = []
-        for t in range(seq_len):
-            qt = q[:, :, t, :]
-            kt = k[:, :, t, :]
-            vt = v[:, :, t, :]
-            state = state + kt.unsqueeze(-1) * vt.unsqueeze(-2)
-            norm_state = norm_state + kt
-            out_t = (qt.unsqueeze(-1) * state).sum(dim=-2)
-            out_t = out_t / ((qt * norm_state).sum(dim=-1, keepdim=True) + 1e-6)
-            outputs.append(out_t)
-        output = torch.stack(outputs, dim=2)
-        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_v_heads * self.value_head_dim)
-        return output, (state, norm_state)
 
     def _gated_delta_attention(
         self,

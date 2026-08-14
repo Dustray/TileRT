@@ -90,40 +90,6 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
         return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 4).transpose(-3, -2)
 
-    @staticmethod
-    def _swizzle_qmma_8x32(mat_in: torch.Tensor) -> torch.Tensor:
-
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_qmma_8x32')
-        assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
-        pre_shape = mat_in.shape[:-2]
-        return mat_in.reshape(*pre_shape, 8, 2, 4, 4).transpose(-2, -3).contiguous()
-
-    @staticmethod
-    def _swizzle_bf16mma_full_16x32(mat_in: torch.Tensor) -> torch.Tensor:
-
-        """Swizzle a (16, 32) FP8 sub-block for the BF16 MMA kernel."""
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_bf16mma_full_16x32')
-        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
-        assert mat_in.dtype == torch.float8_e4m3fn
-        pre = mat_in.shape[:-2]
-        mat = mat_in.reshape(*pre, 2, 8, 2, 2, 4, 2)
-        n = len(pre)
-        mat = mat.permute(*range(n), 1 + n, 4 + n, 2 + n, 3 + n, 0 + n, 5 + n)
-        return mat.reshape(*pre, 32, 16).contiguous()
-
-    @staticmethod
-    def _swizzle_bf16mma_partial_8x32(mat_in: torch.Tensor) -> torch.Tensor:
-
-        """Swizzle a (8, 32) FP8 partial sub-block for the BF16 MMA kernel."""
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter._swizzle_bf16mma_partial_8x32')
-        assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
-        assert mat_in.dtype == torch.float8_e4m3fn
-        pre = mat_in.shape[:-2]
-        mat = mat_in.reshape(*pre, 8, 2, 2, 4, 2)
-        n = len(pre)
-        mat = mat.permute(*range(n), 0 + n, 3 + n, 1 + n, 2 + n, 4 + n)
-        return mat.reshape(*pre, 32, 8).contiguous()
-
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -259,63 +225,6 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
                 .view(exp_num, 1, 1)
             )
         return mat_in.contiguous(), scale_out.contiguous()
-
-    def convert_to_bf16mma(
-        self, weights_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        """Pack FP8 weights for the BF16 MMA kernel (DSv32 only)."""
-        logger.info(f'[{__file__.split(chr(47))[-1]}] ExpertDownAllReduceWeightsConverter.convert_to_bf16mma')
-        args = self.model_args
-        assert args.arch_name == "deepseek_v3_2", "BF16 MMA layout is only valid for DSv32."
-        dim = args.dim
-        num_sms = 128
-        dim_per_sm = dim // num_sms
-        expert_dim = args.moe_inter_dim // 8
-        k_chunks = expert_dim // 32
-        scale_cols = expert_dim // args.block_size
-        assert dim_per_sm == 56, "BF16 MMA layout currently assumes dim_per_sm=56 (DSv32)."
-
-        with torch.inference_mode():
-            mat_in, scale_in = weights_list
-            exp_num = mat_in.shape[0]
-            mat_per_cta = mat_in.reshape(exp_num, num_sms, dim_per_sm, expert_dim)
-
-            full_part = mat_per_cta[:, :, :48, :]
-            partial_part = mat_per_cta[:, :, 48:, :]
-
-            full_tiles = full_part.reshape(exp_num, num_sms, 3, 16, k_chunks, 32)
-            full_tiles = full_tiles.transpose(3, 4)
-            full_swizzled = self._swizzle_bf16mma_full_16x32(full_tiles)
-            full_swizzled = full_swizzled.reshape(exp_num, num_sms, 3 * k_chunks * 32 * 16)
-
-            partial_tiles = partial_part.reshape(exp_num, num_sms, 1, 8, k_chunks, 32).transpose(
-                3, 4
-            )
-            partial_swizzled = self._swizzle_bf16mma_partial_8x32(partial_tiles)
-            partial_swizzled = partial_swizzled.reshape(exp_num, num_sms, k_chunks * 32 * 8)
-
-            mat_swizzled = torch.cat([full_swizzled, partial_swizzled], dim=2)
-            mat_swizzled = mat_swizzled.reshape(exp_num, dim, expert_dim)
-
-            mat_scale_tilert = (
-                scale_in.reshape(exp_num, dim // args.block_size, 1, scale_cols)
-                .repeat(1, 1, 16, 1)
-                .reshape(exp_num, num_sms, -1)
-            )
-            target_cols_per_sm = 1024 * scale_cols // num_sms
-            pad_amount = target_cols_per_sm - mat_scale_tilert.shape[-1]
-            if pad_amount > 0:
-                padding_zeros = torch.zeros(
-                    (exp_num, num_sms, pad_amount),
-                    dtype=scale_in.dtype,
-                    device=scale_in.device,
-                )
-                mat_scale_tilert = torch.cat([mat_scale_tilert, padding_zeros], dim=2)
-            mat_scale_tilert = mat_scale_tilert.reshape(exp_num, 1024, scale_cols)
-            mat_scale_tilert = mat_scale_tilert.to(torch.bfloat16)
-
-            return mat_swizzled.contiguous(), mat_scale_tilert.contiguous()
 
 
 @dataclass

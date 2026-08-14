@@ -54,7 +54,6 @@ class RMSNormUpGateSiLUAlgorithm(Enum):
     FP16MMA = "fp16mma"
     BF16MMA = "bf16mma"
 
-
 RMSNormUpGateSiLUWeightsConverter = ExpertSelectUpGateSiLUWeightsConverter
 ExpertSelectUpGateSiLUW = ExpertSelectUpGateSiLUWeightsConverter
 

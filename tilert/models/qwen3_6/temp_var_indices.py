@@ -73,7 +73,6 @@ class QwenTempVarIdx(IntEnum):
     TOP_N_INDICES = 33  # [bsz, seq, 256] int32.
     LOGPROBS_FLAG = 34  # [1] int32.
 
-
 TEMP_VARS_SIZE = 35
 
 Idx = QwenTempVarIdx

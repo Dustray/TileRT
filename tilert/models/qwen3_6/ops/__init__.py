@@ -1,8 +1,5 @@
 """Core operations for Qwen3.6-35B-A3B."""
 
-from tilert.models.qwen3_6.ops.broadcast_selected_token_ids import (
-    broadcast_selected_token_ids,
-)
 from tilert.models.qwen3_6.ops.delta_net import (
     DeltaNetAlgorithm,
     DeltaNetOp,
@@ -38,20 +35,12 @@ from tilert.models.qwen3_6.ops.expert_sel_up_gate_silu import (
     ExpertSelectUpGateSiLU,
     ExpertSelectUpGateSiLUAlgorithm,
 )
-from tilert.models.qwen3_6.ops.padded_allreduce_add import (
-    PaddedAllReduceAdd,
-    PaddedAllReduceAddAlgorithm,
-    padded_allreduce_add,
-)
 from tilert.models.qwen3_6.ops.qkv_rope import (
     QKVRoPE,
     QKVRoPEAlgorithm,
     QKVRoPERefWeightsAlias,
     QKVRoPETilertWeightsAlias,
     qkv_rope,
-)
-from tilert.models.qwen3_6.ops.receive_selected_token_ids import (
-    receive_selected_token_ids,
 )
 from tilert.models.qwen3_6.ops.rmsnorm_expert_proj import (
     RMSNormExpertProj,
@@ -61,7 +50,6 @@ from tilert.models.qwen3_6.ops.rmsnorm_head_proj import (
     RMSNormHeadProj,
     RMSNormHeadProjAlgorithm,
 )
-from tilert.models.qwen3_6.ops.rmsnorm_quant import rmsnorm_quant
 from tilert.models.qwen3_6.ops.rmsnorm_up_gate_silu import (
     RMSNormUpGateSiLU,
     RMSNormUpGateSiLUAlgorithm,
@@ -74,7 +62,6 @@ from tilert.models.qwen3_6.ops.rotate import (
     rotate,
     rotate_activation,
 )
-from tilert.models.qwen3_6.ops.topk import TopK, topk_accurate, topk_approximate
 from tilert.models.qwen3_6.ops.unproj_o_allreduce import (
     UnProjOAllReduce,
     UnProjOAllReduceAlgorithm,
@@ -107,9 +94,6 @@ __all__ = [
     "RotateAlgorithm",
     "RotateRefWeightsAlias",
     "RotateTilertWeightsAlias",
-    "TopK",
-    "topk_approximate",
-    "topk_accurate",
     "qkv_rope",
     "QKVRoPE",
     "QKVRoPEAlgorithm",
@@ -117,7 +101,6 @@ __all__ = [
     "QKVRoPETilertWeightsAlias",
     "eh_proj_allreduce",
     "EHProjAllReduceAlgorithm",
-    "rmsnorm_quant",
     "RMSNormExpertProj",
     "RMSNormExpertProjAlgorithm",
     "RMSNormUpGateSiLU",
@@ -128,9 +111,4 @@ __all__ = [
     "RMSNormHeadProjAlgorithm",
     "ExpertSelectUpGateSiLU",
     "ExpertSelectUpGateSiLUAlgorithm",
-    "PaddedAllReduceAdd",
-    "PaddedAllReduceAddAlgorithm",
-    "padded_allreduce_add",
-    "broadcast_selected_token_ids",
-    "receive_selected_token_ids",
 ]
